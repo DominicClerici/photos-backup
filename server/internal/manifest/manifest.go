@@ -20,6 +20,10 @@ type Entry struct {
 	Size       int64      `json:"size"`
 	Filename   string     `json:"filename"`
 	CapturedAt *time.Time `json:"captured_at,omitempty"`
+	// ModifiedAt is the local asset's modification time on the source device. It
+	// belongs here so a database rebuilt from this log can restore the device
+	// mappings complete, rather than forcing every asset through a content check.
+	ModifiedAt *time.Time `json:"modified_at,omitempty"`
 	DeviceID   string     `json:"device_id"`
 	LocalID    string     `json:"local_id"`
 	StoredAt   time.Time  `json:"stored_at"`

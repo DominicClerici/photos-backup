@@ -36,6 +36,7 @@ type uploadResponse struct {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sync/check", s.handleSyncCheck)
 	mux.HandleFunc("POST /v1/assets", s.handleUpload)
 	mux.HandleFunc("GET /v1/assets/{id}/original", s.handleOriginal)
 	mux.HandleFunc("GET /v1/assets/{id}/web", s.handleWeb)
@@ -84,6 +85,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			Size:       res.Size,
 			Filename:   meta.filename,
 			CapturedAt: meta.capturedAt,
+			ModifiedAt: meta.modifiedAt,
 			DeviceID:   meta.deviceID,
 			LocalID:    meta.localID,
 			StoredAt:   time.Now().UTC(),
@@ -95,7 +97,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	id, inserted, err := s.Store.InsertAsset(r.Context(), db.Asset{
+	id, inserted, err := s.Store.RecordAsset(r.Context(), db.Asset{
 		SHA256:           res.SHA256,
 		MD5:              res.MD5,
 		ByteSize:         res.Size,
@@ -103,11 +105,12 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		Ext:              ext,
 		ContentType:      contentTypeFor(ext),
 		CapturedAt:       meta.capturedAt,
+		ModifiedAt:       meta.modifiedAt,
 		DeviceID:         meta.deviceID,
 		LocalID:          meta.localID,
 	})
 	if err != nil {
-		s.logger().Error("insert asset", "error", err, "sha256", res.SHA256)
+		s.logger().Error("record asset", "error", err, "sha256", res.SHA256)
 		writeError(w, http.StatusServiceUnavailable, "upload stored but not indexed; retry to reconcile")
 		return
 	}
@@ -189,10 +192,14 @@ func (s *Server) lookup(w http.ResponseWriter, r *http.Request) (db.Asset, bool)
 }
 
 type uploadMeta struct {
-	filename   string
-	md5        string
-	size       int64
+	filename string
+	md5      string
+	size     int64
+	// capturedAt is when the photo was taken; modifiedAt is when the local asset
+	// last changed. The second one is what tells a later sync/check that an
+	// edited photo needs re-examining even though its local id never changed.
 	capturedAt *time.Time
+	modifiedAt *time.Time
 	deviceID   string
 	localID    string
 }
@@ -225,15 +232,26 @@ func parseUploadHeaders(r *http.Request) (uploadMeta, error) {
 		return m, fmt.Errorf("X-Photo-Size is negative: %d", m.size)
 	}
 
-	if raw := r.Header.Get("X-Photo-Captured-At"); raw != "" {
-		captured, err := time.Parse(time.RFC3339, raw)
-		if err != nil {
-			return m, fmt.Errorf("X-Photo-Captured-At is not RFC3339: %q", raw)
-		}
-		captured = captured.UTC()
-		m.capturedAt = &captured
+	if m.capturedAt, err = optionalTimeHeader(r, "X-Photo-Captured-At"); err != nil {
+		return m, err
+	}
+	if m.modifiedAt, err = optionalTimeHeader(r, "X-Photo-Modified-At"); err != nil {
+		return m, err
 	}
 	return m, nil
+}
+
+func optionalTimeHeader(r *http.Request, name string) (*time.Time, error) {
+	raw := strings.TrimSpace(r.Header.Get(name))
+	if raw == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s is not RFC3339: %q", name, raw)
+	}
+	t = t.UTC()
+	return &t, nil
 }
 
 func requiredHeader(r *http.Request, name string) (string, error) {

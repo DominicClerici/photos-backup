@@ -211,5 +211,7 @@ func truncateAssets(t *testing.T, ctx context.Context, url string) {
 		return // schema not created yet; the migration runs next
 	}
 	defer conn.Close(ctx)
-	_, _ = conn.Exec(ctx, "truncate table assets")
+	// Named rather than `cascade`, so a future table with a foreign key here has
+	// to be added deliberately instead of silently wiped.
+	_, _ = conn.Exec(ctx, "truncate table assets, device_assets")
 }

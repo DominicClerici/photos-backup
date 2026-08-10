@@ -17,6 +17,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/config"
 	"github.com/dominicclerici/photos-backup/server/internal/db"
 	"github.com/dominicclerici/photos-backup/server/internal/derive"
+	"github.com/dominicclerici/photos-backup/server/internal/discovery"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 )
 
@@ -57,6 +58,21 @@ func run(log *slog.Logger) error {
 		Manifest:  manifest.New(filepath.Join(root, "manifest.jsonl")),
 		Converter: derive.New(),
 		Log:       log,
+	}
+
+	// mDNS is a convenience, not a dependency: a responder that cannot bind
+	// alongside the system one leaves the phone to use its last known good
+	// address or a manually entered one, so this logs and carries on.
+	if !cfg.MDNSDisabled {
+		port, err := discovery.PortFrom(cfg.ListenAddr)
+		if err != nil {
+			log.Warn("not advertising over mDNS", "error", err)
+		} else if ad, err := discovery.Advertise(cfg.MDNSInstance, port); err != nil {
+			log.Warn("not advertising over mDNS", "error", err, "hint", "set MDNS_DISABLED=1 and publish via Avahi instead")
+		} else {
+			defer ad.Shutdown()
+			log.Info("advertising over mDNS", "service", discovery.ServiceType, "host", ad.Host, "port", port)
+		}
 	}
 
 	httpSrv := &http.Server{

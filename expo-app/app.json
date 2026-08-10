@@ -11,6 +11,7 @@
       "bundleIdentifier": "com.dominicrumor.photobackup",
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "Connects to your photobackup server on the local network.",
+        "NSBonjourServices": ["_photobackup._tcp"],
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
         }
@@ -18,7 +19,12 @@
     },
     "plugins": [
       "expo-dev-client",
-      ["./plugins/withDevelopmentTeam", { "teamId": "5XYSB2XHVT" }],
+      [
+        "./plugins/withDevelopmentTeam",
+        {
+          "teamId": "5XYSB2XHVT"
+        }
+      ],
       [
         "expo-media-library",
         {
@@ -26,7 +32,8 @@
           "savePhotosPermission": "photobackup does not save photos; this is unused.",
           "isAccessMediaLocationEnabled": true
         }
-      ]
+      ],
+      "expo-sqlite"
     ],
     "experiments": {
       "reactCompiler": true

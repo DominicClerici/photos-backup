@@ -1,64 +1,56 @@
-import { StatusBar } from 'expo-status-bar';
 import { usePermissions } from 'expo-media-library';
-import { useCallback, useEffect, useState } from 'react';
+import { StatusBar } from 'expo-status-bar';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  FlatList,
-  Image,
   Pressable,
   SafeAreaView,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from 'react-native';
 
-import { loadConfig, saveConfig } from './src/config';
-import { recentPhotos, thumbnailUri, type PickerItem } from './src/library';
-import { errorText, uploadAsset, type UploadResult, type UploadStage } from './src/upload';
+import { DEFAULT_MAX_ITEMS, loadConfig, saveConfig, type Config } from './src/config';
+import { resolveServer, type ServerResolution } from './src/discovery';
+import { DEFAULT_ENGINE_CONFIG, SyncEngine } from './src/sync/engine';
+import { PhotoKitMediaSource } from './src/sync/media';
+import { openQueueStore, type SqliteQueueStore } from './src/sync/sqliteStore';
+import { HttpTransport } from './src/sync/transport';
+import {
+  emptyCounts,
+  errorText,
+  systemClock,
+  type Progress,
+  type QueueItem,
+  type StateCounts,
+} from './src/sync/types';
 
-const GRID_COLUMNS = 3;
-const PHOTO_LIMIT = 30;
-
-/**
- * Resolves its own URI on mount rather than resolving the whole page up front,
- * so a slow PhotoKit lookup delays one tile instead of the entire grid.
- */
-function Thumbnail({ id }: { id: string }) {
-  const [uri, setUri] = useState<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    thumbnailUri(id)
-      .then((resolved) => {
-        if (active) setUri(resolved);
-      })
-      .catch(() => {});
-    return () => {
-      active = false;
-    };
-  }, [id]);
-
-  if (!uri) return <View style={styles.thumbnail} />;
-  return <Image source={{ uri }} style={styles.thumbnail} />;
-}
-
-const STAGE_LABEL: Record<UploadStage, string> = {
-  resolving: 'Resolving original…',
-  hashing: 'Hashing — the app will freeze for a moment',
-  uploading: 'Uploading…',
-  done: 'Done',
+const IDLE: Progress = {
+  phase: 'idle',
+  activity: 'Idle',
+  counts: emptyCounts(),
+  retryAt: 0,
 };
 
 export default function App() {
   const [permission, requestPermission] = usePermissions();
-  const [config, setConfig] = useState(() => loadConfig());
-  const [photos, setPhotos] = useState<PickerItem[]>([]);
-  const [libraryError, setLibraryError] = useState<string | null>(null);
-  const [health, setHealth] = useState<string>('not checked');
-  const [stage, setStage] = useState<UploadStage | null>(null);
-  const [result, setResult] = useState<UploadResult | null>(null);
-  const [failure, setFailure] = useState<string | null>(null);
+  const [config, setConfig] = useState<Config>(loadConfig);
+  const [store, setStore] = useState<SqliteQueueStore | null>(null);
+  const [storeError, setStoreError] = useState<string | null>(null);
+  const [server, setServer] = useState<ServerResolution | null>(null);
+  const [resolving, setResolving] = useState(false);
+  const [progress, setProgress] = useState<Progress>(IDLE);
+  const [failed, setFailed] = useState<QueueItem[]>([]);
+  const [logLines, setLogLines] = useState<string[]>([]);
+  const [runError, setRunError] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+
+  // The transport reads this on every request, so a re-resolved address takes
+  // effect without rebuilding the engine mid-run.
+  const serverUrl = useRef<string>(config.serverUrl);
+  const engine = useRef<SyncEngine | null>(null);
 
   const granted = permission?.granted ?? false;
   const limitedAccess = permission?.accessPrivileges === 'limited';
@@ -69,155 +61,324 @@ export default function App() {
   }, [permission, requestPermission]);
 
   useEffect(() => {
-    if (!granted) return;
-    recentPhotos(PHOTO_LIMIT)
-      .then((items) => {
-        setPhotos(items);
-        setLibraryError(null);
-      })
-      .catch((e) => setLibraryError(errorText(e)));
-  }, [granted]);
+    openQueueStore()
+      .then(setStore)
+      .catch((e) => setStoreError(errorText(e)));
+  }, []);
 
-  const checkHealth = useCallback(async () => {
-    setHealth('checking…');
-    try {
-      const res = await fetch(`${config.serverUrl}/health`);
-      setHealth(res.ok ? `reachable (${res.status})` : `HTTP ${res.status}`);
-    } catch (e) {
-      setHealth(`unreachable — ${errorText(e)}`);
-    }
-  }, [config.serverUrl]);
-
-  const onPick = useCallback(
-    async (item: PickerItem) => {
-      if (stage) return;
-      setResult(null);
-      setFailure(null);
-      try {
-        const uploaded = await uploadAsset(item.id, {
-          serverUrl: config.serverUrl,
-          deviceId: config.deviceId,
-          onStage: setStage,
-        });
-        setResult(uploaded);
-      } catch (e) {
-        setFailure(errorText(e));
-      } finally {
-        setStage(null);
-      }
+  const refreshQueue = useCallback(
+    async (queue: SqliteQueueStore) => {
+      const [counts, failedItems] = await Promise.all([queue.counts(), queue.failed(20)]);
+      setProgress((current) => ({ ...current, counts }));
+      setFailed(failedItems);
     },
-    [config, stage]
+    []
   );
 
+  useEffect(() => {
+    if (!store) return;
+    void refreshQueue(store);
+  }, [store, refreshQueue]);
+
+  const findServer = useCallback(async () => {
+    setResolving(true);
+    try {
+      const resolution = await resolveServer({
+        rememberedUrl: config.lastServerUrl,
+        manualUrl: config.serverUrl.trim() || null,
+      });
+      setServer(resolution);
+      if (!resolution.url) return;
+
+      serverUrl.current = resolution.url;
+      if (resolution.url !== config.lastServerUrl) {
+        const next = { ...config, lastServerUrl: resolution.url };
+        setConfig(next);
+        saveConfig(next);
+      }
+    } finally {
+      setResolving(false);
+    }
+  }, [config]);
+
+  // One automatic scan on launch; after that it is a button, so a slow or denied
+  // scan never blocks the screen repeatedly.
+  const scannedOnce = useRef(false);
+  useEffect(() => {
+    if (scannedOnce.current) return;
+    scannedOnce.current = true;
+    void findServer();
+  }, [findServer]);
+
+  const start = useCallback(async () => {
+    if (!store || engine.current?.isRunning) return;
+    setRunError(null);
+    setRunning(true);
+
+    const instance = new SyncEngine(
+      {
+        store,
+        media: new PhotoKitMediaSource(),
+        transport: new HttpTransport(() => serverUrl.current),
+        clock: systemClock,
+        onProgress: setProgress,
+        onLog: (line) => setLogLines((lines) => [line, ...lines].slice(0, 20)),
+      },
+      { ...DEFAULT_ENGINE_CONFIG, deviceId: config.deviceId, maxItems: config.maxItems }
+    );
+    engine.current = instance;
+
+    try {
+      await instance.run();
+    } catch (e) {
+      setRunError(errorText(e));
+    } finally {
+      setRunning(false);
+      await refreshQueue(store);
+    }
+  }, [store, config.deviceId, config.maxItems, refreshQueue]);
+
+  const pause = useCallback(() => {
+    engine.current?.stop();
+  }, []);
+
+  const retryFailed = useCallback(async () => {
+    if (!store) return;
+    await store.resetFailed();
+    await refreshQueue(store);
+  }, [store, refreshQueue]);
+
   const onChangeServer = useCallback(
-    (serverUrl: string) => {
-      const next = { ...config, serverUrl };
+    (value: string) => {
+      const next = { ...config, serverUrl: value };
       setConfig(next);
       saveConfig(next);
     },
     [config]
   );
 
+  const onChangeMaxItems = useCallback(
+    (value: string) => {
+      const parsed = Number.parseInt(value.replace(/[^0-9]/g, ''), 10);
+      const next = { ...config, maxItems: Number.isFinite(parsed) ? parsed : DEFAULT_MAX_ITEMS };
+      setConfig(next);
+      saveConfig(next);
+    },
+    [config]
+  );
+
+  const canStart = Boolean(store) && granted && Boolean(serverUrl.current) && !running;
+
   return (
     <SafeAreaView style={styles.screen}>
       <StatusBar style="light" />
-      <Text style={styles.title}>photobackup</Text>
+      <ScrollView contentContainerStyle={styles.content}>
+        <Text style={styles.title}>photobackup</Text>
 
-      <View style={styles.row}>
-        <TextInput
-          style={styles.input}
-          value={config.serverUrl}
-          onChangeText={onChangeServer}
-          autoCapitalize="none"
-          autoCorrect={false}
-          keyboardType="url"
-          placeholder="http://10.0.0.2:8787"
-          placeholderTextColor="#666"
-        />
-        <Pressable style={styles.button} onPress={checkHealth}>
-          <Text style={styles.buttonText}>Check</Text>
-        </Pressable>
-      </View>
-      <Text style={styles.muted}>server: {health}</Text>
-
-      {!granted && (
-        <Text style={styles.warning}>
-          Photo library access is required. Grant it in Settings to pick a photo.
-        </Text>
-      )}
-      {limitedAccess && (
-        <Text style={styles.warning}>
-          Limited access is on, so only hand-picked photos are visible. Choose “All Photos” in
-          Settings for a real backup.
-        </Text>
-      )}
-      {libraryError && <Text style={styles.warning}>Library error: {libraryError}</Text>}
-
-      {stage ? (
-        <View style={styles.status}>
-          <ActivityIndicator color="#8ab4f8" />
-          <Text style={styles.statusText}>{STAGE_LABEL[stage]}</Text>
-        </View>
-      ) : (
-        <Text style={styles.muted}>Tap a photo to back it up.</Text>
-      )}
-
-      {result && (
-        <View style={styles.result}>
-          <Text style={styles.resultTitle}>
-            {result.duplicate ? 'Already archived' : 'Archived'} — {result.filename}
+        <Section title="Server">
+          <Text style={server?.url ? styles.good : styles.muted}>
+            {resolving ? 'looking for a server…' : (server?.note ?? 'not checked')}
           </Text>
-          <Text style={styles.muted}>sha256 {result.sha256.slice(0, 16)}…</Text>
-          <Text style={styles.muted}>
-            {(result.size / 1024 / 1024).toFixed(2)} MB · hash {result.hashMs} ms · upload{' '}
-            {result.uploadMs} ms
-          </Text>
-        </View>
-      )}
-      {failure && (
-        <View style={styles.result}>
-          <Text style={styles.failureTitle}>Upload failed</Text>
-          <Text style={styles.muted}>{failure}</Text>
-        </View>
-      )}
+          {server?.emptyScan && (
+            <Text style={styles.warning}>
+              An empty scan means either photod is not running or Local Network access was denied.
+              Check Settings › photobackup › Local Network.
+            </Text>
+          )}
+          <View style={styles.row}>
+            <TextInput
+              style={styles.input}
+              value={config.serverUrl}
+              onChangeText={onChangeServer}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="url"
+              placeholder="http://10.0.0.2:8787"
+              placeholderTextColor="#666"
+            />
+            <Pressable style={styles.button} onPress={findServer} disabled={resolving}>
+              <Text style={styles.buttonText}>Find</Text>
+            </Pressable>
+          </View>
+        </Section>
 
-      <FlatList
-        data={photos}
-        keyExtractor={(item) => item.id}
-        numColumns={GRID_COLUMNS}
-        contentContainerStyle={styles.grid}
-        renderItem={({ item }) => (
-          <Pressable style={styles.cell} onPress={() => onPick(item)} disabled={stage !== null}>
-            <Thumbnail id={item.id} />
-          </Pressable>
+        {!granted && (
+          <Text style={styles.warning}>
+            Photo library access is required. Grant it in Settings to back anything up.
+          </Text>
         )}
-      />
+        {limitedAccess && (
+          <Text style={styles.warning}>
+            Limited access is on, so only hand-picked photos are visible. Choose “All Photos” in
+            Settings for a real backup.
+          </Text>
+        )}
+        {storeError && <Text style={styles.warning}>Queue unavailable: {storeError}</Text>}
+        {runError && <Text style={styles.warning}>Run stopped: {runError}</Text>}
+
+        <Section title="Backup">
+          <View style={styles.row}>
+            <Pressable
+              style={[styles.button, styles.grow, !canStart && styles.buttonDisabled]}
+              onPress={start}
+              disabled={!canStart}
+            >
+              <Text style={styles.buttonText}>{running ? 'Running…' : 'Start backup'}</Text>
+            </Pressable>
+            <Pressable
+              style={[styles.button, !running && styles.buttonDisabled]}
+              onPress={pause}
+              disabled={!running}
+            >
+              <Text style={styles.buttonText}>Pause</Text>
+            </Pressable>
+          </View>
+
+          <View style={styles.status}>
+            {running && <ActivityIndicator color="#8ab4f8" />}
+            <Text style={styles.statusText}>{progress.activity}</Text>
+          </View>
+
+          <Counts counts={progress.counts} />
+
+          <View style={styles.row}>
+            <Text style={styles.label}>Newest items to consider</Text>
+            <TextInput
+              style={styles.numberInput}
+              value={String(config.maxItems)}
+              onChangeText={onChangeMaxItems}
+              keyboardType="number-pad"
+              editable={!running}
+            />
+          </View>
+          <Text style={styles.muted}>0 backs up the whole library.</Text>
+        </Section>
+
+        {failed.length > 0 && (
+          <Section title={`Failed (${failed.length})`}>
+            <Pressable style={styles.button} onPress={retryFailed} disabled={running}>
+              <Text style={styles.buttonText}>Retry failed items</Text>
+            </Pressable>
+            {failed.map((item) => (
+              <View key={item.localId} style={styles.failedRow}>
+                <Text style={styles.failedName}>{item.filename}</Text>
+                <Text style={styles.muted}>{item.lastError ?? 'no reason recorded'}</Text>
+              </View>
+            ))}
+          </Section>
+        )}
+
+        {logLines.length > 0 && (
+          <Section title="Log">
+            {logLines.map((line, index) => (
+              <Text key={`${index}-${line}`} style={styles.logLine}>
+                {line}
+              </Text>
+            ))}
+          </Section>
+        )}
+      </ScrollView>
     </SafeAreaView>
   );
 }
 
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>{title}</Text>
+      {children}
+    </View>
+  );
+}
+
+/**
+ * Groups the five working states into the three numbers that actually answer
+ * "how far along is this": still to look at, still to send, and archived.
+ */
+function Counts({ counts }: { counts: StateCounts }) {
+  const queued = counts.pending + counts.unknown + counts.hashed;
+  const total = queued + counts.want + counts.done + counts.failed;
+  return (
+    <View style={styles.counts}>
+      <Count label="queued" value={queued} />
+      <Count label="to send" value={counts.want} />
+      <Count label="archived" value={counts.done} tone="good" />
+      <Count label="failed" value={counts.failed} tone={counts.failed > 0 ? 'bad' : undefined} />
+      <Count label="total" value={total} />
+    </View>
+  );
+}
+
+function Count({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: number;
+  tone?: 'good' | 'bad';
+}) {
+  const color = tone === 'good' ? styles.good : tone === 'bad' ? styles.bad : styles.countValue;
+  return (
+    <View style={styles.count}>
+      <Text style={[styles.countValue, color]}>{value}</Text>
+      <Text style={styles.countLabel}>{label}</Text>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: '#111', paddingHorizontal: 16 },
-  title: { color: '#eee', fontSize: 20, fontWeight: '600', marginTop: 8, marginBottom: 12 },
+  screen: { flex: 1, backgroundColor: '#111' },
+  content: { paddingHorizontal: 16, paddingBottom: 40 },
+  title: { color: '#eee', fontSize: 20, fontWeight: '600', marginTop: 8, marginBottom: 4 },
+  section: {
+    backgroundColor: '#1a1a1a',
+    borderRadius: 10,
+    padding: 12,
+    marginTop: 12,
+    gap: 8,
+  },
+  sectionTitle: { color: '#eee', fontSize: 13, fontWeight: '600', textTransform: 'uppercase' },
   row: { flexDirection: 'row', gap: 8, alignItems: 'center' },
+  grow: { flex: 1 },
   input: {
     flex: 1,
-    backgroundColor: '#1c1c1c',
+    backgroundColor: '#242424',
     color: '#eee',
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
-  button: { backgroundColor: '#2d4a7c', borderRadius: 8, paddingHorizontal: 16, paddingVertical: 11 },
+  numberInput: {
+    backgroundColor: '#242424',
+    color: '#eee',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    minWidth: 80,
+    textAlign: 'right',
+  },
+  label: { color: '#aaa', fontSize: 13, flex: 1 },
+  button: {
+    backgroundColor: '#2d4a7c',
+    borderRadius: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 11,
+    alignItems: 'center',
+  },
+  buttonDisabled: { backgroundColor: '#2a2a2a' },
   buttonText: { color: '#eee', fontWeight: '600' },
-  muted: { color: '#888', fontSize: 12, marginTop: 6 },
+  muted: { color: '#888', fontSize: 12 },
+  good: { color: '#7ed492' },
+  bad: { color: '#e2685f' },
   warning: { color: '#e8b84b', fontSize: 12, marginTop: 8 },
-  status: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 10 },
-  statusText: { color: '#8ab4f8', fontSize: 13 },
-  result: { backgroundColor: '#1c1c1c', borderRadius: 8, padding: 12, marginTop: 10 },
-  resultTitle: { color: '#7ed492', fontWeight: '600' },
-  failureTitle: { color: '#e2685f', fontWeight: '600' },
-  grid: { paddingVertical: 12 },
-  cell: { flex: 1 / GRID_COLUMNS, aspectRatio: 1, padding: 2 },
-  thumbnail: { flex: 1, borderRadius: 4, backgroundColor: '#222' },
+  status: { flexDirection: 'row', alignItems: 'center', gap: 8, minHeight: 22 },
+  statusText: { color: '#8ab4f8', fontSize: 13, flex: 1 },
+  counts: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 },
+  count: { alignItems: 'center' },
+  countValue: { color: '#eee', fontSize: 18, fontWeight: '600' },
+  countLabel: { color: '#777', fontSize: 11 },
+  failedRow: { borderTopWidth: 1, borderTopColor: '#2a2a2a', paddingTop: 6 },
+  failedName: { color: '#ddd', fontSize: 13 },
+  logLine: { color: '#8a8a8a', fontSize: 11, fontFamily: 'Menlo' },
 });
