@@ -5,12 +5,15 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -18,6 +21,9 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/blobstore"
 	"github.com/dominicclerici/photos-backup/server/internal/db"
 	"github.com/dominicclerici/photos-backup/server/internal/derive"
+	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
+	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
+	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 )
 
@@ -31,8 +37,11 @@ const (
 type harness struct {
 	server       *httptest.Server
 	store        *db.Store
+	srv          *Server
 	photosRoot   string
+	derivRoot    string
 	manifestPath string
+	nudges       atomic.Int64
 }
 
 // newHarness wires the real server against a real Postgres and a temp photos
@@ -60,18 +69,68 @@ func newHarness(t *testing.T) *harness {
 	truncateAssets(t, ctx, url)
 
 	root := t.TempDir()
+	derivRoot := t.TempDir()
 	manifestPath := filepath.Join(root, "manifest.jsonl")
-	srv := &Server{
-		Store:     store,
-		Blobs:     blobstore.New(root),
-		Manifest:  manifest.New(manifestPath),
-		Converter: derive.New(),
+
+	h := &harness{
+		store:        store,
+		photosRoot:   root,
+		derivRoot:    derivRoot,
+		manifestPath: manifestPath,
+	}
+	h.srv = &Server{
+		Store:       store,
+		Blobs:       blobstore.New(root),
+		Derivatives: derivstore.New(derivRoot),
+		Manifest:    manifest.New(manifestPath),
+		Converter:   derive.New(),
+		Queue:       jobs.NewQueue(store.Pool()),
+		Nudge:       func() { h.nudges.Add(1) },
+		Log:         slog.New(slog.DiscardHandler),
 	}
 
-	ts := httptest.NewServer(srv.Handler())
+	ts := httptest.NewServer(h.srv.Handler())
 	t.Cleanup(ts.Close)
+	h.server = ts
 
-	return &harness{server: ts, store: store, photosRoot: root, manifestPath: manifestPath}
+	return h
+}
+
+// derive runs the real derivative pipeline for one asset, so the endpoints that
+// serve stored files have something to serve. The api package deliberately does
+// not depend on the worker in production code; this is the test wiring it up to
+// exercise the pieces together.
+func (h *harness) derive(t *testing.T, assetID string) {
+	t.Helper()
+	ctx := context.Background()
+
+	asset, err := h.store.Asset(ctx, assetID)
+	if err != nil {
+		t.Fatalf("load asset: %v", err)
+	}
+
+	src := h.srv.Blobs.Path(asset.SHA256, asset.Ext)
+	data, err := exifdata.New().Read(ctx, src)
+	if err != nil {
+		t.Fatalf("read exif: %v", err)
+	}
+
+	if err := h.srv.Derivatives.Write(asset.SHA256, derivstore.Thumb, func(w io.Writer) error {
+		return h.srv.Converter.Thumb(ctx, src, w)
+	}); err != nil {
+		t.Fatalf("write thumb: %v", err)
+	}
+
+	width, height := data.DisplaySize()
+	err = h.store.ApplyMetadata(ctx, assetID, db.Metadata{
+		Width: width, Height: height, Orientation: data.Orientation,
+		CameraMake: data.CameraMake, CameraModel: data.CameraModel, Lens: data.Lens,
+		GPSLat: data.GPSLat, GPSLon: data.GPSLon,
+		ExifCapturedAt: data.CapturedAt, ExifOffsetMinutes: data.OffsetMinutes,
+	})
+	if err != nil {
+		t.Fatalf("apply metadata: %v", err)
+	}
 }
 
 // upload posts a body as an asset, letting the caller override any header to
@@ -162,13 +221,45 @@ func (h *harness) manifestEntries(t *testing.T) []manifest.Entry {
 	return entries
 }
 
-func loadFixture(t *testing.T) []byte {
+// Fixtures live at the module root, shared with the media packages.
+func loadFixture(t *testing.T) []byte { return loadNamedFixture(t, "sample.heic") }
+
+func loadNamedFixture(t *testing.T, name string) []byte {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("testdata", "sample.heic"))
+	b, err := os.ReadFile(filepath.Join("..", "..", "testdata", name))
 	if err != nil {
-		t.Fatalf("read fixture: %v", err)
+		t.Fatalf("read fixture %s: %v", name, err)
 	}
 	return b
+}
+
+// getWith issues a GET carrying extra headers, for the conditional-request
+// tests.
+func (h *harness) getWith(t *testing.T, path string, headers map[string]string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, h.server.URL+path, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := h.server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+func (h *harness) postJSON(t *testing.T, path, body string) *http.Response {
+	t.Helper()
+	resp, err := h.server.Client().Post(h.server.URL+path, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST %s: %v", path, err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
 }
 
 // withDatabase points a connection string at a different database, keeping the
@@ -213,5 +304,5 @@ func truncateAssets(t *testing.T, ctx context.Context, url string) {
 	defer conn.Close(ctx)
 	// Named rather than `cascade`, so a future table with a foreign key here has
 	// to be added deliberately instead of silently wiped.
-	_, _ = conn.Exec(ctx, "truncate table assets, device_assets")
+	_, _ = conn.Exec(ctx, "truncate table assets, device_assets, jobs")
 }

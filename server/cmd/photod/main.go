@@ -1,4 +1,5 @@
-// Command photod serves the photo archive: uploads in, gallery out.
+// Command photod serves the photo archive: uploads in, gallery out, and the
+// derivative workers that turn one into the other.
 package main
 
 import (
@@ -7,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -17,8 +19,13 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/config"
 	"github.com/dominicclerici/photos-backup/server/internal/db"
 	"github.com/dominicclerici/photos-backup/server/internal/derive"
+	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 	"github.com/dominicclerici/photos-backup/server/internal/discovery"
+	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
+	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
+	"github.com/dominicclerici/photos-backup/server/internal/video"
+	"github.com/dominicclerici/photos-backup/server/internal/worker"
 )
 
 func main() {
@@ -40,6 +47,17 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	derivRoot := cfg.DerivativesRoot
+	if derivRoot == "" {
+		derivRoot = filepath.Join(root, "derivatives")
+	}
+	if derivRoot, err = filepath.Abs(derivRoot); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(derivRoot, 0o755); err != nil {
+		return err
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -52,12 +70,65 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	converter := derive.New()
+	converter.Binary = cfg.MagickBin
+	converter.PreviewConcurrency = cfg.PreviewConcurrency
+
+	queue := jobs.NewQueue(store.Pool())
+	blobs := blobstore.New(root)
+	derivatives := derivstore.New(derivRoot)
+
 	srv := &api.Server{
-		Store:     store,
-		Blobs:     blobstore.New(root),
-		Manifest:  manifest.New(filepath.Join(root, "manifest.jsonl")),
-		Converter: derive.New(),
-		Log:       log,
+		Store:       store,
+		Blobs:       blobs,
+		Derivatives: derivatives,
+		Manifest:    manifest.New(filepath.Join(root, "manifest.jsonl")),
+		Converter:   converter,
+		Queue:       queue,
+		Log:         log,
+	}
+
+	// Missing tooling is reported, never fatal. An upload has to be able to
+	// reach the disk on a host where ffmpeg was never installed — the archive
+	// is the point, and derivatives are a convenience built on top of it. The
+	// same rule PROJECT.md applies to photo-ml, one layer down.
+	checkTools(log, cfg)
+
+	if !cfg.WorkerDisabled {
+		videoTool := video.New()
+		videoTool.FFmpeg = cfg.FFmpegBin
+		videoTool.FFprobe = cfg.FFprobeBin
+		videoTool.Encoder = cfg.VideoEncoder
+
+		exif := exifdata.New()
+		exif.Binary = cfg.ExiftoolBin
+
+		workers := worker.New(worker.Deps{
+			Store:       store,
+			Queue:       queue,
+			Blobs:       blobs,
+			Derivatives: derivatives,
+			Images:      converter,
+			Video:       videoTool,
+			Exif:        exif,
+			Log:         log,
+		})
+		workers.MetadataWorkers = cfg.WorkerConcurrency
+		workers.TranscodeWorkers = cfg.TranscodeConcurrency
+
+		workers.Start(ctx)
+		defer workers.Wait()
+
+		// The upload handler wakes the pools directly, so the first thumbnail
+		// of a fresh backup appears in about the time it takes to make one.
+		srv.Nudge = workers.Nudge
+
+		log.Info("derivative workers running",
+			"metadata", workers.MetadataWorkers,
+			"transcode", workers.TranscodeWorkers,
+			"derivatives_root", derivRoot)
+	} else {
+		log.Warn("derivative workers disabled; uploads will queue work that nothing drains")
 	}
 
 	// mDNS is a convenience, not a dependency: a responder that cannot bind
@@ -99,5 +170,22 @@ func run(log *slog.Logger) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		return httpSrv.Shutdown(shutdownCtx)
+	}
+}
+
+// checkTools reports which external tools are missing, and what stops working
+// without each one. Finding out at startup beats finding out from a queue full
+// of identical failures an hour into a backfill.
+func checkTools(log *slog.Logger, cfg config.Config) {
+	for _, tool := range []struct{ binary, needed string }{
+		{cfg.MagickBin, "thumbnails and previews"},
+		{cfg.ExiftoolBin, "capture times, camera, and GPS"},
+		{cfg.FFmpegBin, "video posters and playback renditions"},
+		{cfg.FFprobeBin, "video dimensions and duration"},
+	} {
+		if _, err := exec.LookPath(tool.binary); err != nil {
+			log.Warn("external tool not found; uploads still work but derivatives will fail",
+				"binary", tool.binary, "affects", tool.needed)
+		}
 	}
 }

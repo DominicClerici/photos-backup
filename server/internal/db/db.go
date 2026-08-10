@@ -12,6 +12,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
+
+	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 )
 
 //go:embed migrations/*.sql
@@ -21,7 +23,8 @@ var migrationFS embed.FS
 var ErrNotFound = errors.New("db: asset not found")
 
 // Asset is one archived original. ID and UploadedAt are assigned by the
-// database; every other field comes from the upload.
+// database; the upload supplies the rest, and the derivative worker fills in
+// everything from MediaKind's neighbours downward.
 type Asset struct {
 	ID               string
 	SHA256           string
@@ -30,6 +33,7 @@ type Asset struct {
 	OriginalFilename string
 	Ext              string
 	ContentType      string
+	MediaKind        string
 	CapturedAt       *time.Time
 	UploadedAt       time.Time
 	DeviceID         string
@@ -38,7 +42,52 @@ type Asset struct {
 	// describes the delivery rather than the content, so it is stored on the
 	// device_assets mapping and never on the asset row.
 	ModifiedAt *time.Time
+
+	// Everything below is written by the metadata job, read off the original
+	// itself rather than reported by the phone.
+	Metadata
+
+	// SortTime is the generated column the timeline orders on:
+	// exif capture time, else the phone's, else arrival.
+	SortTime time.Time
+	// DerivedState tracks the metadata job — pending, ready, or failed. The
+	// gallery renders a tile for all three, so an asset is never invisible.
+	DerivedState string
+	// PlaybackState tracks the transcode. "none" for photos, which have no
+	// playback rendition to build.
+	PlaybackState string
 }
+
+// Metadata is what the worker reads out of an original. Every field is optional
+// because plenty of real files carry none of it: a screenshot has no camera, a
+// messaging-app image has had its EXIF stripped.
+type Metadata struct {
+	Width             *int
+	Height            *int
+	Orientation       *int
+	DurationSeconds   *float64
+	CameraMake        string
+	CameraModel       string
+	Lens              string
+	GPSLat            *float64
+	GPSLon            *float64
+	ExifCapturedAt    *time.Time
+	ExifOffsetMinutes *int
+}
+
+// Derivative states, shared by DerivedState and PlaybackState.
+const (
+	DerivedPending = "pending"
+	DerivedReady   = "ready"
+	DerivedFailed  = "failed"
+	// PlaybackNone marks an asset that will never have a playback rendition.
+	PlaybackNone = "none"
+)
+
+const (
+	MediaImage = "image"
+	MediaVideo = "video"
+)
 
 // LocalRef identifies a local asset the phone is asking about, with the
 // modification time it currently reports.
@@ -88,6 +137,10 @@ func Open(ctx context.Context, url string) (*Store, error) {
 
 func (s *Store) Close() { s.pool.Close() }
 
+// Pool exposes the connection pool so the job queue can share it rather than
+// opening a second one against the same database.
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+
 // Migrate brings the schema up to date. goose needs a database/sql handle, so
 // this borrows one through the pgx stdlib adapter rather than holding it open.
 func (s *Store) Migrate() error {
@@ -110,7 +163,11 @@ func (s *Store) Migrate() error {
 }
 
 const assetColumns = `id, sha256, md5, byte_size, original_filename, ext,
-	content_type, captured_at, uploaded_at, device_id, local_id`
+	content_type, media_kind, captured_at, uploaded_at, device_id, local_id,
+	width, height, orientation, duration_seconds,
+	coalesce(camera_make, ''), coalesce(camera_model, ''), coalesce(lens, ''),
+	gps_lat, gps_lon, exif_captured_at, exif_offset_minutes,
+	sort_time, derived_state, playback_state`
 
 // RecordAsset stores an asset and the mapping from the local asset that
 // delivered it, in one transaction. It returns the existing row's id when this
@@ -130,14 +187,19 @@ func (s *Store) RecordAsset(ctx context.Context, a Asset) (id string, inserted b
 
 	const insert = `
 		insert into assets (sha256, md5, byte_size, original_filename, ext,
-		                    content_type, captured_at, device_id, local_id)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		                    content_type, media_kind, captured_at, device_id, local_id)
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		on conflict (sha256) do nothing
 		returning id`
 
+	mediaKind := a.MediaKind
+	if mediaKind == "" {
+		mediaKind = MediaImage
+	}
+
 	err = tx.QueryRow(ctx, insert,
 		a.SHA256, a.MD5, a.ByteSize, a.OriginalFilename, a.Ext,
-		a.ContentType, a.CapturedAt, a.DeviceID, a.LocalID,
+		a.ContentType, mediaKind, a.CapturedAt, a.DeviceID, a.LocalID,
 	).Scan(&id)
 	switch {
 	case err == nil:
@@ -159,6 +221,19 @@ func (s *Store) RecordAsset(ctx context.Context, a Asset) (id string, inserted b
 			do update set asset_id = excluded.asset_id, modified_at = excluded.modified_at`
 		if _, err := tx.Exec(ctx, upsert, a.DeviceID, a.LocalID, id, a.ModifiedAt); err != nil {
 			return "", false, fmt.Errorf("record device mapping: %w", err)
+		}
+	}
+
+	// The metadata job is committed with the asset row, not after it. Enqueuing
+	// separately would leave a window where a crash lands an asset that no
+	// worker will ever pick up, and nothing would notice: the phone has its ack
+	// and will never send those bytes again.
+	//
+	// Only on insert. A duplicate already has its derivatives, or a job queued
+	// to build them.
+	if inserted {
+		if err := jobs.Enqueue(ctx, tx, jobs.KindMetadata, id); err != nil {
+			return "", false, err
 		}
 	}
 
@@ -295,28 +370,6 @@ func (s *Store) Asset(ctx context.Context, id string) (Asset, error) {
 	return a, nil
 }
 
-// RecentAssets returns the newest assets first, by capture time where known.
-func (s *Store) RecentAssets(ctx context.Context, limit int) ([]Asset, error) {
-	rows, err := s.pool.Query(ctx, `select `+assetColumns+`
-		from assets
-		order by captured_at desc nulls last, uploaded_at desc
-		limit $1`, limit)
-	if err != nil {
-		return nil, fmt.Errorf("list assets: %w", err)
-	}
-	defer rows.Close()
-
-	var assets []Asset
-	for rows.Next() {
-		a, err := scanAsset(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan asset: %w", err)
-		}
-		assets = append(assets, a)
-	}
-	return assets, rows.Err()
-}
-
 type scanner interface {
 	Scan(dest ...any) error
 }
@@ -324,6 +377,10 @@ type scanner interface {
 func scanAsset(s scanner) (Asset, error) {
 	var a Asset
 	err := s.Scan(&a.ID, &a.SHA256, &a.MD5, &a.ByteSize, &a.OriginalFilename, &a.Ext,
-		&a.ContentType, &a.CapturedAt, &a.UploadedAt, &a.DeviceID, &a.LocalID)
+		&a.ContentType, &a.MediaKind, &a.CapturedAt, &a.UploadedAt, &a.DeviceID, &a.LocalID,
+		&a.Width, &a.Height, &a.Orientation, &a.DurationSeconds,
+		&a.CameraMake, &a.CameraModel, &a.Lens,
+		&a.GPSLat, &a.GPSLon, &a.ExifCapturedAt, &a.ExifOffsetMinutes,
+		&a.SortTime, &a.DerivedState, &a.PlaybackState)
 	return a, err
 }

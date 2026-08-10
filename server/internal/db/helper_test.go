@@ -42,9 +42,9 @@ func testStore(t *testing.T) *Store {
 	if err := store.Migrate(); err != nil {
 		t.Fatalf("migrate test database: %v", err)
 	}
-	// Both tables by name rather than `cascade`, so a future table with a
+	// Every table by name rather than `cascade`, so a future table with a
 	// foreign key here has to be added deliberately instead of silently wiped.
-	if _, err := store.pool.Exec(ctx, "truncate table assets, device_assets"); err != nil {
+	if _, err := store.pool.Exec(ctx, "truncate table assets, device_assets, jobs"); err != nil {
 		t.Fatalf("truncate assets: %v", err)
 	}
 	return store

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -62,12 +63,12 @@ func TestRecordAssetIsIdempotentOnSHA256(t *testing.T) {
 		t.Errorf("duplicate returned id %q, want the original %q", secondID, firstID)
 	}
 
-	assets, err := s.RecentAssets(ctx, 10)
+	page, err := s.Timeline(ctx, nil, 10)
 	if err != nil {
-		t.Fatalf("RecentAssets: %v", err)
+		t.Fatalf("Timeline: %v", err)
 	}
-	if len(assets) != 1 {
-		t.Errorf("table holds %d rows after duplicate upload, want 1", len(assets))
+	if len(page.Items) != 1 {
+		t.Errorf("table holds %d rows after duplicate upload, want 1", len(page.Items))
 	}
 }
 
@@ -365,7 +366,52 @@ func TestAssetReportsNotFoundForUnknownID(t *testing.T) {
 	}
 }
 
-func TestRecentAssetsOrdersNewestCaptureFirst(t *testing.T) {
+func TestRecordAssetQueuesItsDerivativeWork(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	id, _, err := s.RecordAsset(ctx, sampleAsset())
+	if err != nil {
+		t.Fatalf("RecordAsset: %v", err)
+	}
+
+	var queued int
+	if err := s.pool.QueryRow(ctx,
+		`select count(*) from jobs where asset_id = $1::uuid and kind = 'metadata'`, id).Scan(&queued); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if queued != 1 {
+		t.Fatalf("queued %d metadata jobs, want 1 committed with the asset row", queued)
+	}
+}
+
+// Duplicate content already has derivatives, or work queued to build them.
+// Enqueuing again would mean every re-upload of the same photo re-ran ffmpeg.
+func TestRecordAssetDoesNotQueueWorkForDuplicateContent(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	id, _, err := s.RecordAsset(ctx, sampleAsset())
+	if err != nil {
+		t.Fatalf("first RecordAsset: %v", err)
+	}
+	dup := sampleAsset()
+	dup.LocalID = "a-different-local-id"
+	if _, _, err := s.RecordAsset(ctx, dup); err != nil {
+		t.Fatalf("second RecordAsset: %v", err)
+	}
+
+	var queued int
+	if err := s.pool.QueryRow(ctx,
+		`select count(*) from jobs where asset_id = $1::uuid`, id).Scan(&queued); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if queued != 1 {
+		t.Errorf("queued %d jobs, want 1", queued)
+	}
+}
+
+func TestTimelineOrdersNewestFirst(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
 
@@ -375,25 +421,316 @@ func TestRecentAssetsOrdersNewestCaptureFirst(t *testing.T) {
 		time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
 	}
 	for i, ts := range times {
-		a := sampleAsset()
-		a.SHA256 = string(rune('a'+i)) + sampleAsset().SHA256[1:]
-		a.LocalID = a.LocalID + "-" + string(rune('a'+i))
-		a.CapturedAt = &ts
-		if _, _, err := s.RecordAsset(ctx, a); err != nil {
-			t.Fatalf("RecordAsset %d: %v", i, err)
-		}
+		seedAsset(t, s, i, ts)
 	}
 
-	got, err := s.RecentAssets(ctx, 10)
+	page, err := s.Timeline(ctx, nil, 10)
 	if err != nil {
-		t.Fatalf("RecentAssets: %v", err)
+		t.Fatalf("Timeline: %v", err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("got %d assets, want 3", len(got))
+	if len(page.Items) != 3 {
+		t.Fatalf("got %d items, want 3", len(page.Items))
 	}
-	for i := 1; i < len(got); i++ {
-		if got[i-1].CapturedAt.Before(*got[i].CapturedAt) {
-			t.Errorf("assets out of order at %d: %v before %v", i, got[i-1].CapturedAt, got[i].CapturedAt)
+	if page.NextCursor != "" {
+		t.Errorf("NextCursor = %q, want empty on the last page", page.NextCursor)
+	}
+	for i := 1; i < len(page.Items); i++ {
+		if page.Items[i-1].TakenAt.Before(page.Items[i].TakenAt) {
+			t.Errorf("items out of order at %d: %v before %v",
+				i, page.Items[i-1].TakenAt, page.Items[i].TakenAt)
 		}
 	}
+}
+
+// The file's capture time is what the timeline sorts on. A photo taken in 2019
+// but imported into Photos today must land in 2019, not at the top.
+func TestTimelinePrefersTheCaptureTimeReadFromTheFile(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	imported := seedAsset(t, s, 0, time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+	recent := seedAsset(t, s, 1, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC))
+
+	shotIn2019 := time.Date(2019, 4, 2, 9, 30, 0, 0, time.UTC)
+	if err := s.ApplyMetadata(ctx, imported, Metadata{ExifCapturedAt: &shotIn2019}); err != nil {
+		t.Fatalf("ApplyMetadata: %v", err)
+	}
+
+	page, err := s.Timeline(ctx, nil, 10)
+	if err != nil {
+		t.Fatalf("Timeline: %v", err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("got %d items, want 2", len(page.Items))
+	}
+	if page.Items[0].ID != recent {
+		t.Errorf("first item = %s, want the 2026 asset %s", page.Items[0].ID, recent)
+	}
+	if !page.Items[1].TakenAt.Equal(shotIn2019) {
+		t.Errorf("second item taken at %v, want the EXIF time %v", page.Items[1].TakenAt, shotIn2019)
+	}
+}
+
+// The grid groups photos under a day heading, so it needs the file's own UTC
+// offset. Without it a photo taken at 23:50 local would be filed under the next
+// day by any browser east of the camera.
+func TestTimelineCarriesTheFilesUTCOffset(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	zoned := seedAsset(t, s, 0, time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+	unzoned := seedAsset(t, s, 1, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC))
+
+	shot := time.Date(2026, 8, 4, 23, 50, 36, 0, time.UTC)
+	offset := -240
+	if err := s.ApplyMetadata(ctx, zoned, Metadata{ExifCapturedAt: &shot, ExifOffsetMinutes: &offset}); err != nil {
+		t.Fatalf("ApplyMetadata: %v", err)
+	}
+	if err := s.ApplyMetadata(ctx, unzoned, Metadata{}); err != nil {
+		t.Fatalf("ApplyMetadata: %v", err)
+	}
+
+	page, err := s.Timeline(ctx, nil, 10)
+	if err != nil {
+		t.Fatalf("Timeline: %v", err)
+	}
+	byID := make(map[string]TimelineItem, len(page.Items))
+	for _, it := range page.Items {
+		byID[it.ID] = it
+	}
+
+	got := byID[zoned].OffsetMinutes
+	if got == nil || *got != offset {
+		t.Errorf("zoned asset offset = %v, want %d", got, offset)
+	}
+	// Null rather than zero: "no zone recorded" and "UTC" are different claims,
+	// and the viewer must not pass the first off as the second.
+	if byID[unzoned].OffsetMinutes != nil {
+		t.Errorf("asset with no recorded zone reported offset %v, want null", *byID[unzoned].OffsetMinutes)
+	}
+
+	states, err := s.TimelineStates(ctx, []string{zoned})
+	if err != nil {
+		t.Fatalf("TimelineStates: %v", err)
+	}
+	if got := states[zoned].OffsetMinutes; got == nil || *got != offset {
+		t.Errorf("TimelineStates offset = %v, want %d", got, offset)
+	}
+}
+
+func TestTimelinePagesWithoutSkippingOrRepeating(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	const total = 7
+	base := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	for i := range total {
+		seedAsset(t, s, i, base.Add(time.Duration(i)*time.Hour))
+	}
+
+	var seen []string
+	var cursor *Cursor
+	for range total { // bounded so a broken cursor cannot spin forever
+		page, err := s.Timeline(ctx, cursor, 3)
+		if err != nil {
+			t.Fatalf("Timeline: %v", err)
+		}
+		for _, it := range page.Items {
+			seen = append(seen, it.ID)
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		c, err := DecodeCursor(page.NextCursor)
+		if err != nil {
+			t.Fatalf("DecodeCursor: %v", err)
+		}
+		cursor = &c
+	}
+
+	if len(seen) != total {
+		t.Fatalf("paged through %d items, want %d", len(seen), total)
+	}
+	unique := make(map[string]bool, len(seen))
+	for _, id := range seen {
+		if unique[id] {
+			t.Errorf("asset %s was returned on two pages", id)
+		}
+		unique[id] = true
+	}
+}
+
+// Assets sharing a timestamp are the case a naive timestamp-only cursor gets
+// wrong: it either loses them or serves them twice.
+func TestTimelinePagesThroughAssetsSharingATimestamp(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	same := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	for i := range 5 {
+		seedAsset(t, s, i, same)
+	}
+
+	unique := make(map[string]bool)
+	var cursor *Cursor
+	for range 5 {
+		page, err := s.Timeline(ctx, cursor, 2)
+		if err != nil {
+			t.Fatalf("Timeline: %v", err)
+		}
+		for _, it := range page.Items {
+			if unique[it.ID] {
+				t.Errorf("asset %s was returned twice", it.ID)
+			}
+			unique[it.ID] = true
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		c, err := DecodeCursor(page.NextCursor)
+		if err != nil {
+			t.Fatalf("DecodeCursor: %v", err)
+		}
+		cursor = &c
+	}
+
+	if len(unique) != 5 {
+		t.Errorf("saw %d of 5 assets sharing a timestamp", len(unique))
+	}
+}
+
+// A pending asset that the timeline hid would be invisible for the whole
+// backfill, and a permanently failed one would be invisible forever.
+func TestTimelineIncludesAssetsWhoseDerivativesAreNotReady(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	pending := seedAsset(t, s, 0, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	failed := seedAsset(t, s, 1, time.Date(2026, 5, 1, 11, 0, 0, 0, time.UTC))
+	if err := s.SetDerivedState(ctx, failed, DerivedFailed); err != nil {
+		t.Fatalf("SetDerivedState: %v", err)
+	}
+
+	page, err := s.Timeline(ctx, nil, 10)
+	if err != nil {
+		t.Fatalf("Timeline: %v", err)
+	}
+
+	states := make(map[string]string, len(page.Items))
+	for _, it := range page.Items {
+		states[it.ID] = it.State
+	}
+	if states[pending] != DerivedPending {
+		t.Errorf("pending asset state = %q, want %q", states[pending], DerivedPending)
+	}
+	if states[failed] != DerivedFailed {
+		t.Errorf("failed asset state = %q, want %q", states[failed], DerivedFailed)
+	}
+}
+
+func TestTimelineStatesReportsOnlyTheAssetsAskedFor(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	base := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	watched := seedAsset(t, s, 0, base)
+	other := seedAsset(t, s, 1, base.Add(-time.Hour))
+
+	if err := s.ApplyMetadata(ctx, watched, Metadata{}); err != nil {
+		t.Fatalf("ApplyMetadata: %v", err)
+	}
+
+	states, err := s.TimelineStates(ctx, []string{watched})
+	if err != nil {
+		t.Fatalf("TimelineStates: %v", err)
+	}
+	if len(states) != 1 {
+		t.Fatalf("got %d states, want 1", len(states))
+	}
+	if states[watched].State != DerivedReady {
+		t.Errorf("state = %q, want %q", states[watched].State, DerivedReady)
+	}
+	if _, ok := states[other]; ok {
+		t.Error("TimelineStates returned an asset that was not asked about")
+	}
+}
+
+func TestDecodeCursorRejectsGarbage(t *testing.T) {
+	for _, token := range []string{"not-base64!!", "", "Zm9v"} {
+		if _, err := DecodeCursor(token); !errors.Is(err, ErrBadCursor) {
+			t.Errorf("DecodeCursor(%q) error = %v, want ErrBadCursor", token, err)
+		}
+	}
+}
+
+func TestApplyMetadataMarksTheAssetReady(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	id := seedAsset(t, s, 0, time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+
+	width, height, offset := 4032, 3024, -240
+	lat, lon := 44.4759, -73.2121
+	shot := time.Date(2026, 4, 30, 18, 12, 0, 0, time.UTC)
+
+	err := s.ApplyMetadata(ctx, id, Metadata{
+		Width: &width, Height: &height,
+		CameraMake: "Apple", CameraModel: "iPhone 14 Pro",
+		Lens:   "iPhone 14 Pro back triple camera 6.86mm f/1.78",
+		GPSLat: &lat, GPSLon: &lon,
+		ExifCapturedAt: &shot, ExifOffsetMinutes: &offset,
+	})
+	if err != nil {
+		t.Fatalf("ApplyMetadata: %v", err)
+	}
+
+	got, err := s.Asset(ctx, id)
+	if err != nil {
+		t.Fatalf("Asset: %v", err)
+	}
+	if got.DerivedState != DerivedReady {
+		t.Errorf("DerivedState = %q, want %q", got.DerivedState, DerivedReady)
+	}
+	if got.Width == nil || *got.Width != width {
+		t.Errorf("Width = %v, want %d", got.Width, width)
+	}
+	if got.CameraModel != "iPhone 14 Pro" {
+		t.Errorf("CameraModel = %q", got.CameraModel)
+	}
+	if got.ExifOffsetMinutes == nil || *got.ExifOffsetMinutes != offset {
+		t.Errorf("ExifOffsetMinutes = %v, want %d", got.ExifOffsetMinutes, offset)
+	}
+	// The phone's value survives the worker writing the file's value.
+	if got.CapturedAt == nil {
+		t.Error("ApplyMetadata cleared captured_at; the phone's value must be kept")
+	}
+	if !got.SortTime.Equal(shot) {
+		t.Errorf("SortTime = %v, want the EXIF capture time %v", got.SortTime, shot)
+	}
+}
+
+func TestApplyMetadataReportsAnUnknownAsset(t *testing.T) {
+	s := testStore(t)
+
+	err := s.ApplyMetadata(context.Background(), "6b3e2c1a-0000-4000-8000-000000000000", Metadata{})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ApplyMetadata error = %v, want ErrNotFound", err)
+	}
+}
+
+// seedAsset records a distinct asset captured at the given time, returning its
+// id. The index only has to make sha256 and local id unique.
+func seedAsset(t *testing.T, s *Store, i int, captured time.Time) string {
+	t.Helper()
+	a := sampleAsset()
+	a.SHA256 = fmt.Sprintf("%064x", i+1)
+	a.MD5 = fmt.Sprintf("%032x", i+1)
+	a.LocalID = fmt.Sprintf("%s-%d", a.LocalID, i)
+	a.CapturedAt = &captured
+
+	id, _, err := s.RecordAsset(context.Background(), a)
+	if err != nil {
+		t.Fatalf("RecordAsset %d: %v", i, err)
+	}
+	return id
 }

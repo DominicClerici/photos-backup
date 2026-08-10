@@ -30,6 +30,7 @@ browsing, ML search, USB ingest, mirroring phone deletions.
 | Sync model | One-way archive. The server never deletes. |
 | iOS app | Expo / React Native, custom dev client |
 | Core server | Go |
+| Web app | Next.js (App Router), separate process |
 | ML service | Python, **v2**, always optional |
 | Database | Postgres (pgvector-ready for v2) |
 | Storage | Content-addressed blobs, SHA-256 |
@@ -78,13 +79,17 @@ of hardlinks on demand, costing no extra bytes.
 ## 4. Architecture
 
 ```
-                        iPhone  (Expo / React Native)
-                          - PhotoKit enumeration
-                          - local SQLite upload queue
-                          - foreground bulk upload
-                          - background top-up
-                                  |
-                     HTTPS over LAN (mDNS) or Tailscale
+     iPhone  (Expo / React Native)        browser
+       - PhotoKit enumeration               |
+       - local SQLite upload queue          v
+       - foreground bulk upload    +------------------------+
+       - background top-up         |  web  (Next.js)        |
+              |                    |    virtualized timeline|
+              |                    |    full-size viewer    |
+              |                    |    /api/* -> photod    |
+              |                    +-----------+------------+
+              |                                |
+              +---- HTTPS over LAN (mDNS) or Tailscale ----+
                                   |
                                   v
         +---------------------------------------------------+
@@ -94,7 +99,7 @@ of hardlinks on demand, costing no extra bytes.
         |    POST /v1/assets         single-shot upload      |
         |    PUT  /v1/assets/:id/chunk   resumable upload    |
         |    GET  /v1/assets/...     originals + derivatives |
-        |    web gallery                                     |
+        |    GET  /v1/timeline       paged gallery JSON      |
         |    enqueues jobs                                   |
         +----------+---------------------------+------------+
                    |                           |
@@ -114,8 +119,19 @@ of hardlinks on demand, costing no extra bytes.
               /mnt/photos  (6TB drive)
 ```
 
-Three processes under systemd. The split is by process boundary, not sprinkled
-through one codebase.
+Three server processes under systemd, plus the web app. The split is by process
+boundary, not sprinkled through one codebase.
+
+The gallery is a separate Next.js app rather than pages served by photod. It
+costs a second process on the archive machine, and buys the ability to put the
+gallery on the public internet later without moving the upload endpoints or the
+6TB drive along with it. photod stays a private API; the web app is the only
+part that would ever face outward.
+
+The browser talks to one origin. Next rewrites `/api/*` to photod, so the JSON
+is same-origin and CORS never enters the picture. Thumbnails and video are the
+exception: `<img>` and `<video>` are not subject to CORS, so they can point
+straight at photod and skip the proxy hop entirely.
 
 **Hard rule:** `photo-ml` is optional forever. If it is down, mid-model-swap, or
 saturating the GPU, backups still complete and photos still display. Search
@@ -135,13 +151,20 @@ thumbnails are `libheif` and `ffmpeg` subprocess calls. Go only orchestrates.
     ab/cd/abcd1234....HEIC          originals, sha256-addressed, immutable
     3f/9a/3f9a77b2....MOV
   manifest.jsonl                    append-only recovery log
-  derivatives/
-    ab/cd/abcd1234.thumb.webp
-    ab/cd/abcd1234.preview.webp
+
+$DERIVATIVES_ROOT/                  the SSD; defaults to /mnt/photos/derivatives
+  ab/cd/abcd1234.thumb.webp         256px square, stored
+  3f/9a/3f9a77b2.thumb.webp         poster frame for video, same shape
+  3f/9a/3f9a77b2.mp4                H.264 playback rendition, video only
 ```
 
 Originals live on the 6TB drive. Postgres and derivatives should live on the
-workstation SSD for speed.
+workstation SSD for speed, which is what `DERIVATIVES_ROOT` is for.
+
+The 2048px preview is **not** stored. It is rendered per request from the blob
+and cached by the browser instead, since the bytes are content-addressed and can
+never go stale. One viewer shows one preview at a time; a stored file would buy
+nothing that `Cache-Control: immutable` does not.
 
 `manifest.jsonl` records one line per stored blob: hash, original filename,
 capture time, source device, byte size. It is the disaster-recovery path when the
@@ -228,6 +251,16 @@ zero bytes.
 
 Worker pool, ffmpeg/libheif thumbnails, video posters, virtualized web timeline,
 full-size viewer.
+
+Two job kinds in two separately sized pools: `metadata` (exiftool, the 256px
+thumbnail, a video's poster frame) and `playback` (H.264/AAC MP4). They are
+split because a handful of 4K transcodes would otherwise take every worker slot
+and starve the thumbnails behind them, which during a backfill looks exactly
+like a gallery that has stopped working.
+
+Not built, deliberately: a date scrubber. The timeline pages on a keyset cursor,
+so jumping to an arbitrary date means either loading everything in between or a
+second index; neither is worth it before the archive is real.
 
 ### Phase 4 — Real-load hardening
 

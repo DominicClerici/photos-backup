@@ -37,3 +37,43 @@ func TestFromEnvPrefersEnvironment(t *testing.T) {
 		t.Errorf("DatabaseURL = %q, want the environment value", cfg.DatabaseURL)
 	}
 }
+
+func TestWorkerDefaultsFavorThumbnailsOverTranscodes(t *testing.T) {
+	cfg := FromEnv()
+
+	// The gallery is blocked on metadata work and not on transcodes, so the
+	// pools must not be sized the same.
+	if cfg.WorkerConcurrency <= cfg.TranscodeConcurrency {
+		t.Errorf("WorkerConcurrency = %d, TranscodeConcurrency = %d; metadata should get more",
+			cfg.WorkerConcurrency, cfg.TranscodeConcurrency)
+	}
+	if cfg.VideoEncoder != "libx264" {
+		t.Errorf("VideoEncoder = %q, want libx264 as the portable default", cfg.VideoEncoder)
+	}
+}
+
+// A typo in a count must not start a server with zero workers, which would look
+// exactly like a queue that has silently stopped.
+func TestConcurrencyFallsBackOnUnusableValues(t *testing.T) {
+	for _, value := range []string{"", "0", "-3", "four"} {
+		t.Setenv("WORKER_CONCURRENCY", value)
+		if got := FromEnv().WorkerConcurrency; got != 4 {
+			t.Errorf("WORKER_CONCURRENCY=%q gave %d, want the default 4", value, got)
+		}
+	}
+}
+
+// Empty means "beside the originals"; main resolves it. Keeping the empty value
+// here is what lets main tell "unset" apart from "deliberately set to the same
+// place".
+func TestDerivativesRootDefaultsToEmptyForMainToResolve(t *testing.T) {
+	t.Setenv("DERIVATIVES_ROOT", "")
+	if got := FromEnv().DerivativesRoot; got != "" {
+		t.Errorf("DerivativesRoot = %q, want empty", got)
+	}
+
+	t.Setenv("DERIVATIVES_ROOT", "/var/lib/photobackup/derivatives")
+	if got := FromEnv().DerivativesRoot; got != "/var/lib/photobackup/derivatives" {
+		t.Errorf("DerivativesRoot = %q", got)
+	}
+}

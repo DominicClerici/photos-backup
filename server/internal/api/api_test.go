@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"golang.org/x/image/webp"
+	"github.com/dominicclerici/photos-backup/server/internal/db"
 )
 
 func decodeUpload(t *testing.T, resp *http.Response) uploadResponse {
@@ -103,11 +103,11 @@ func TestUploadRejectsMD5MismatchAndWritesNothing(t *testing.T) {
 	if entries := h.manifestEntries(t); len(entries) != 0 {
 		t.Errorf("rejected upload wrote %d manifest lines, want 0", len(entries))
 	}
-	if resp := h.get(t, "/"); resp.StatusCode == http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		if bytes.Contains(body, []byte("/original")) {
-			t.Error("rejected upload is visible in the gallery")
-		}
+
+	var page db.TimelinePage
+	decodeJSON(t, h.get(t, "/v1/timeline"), &page)
+	if len(page.Items) != 0 {
+		t.Errorf("rejected upload is on the timeline: %+v", page.Items)
 	}
 }
 
@@ -146,28 +146,6 @@ func TestGetOriginalReturnsExactBytes(t *testing.T) {
 	}
 }
 
-func TestGetWebReturnsDecodableWebP(t *testing.T) {
-	h := newHarness(t)
-	up := decodeUpload(t, h.upload(t, loadFixture(t), nil))
-
-	resp := h.get(t, "/v1/assets/"+up.ID+"/web")
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
-	}
-	if ct := resp.Header.Get("Content-Type"); ct != "image/webp" {
-		t.Errorf("Content-Type = %q, want image/webp", ct)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	if _, err := webp.Decode(bytes.NewReader(body)); err != nil {
-		t.Fatalf("response is not decodable WebP: %v", err)
-	}
-}
-
 func TestGetUnknownAssetReturnsNotFound(t *testing.T) {
 	h := newHarness(t)
 
@@ -178,23 +156,15 @@ func TestGetUnknownAssetReturnsNotFound(t *testing.T) {
 	}
 }
 
-func TestGalleryShowsUploadedAsset(t *testing.T) {
+// A malformed id reaches Postgres as a failed uuid cast, which must not be
+// reported as the database being down.
+func TestGetMalformedAssetIDReturnsNotFound(t *testing.T) {
 	h := newHarness(t)
-	up := decodeUpload(t, h.upload(t, loadFixture(t), nil))
 
-	resp := h.get(t, "/")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	if !bytes.Contains(body, []byte("/v1/assets/"+up.ID+"/web")) {
-		t.Errorf("gallery does not link the uploaded asset\n%s", body)
-	}
-	if !bytes.Contains(body, []byte("IMG_8071.HEIC")) {
-		t.Error("gallery does not show the original filename")
+	resp := h.get(t, "/v1/assets/not-a-uuid/original")
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
 }
 
@@ -225,5 +195,41 @@ func TestHealthReportsOK(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// The upload path must not wait on derivative work, and must not forget to ask
+// for it either.
+func TestUploadWakesTheWorkerWithoutWaitingForIt(t *testing.T) {
+	h := newHarness(t)
+
+	up := decodeUpload(t, h.upload(t, loadFixture(t), nil))
+
+	if h.nudges.Load() != 1 {
+		t.Errorf("nudges = %d, want 1", h.nudges.Load())
+	}
+
+	// The response arrives with the asset still underived.
+	var detail assetDetail
+	decodeJSON(t, h.get(t, "/v1/assets/"+up.ID), &detail)
+	if detail.State != db.DerivedPending {
+		t.Errorf("state = %q immediately after upload, want pending", detail.State)
+	}
+
+	// A duplicate has nothing new to derive, so it must not wake anyone.
+	h.upload(t, loadFixture(t), map[string]string{"X-Photo-Local-Id": "another-local-id"})
+	if h.nudges.Load() != 1 {
+		t.Errorf("nudges = %d after a duplicate upload, want 1", h.nudges.Load())
+	}
+}
+
+func decodeJSON(t *testing.T, resp *http.Response, into any) {
+	t.Helper()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(into); err != nil {
+		t.Fatalf("decode response: %v", err)
 	}
 }

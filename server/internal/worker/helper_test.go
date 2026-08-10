@@ -1,0 +1,197 @@
+package worker
+
+import (
+	"bytes"
+	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"fmt"
+	"log/slog"
+	"net/url"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/dominicclerici/photos-backup/server/internal/blobstore"
+	"github.com/dominicclerici/photos-backup/server/internal/db"
+	"github.com/dominicclerici/photos-backup/server/internal/derive"
+	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
+	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
+	"github.com/dominicclerici/photos-backup/server/internal/jobs"
+	"github.com/dominicclerici/photos-backup/server/internal/video"
+)
+
+const (
+	adminURL   = "postgres://photobackup:photobackup@localhost:5432/photobackup?sslmode=disable"
+	testDBName = "photobackup_test_worker"
+)
+
+// These tests run the real pipeline: real Postgres, real exiftool, real
+// ImageMagick, real ffmpeg, real fixture files. Nothing is stubbed, because the
+// only thing this package does is sequence those tools — a test with a stubbed
+// ffmpeg would be verifying the stub.
+type harness struct {
+	*Runner
+	store *db.Store
+	root  string
+}
+
+func newHarness(t *testing.T) *harness {
+	t.Helper()
+	ctx := context.Background()
+
+	admin := adminURL
+	if v := os.Getenv("TEST_DATABASE_URL"); v != "" {
+		admin = v
+	}
+	ensureTestDatabase(t, ctx, admin)
+
+	store, err := db.Open(ctx, withDatabase(t, admin, testDBName))
+	if err != nil {
+		t.Fatalf("open test database: %v\n\nIs Postgres up? Run: docker compose up -d", err)
+	}
+	t.Cleanup(store.Close)
+	if err := store.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if _, err := store.Pool().Exec(ctx, "truncate table assets, device_assets, jobs"); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	root := t.TempDir()
+	runner := New(Deps{
+		Store:       store,
+		Queue:       jobs.NewQueue(store.Pool()),
+		Blobs:       blobstore.New(filepath.Join(root, "photos")),
+		Derivatives: derivstore.New(filepath.Join(root, "derivatives")),
+		Images:      derive.New(),
+		Video:       video.New(),
+		Exif:        exifdata.New(),
+		Log:         slog.New(slog.DiscardHandler),
+	})
+	// The fixtures are tiny; slow encoder settings would only make the suite drag.
+	runner.Video.CRF = 30
+
+	return &harness{Runner: runner, store: store, root: root}
+}
+
+// ingest puts a fixture through the same path an upload takes: bytes into the
+// blob store, then a row and its metadata job into the database.
+func (h *harness) ingest(t *testing.T, fixture, mediaKind string) db.Asset {
+	t.Helper()
+
+	body, err := os.ReadFile(filepath.Join("..", "..", "testdata", fixture))
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", fixture, err)
+	}
+	sum := md5.Sum(body)
+	ext := filepath.Ext(fixture)
+
+	res, err := h.Blobs.Put(bytes.NewReader(body), ext, blobstore.Expected{
+		MD5:  hex.EncodeToString(sum[:]),
+		Size: int64(len(body)),
+	})
+	if err != nil {
+		t.Fatalf("store blob: %v", err)
+	}
+
+	id, _, err := h.store.RecordAsset(context.Background(), db.Asset{
+		SHA256:           res.SHA256,
+		MD5:              res.MD5,
+		ByteSize:         res.Size,
+		OriginalFilename: fixture,
+		Ext:              ext,
+		ContentType:      "application/octet-stream",
+		MediaKind:        mediaKind,
+		DeviceID:         "test-device",
+		LocalID:          fixture,
+	})
+	if err != nil {
+		t.Fatalf("record asset: %v", err)
+	}
+
+	asset, err := h.store.Asset(context.Background(), id)
+	if err != nil {
+		t.Fatalf("load asset: %v", err)
+	}
+	return asset
+}
+
+// claimAndRun takes the next job of a kind and executes it exactly as a pool
+// worker would, so the retry and state bookkeeping under test is the real one.
+func (h *harness) claimAndRun(t *testing.T, kind jobs.Kind) jobs.Job {
+	t.Helper()
+	job, err := h.Queue.Claim(context.Background(), []jobs.Kind{kind}, "test-worker")
+	if err != nil {
+		t.Fatalf("claim %s job: %v", kind, err)
+	}
+	h.execute(context.Background(), "test-worker", job)
+	return job
+}
+
+func (h *harness) reload(t *testing.T, id string) db.Asset {
+	t.Helper()
+	asset, err := h.store.Asset(context.Background(), id)
+	if err != nil {
+		t.Fatalf("reload asset: %v", err)
+	}
+	return asset
+}
+
+// waitFor polls until cond holds or the deadline passes. The pools are
+// asynchronous, so there is nothing to synchronise on but the outcome.
+func (h *harness) waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func (h *harness) jobState(t *testing.T, assetID string, kind jobs.Kind) string {
+	t.Helper()
+	var state string
+	err := h.store.Pool().QueryRow(context.Background(),
+		`select state from jobs where asset_id = $1::uuid and kind = $2`, assetID, string(kind)).Scan(&state)
+	if err != nil {
+		t.Fatalf("read job state: %v", err)
+	}
+	return state
+}
+
+func withDatabase(t *testing.T, rawURL, name string) string {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse database url: %v", err)
+	}
+	u.Path = "/" + name
+	return u.String()
+}
+
+func ensureTestDatabase(t *testing.T, ctx context.Context, adminURL string) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, adminURL)
+	if err != nil {
+		t.Fatalf("connect to Postgres: %v\n\nIs Postgres up? Run: docker compose up -d", err)
+	}
+	defer conn.Close(ctx)
+
+	var exists bool
+	if err := conn.QueryRow(ctx, "select exists (select 1 from pg_database where datname = $1)", testDBName).Scan(&exists); err != nil {
+		t.Fatalf("look up test database: %v", err)
+	}
+	if exists {
+		return
+	}
+	if _, err := conn.Exec(ctx, fmt.Sprintf("create database %s", pgx.Identifier{testDBName}.Sanitize())); err != nil {
+		t.Fatalf("create test database: %v", err)
+	}
+}
