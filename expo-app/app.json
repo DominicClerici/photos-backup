@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "photobackup-spike",
+    "slug": "expo-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.dominicrumor.photobackup",
+      "infoPlist": {
+        "NSLocalNetworkUsageDescription": "Finds the photobackup server on your local network.",
+        "NSBonjourServices": ["_photobackup._tcp"],
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-dev-client",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "photobackup reads your photo library to back it up.",
+          "savePhotosPermission": "photobackup does not save photos; this is unused.",
+          "isAccessMediaLocationEnabled": true
+        }
+      ]
+    ],
+    "experiments": {
+      "reactCompiler": true
+    }
+  }
+}
