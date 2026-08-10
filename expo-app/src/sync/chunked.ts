@@ -48,6 +48,10 @@ export class ChunkTransport {
       const response = await this.sendBlob(url, headers, chunk);
       if (this.strategy === 'unknown') {
         this.strategy = 'blob';
+        // Logged on the way up as well as the way down: which strategy a real
+        // phone lands on is the open question this class exists to answer, and
+        // silence on success would leave it open.
+        this.onLog?.('chunk upload: Blob bodies accepted; slices stream straight from storage');
       }
       return response;
     } catch (e) {
