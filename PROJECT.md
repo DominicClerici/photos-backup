@@ -273,7 +273,7 @@ run, driven by `cmd/loadgen` — a Go client that speaks the phone's exact
 protocol, so the archive can be run at size without a phone in the loop. It is a
 test client, not a product surface; if it and the app ever disagree, it is wrong.
 
-Three things that 110 items could not have shown, all of them found by the
+Four things that 110 items could not have shown, all of them found by the
 rehearsal rather than by reading the code:
 
 **216 files had no extension.** A Takeout export strips it off every Live
@@ -294,7 +294,14 @@ original on the phone, every time. Timestamps are now normalized on the way in.
 `TRANSCODE_CONCURRENCY=1` that queue outlives the uploads by a wide margin. The
 split pools did their job — thumbnails were never starved, and the gallery was
 usable long before the transcodes finished — but the number wants raising on a
-machine that is otherwise idle.
+machine that is otherwise idle. It drained to zero with nothing failed.
+
+**The lease survives a hard kill.** photod and its ffmpeg were killed outright
+partway through the transcode queue. On restart the abandoned job sat in
+`running` until its lease expired, was reclaimed, ran again, and finished: one
+job in the whole queue ended with `attempts = 2` and none ended failed. That the
+reclaim path was exercised by an actual crash rather than by a test with a zero
+lease is the only reason it counts for much.
 
 Deferred deliberately: pairing, device tokens, and TLS. §6 describes them and no
 phase owned them; they are their own phase now, after the pipe is proven.

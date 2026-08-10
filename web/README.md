@@ -13,8 +13,14 @@ pnpm dev                               # http://localhost:3000
 
 | variable | default | meaning |
 |---|---|---|
-| `PHOTOD_URL` | `http://localhost:8787` | where `/api/*` is proxied (build/server side) |
+| `PHOTOD_URL` | `http://localhost:8787` | where `/api/*` is proxied |
 | `NEXT_PUBLIC_MEDIA_BASE` | unset — use the proxy | origin for thumbnails, previews, and video |
+
+Both are read at **build** time, not at start time. `rewrites()` is evaluated by
+`next build` and frozen into `.next/routes-manifest.json`, so setting
+`PHOTOD_URL` in front of `pnpm start` does nothing — the server keeps proxying to
+whatever was set when it was built, and every `/api/*` request 500s with
+`ECONNREFUSED` if that host is not there. Set it for the build.
 
 ```sh
 pnpm test     # layout arithmetic, via node --test

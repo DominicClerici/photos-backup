@@ -236,6 +236,16 @@ tree is meaningless without the database; this is how that price is paid back,
 and it costs no bytes. It refuses to cross a filesystem boundary rather than
 silently falling back to copying — `--copy` if that is genuinely wanted.
 
+Measure that claim with one `du` over both trees, not two: `du -shc blobs
+export` reports the export at 0B because it counts each inode once, while `du
+-sh export` on its own reports the full library again. The second number is the
+apparent size, not new bytes on the disk.
+
+A live export is also a second reference to every blob, so deleting one out of
+the blob tree frees nothing until the export goes too. Accidental protection
+rather than a designed feature, but worth knowing before concluding a delete did
+not take.
+
 **reindex** replays `manifest.jsonl`, restoring asset rows *and* the device
 mappings. The mappings matter as much as the rows: without them the phone is
 told "unknown" for everything it holds and re-hashes its whole library on the
@@ -243,6 +253,15 @@ next run, recovering the archive but not the property that makes backing it up
 cheap. `--adopt-orphans` also indexes blobs the log never recorded, reading
 their type off the file. Idempotent, so running it against a merely incomplete
 database is safe.
+
+It restores those mappings only for the device that *uploaded* each blob. A
+second device holding the same photos never stored anything — `sync/check`
+matched it by content and recorded the mapping in the database alone — and the
+manifest is a log of stored blobs, so there was never a line to replay. After a
+rebuild that device is told "unknown" once, hashes its library, matches by
+content again, and is back to instant on the run after. One expensive run per
+extra device, self-healing, and not fixable without logging something other than
+what was stored.
 
 ## Dependencies
 
