@@ -1,0 +1,33 @@
+# The weekly deep audit: re-hash every original and report anything that no
+# longer matches. This is the bit-rot check, and it is the only thing standing
+# between a single-drive archive and silent decay.
+#
+# UNTESTED. See deploy/README.md.
+
+[Unit]
+Description=Deep-verify the photo archive
+Documentation=https://github.com/dominicclerici/photos-backup
+RequiresMountsFor=/mnt/photos
+
+[Service]
+Type=oneshot
+User=photod
+Group=photod
+EnvironmentFile=/etc/photod/photod.env
+# --fix handles the repairs with one obvious answer: a missing manifest line, a
+# derivative that needs rebuilding, an abandoned partial upload. It deliberately
+# does not touch a damaged original — exit code 2 means a human is needed.
+ExecStart=/usr/local/bin/photobackup verify --deep --fix --quiet
+
+# Reading several terabytes should never be what makes the machine feel slow.
+Nice=15
+IOSchedulingClass=idle
+
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/mnt/photos /var/lib/photod
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+# A deep pass over 6TB is hours. No timeout.
+TimeoutStartSec=infinity

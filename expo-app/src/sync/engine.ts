@@ -5,6 +5,7 @@ import {
   TRANSPORT_BACKOFF,
   type BackoffPolicy,
 } from './backoff';
+import { CHUNK_THRESHOLD } from './chunkPlan';
 import {
   asSyncError,
   emptyCounts,
@@ -36,18 +37,37 @@ export type EngineConfig = {
    */
   hashBatchSize: number;
   uploadConcurrency: number;
+  /**
+   * Originals at or above this size take the resumable path. Below it, a failed
+   * upload costs one cheap retry.
+   */
+  chunkThreshold: number;
   itemBackoff: BackoffPolicy;
   transportBackoff: BackoffPolicy;
 };
 
 export const DEFAULT_ENGINE_CONFIG: Omit<EngineConfig, 'deviceId'> = {
-  maxItems: 110,
+  // The whole library. Phase 2 capped this at the 110-item test fixture; a real
+  // backfill is the entire camera roll and the cap would silently leave most of
+  // it unarchived.
+  maxItems: 0,
   checkBatchSize: 200,
   hashBatchSize: 25,
   uploadConcurrency: 3,
+  chunkThreshold: CHUNK_THRESHOLD,
   itemBackoff: ITEM_BACKOFF,
   transportBackoff: TRANSPORT_BACKOFF,
 };
+
+/**
+ * How often progress reaches React while work is running.
+ *
+ * The engine reports after every item, which at 110 items is a rendered update
+ * per photo and at 40,000 is the run loop spending most of its time in the
+ * renderer. Coalescing to a few frames a second keeps the label honest and the
+ * uploads moving.
+ */
+const PROGRESS_INTERVAL_MS = 250;
 
 export type EngineDeps = {
   store: QueueStore;
@@ -73,6 +93,8 @@ export class SyncEngine {
   private latestCounts: StateCounts = emptyCounts();
   private stopping = false;
   private running = false;
+  private lastReportAt = 0;
+  private lastPhase: Phase | null = null;
 
   constructor(
     private readonly deps: EngineDeps,
@@ -305,7 +327,7 @@ export class SyncEngine {
       // Set before the hash begins. File.md5 is a synchronous JSI call and
       // nothing repaints while it runs, so a label written afterwards would
       // never be seen.
-      this.report('hashing', `Preparing ${item.filename} — the app may freeze briefly`);
+      this.report('hashing', `Preparing ${item.filename} — the app may freeze briefly`, true);
       await this.deps.clock.sleep(0);
 
       let opened: OpenedAsset;
@@ -362,7 +384,8 @@ export class SyncEngine {
       return;
     }
 
-    this.report('uploading', `Uploading ${item.filename}`);
+    const resumable = item.size >= this.config.chunkThreshold;
+    this.report('uploading', `Uploading ${item.filename}`, true);
 
     let opened: OpenedAsset;
     try {
@@ -388,7 +411,7 @@ export class SyncEngine {
         return;
       }
 
-      const response = await this.deps.transport.upload({
+      const request = {
         deviceId: this.config.deviceId,
         localId: item.localId,
         uri: opened.uri,
@@ -397,7 +420,19 @@ export class SyncEngine {
         size: item.size,
         createdAt: item.createdAt,
         modifiedAt: item.modifiedAt,
-      });
+      };
+
+      // A big video is minutes of silence on the single-shot path. The
+      // resumable one knows how far it has got, so it can say.
+      const response = resumable
+        ? await this.deps.transport.uploadResumable(request, (sent, total) => {
+            // The last update is forced: intermediate percentages can coalesce,
+            // but a label left reading 88% after the bytes are all across is
+            // just wrong, and it is the one a stalled-looking upload gets
+            // judged on.
+            this.report('uploading', `Uploading ${item.filename} — ${percent(sent, total)}`, sent >= total);
+          })
+        : await this.deps.transport.upload(request);
       this.breaker.reset();
 
       // Only now, after the ack. A crash before this point costs one re-upload;
@@ -473,7 +508,28 @@ export class SyncEngine {
     this.latestCounts = await this.deps.store.counts();
   }
 
-  private report(phase: Phase, activity: string): void {
+  /**
+   * Reports progress, coalescing repeats within a phase to a few a second.
+   *
+   * A change of phase always goes through: "the server is unreachable" and
+   * "retrying in 30s" are the whole reason anyone is looking at this screen, and
+   * dropping one because it landed too soon after the last upload line would
+   * leave the app claiming to be doing something it stopped doing.
+   *
+   * What gets throttled is the 40,000th "Uploading IMG_4823" — same phase, new
+   * label, and a re-render per item is the run loop's biggest cost at that size.
+   * `force` overrides for a label written immediately before something that
+   * blocks the JS thread, which would otherwise never be painted at all.
+   */
+  private report(phase: Phase, activity: string, force = false): void {
+    const now = this.deps.clock.now();
+    const changed = phase !== this.lastPhase;
+    if (!force && !changed && now - this.lastReportAt < PROGRESS_INTERVAL_MS) {
+      return;
+    }
+    this.lastReportAt = now;
+    this.lastPhase = phase;
+
     this.deps.onProgress?.({
       phase,
       activity,
@@ -485,4 +541,10 @@ export class SyncEngine {
   private log(line: string): void {
     this.deps.onLog?.(line);
   }
+}
+
+/** A whole-number percentage, for a progress label. */
+function percent(sent: number, total: number): string {
+  if (total <= 0) return '0%';
+  return `${Math.min(100, Math.floor((sent / total) * 100))}%`;
 }

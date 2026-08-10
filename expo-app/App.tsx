@@ -14,6 +14,7 @@ import {
 
 import { DEFAULT_MAX_ITEMS, loadConfig, saveConfig, type Config } from './src/config';
 import { resolveServer, type ServerResolution } from './src/discovery';
+import { DEFAULT_GATE, NO_GATE, readConditions } from './src/sync/conditions';
 import { DEFAULT_ENGINE_CONFIG, SyncEngine } from './src/sync/engine';
 import { PhotoKitMediaSource } from './src/sync/media';
 import { openQueueStore, type SqliteQueueStore } from './src/sync/sqliteStore';
@@ -45,6 +46,8 @@ export default function App() {
   const [failed, setFailed] = useState<QueueItem[]>([]);
   const [logLines, setLogLines] = useState<string[]>([]);
   const [runError, setRunError] = useState<string | null>(null);
+  /** Why a backup is being held back — charging, Wi-Fi — or null. */
+  const [heldBecause, setHeldBecause] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
 
   // The transport reads this on every request, so a re-resolved address takes
@@ -110,33 +113,46 @@ export default function App() {
     void findServer();
   }, [findServer]);
 
-  const start = useCallback(async () => {
-    if (!store || engine.current?.isRunning) return;
-    setRunError(null);
-    setRunning(true);
+  const start = useCallback(
+    async (override = false) => {
+      if (!store || engine.current?.isRunning) return;
+      setRunError(null);
 
-    const instance = new SyncEngine(
-      {
-        store,
-        media: new PhotoKitMediaSource(),
-        transport: new HttpTransport(() => serverUrl.current),
-        clock: systemClock,
-        onProgress: setProgress,
-        onLog: (line) => setLogLines((lines) => [line, ...lines].slice(0, 20)),
-      },
-      { ...DEFAULT_ENGINE_CONFIG, deviceId: config.deviceId, maxItems: config.maxItems }
-    );
-    engine.current = instance;
+      // Risk 6: 100GB heats the phone and drains the battery. Bulk work waits
+      // for a charger and Wi-Fi unless the user explicitly says otherwise, and
+      // the reason it is waiting is on screen rather than implied by nothing
+      // happening.
+      const conditions = await readConditions(override ? NO_GATE : DEFAULT_GATE);
+      setHeldBecause(conditions.blockedBy);
+      if (conditions.blockedBy) return;
 
-    try {
-      await instance.run();
-    } catch (e) {
-      setRunError(errorText(e));
-    } finally {
-      setRunning(false);
-      await refreshQueue(store);
-    }
-  }, [store, config.deviceId, config.maxItems, refreshQueue]);
+      setRunning(true);
+      const log = (line: string) => setLogLines((lines) => [line, ...lines].slice(0, 20));
+
+      const instance = new SyncEngine(
+        {
+          store,
+          media: new PhotoKitMediaSource(),
+          transport: new HttpTransport(() => serverUrl.current, log),
+          clock: systemClock,
+          onProgress: setProgress,
+          onLog: log,
+        },
+        { ...DEFAULT_ENGINE_CONFIG, deviceId: config.deviceId, maxItems: config.maxItems }
+      );
+      engine.current = instance;
+
+      try {
+        await instance.run();
+      } catch (e) {
+        setRunError(errorText(e));
+      } finally {
+        setRunning(false);
+        await refreshQueue(store);
+      }
+    },
+    [store, config.deviceId, config.maxItems, refreshQueue]
+  );
 
   const pause = useCallback(() => {
     engine.current?.stop();
@@ -220,7 +236,7 @@ export default function App() {
           <View style={styles.row}>
             <Pressable
               style={[styles.button, styles.grow, !canStart && styles.buttonDisabled]}
-              onPress={start}
+              onPress={() => start()}
               disabled={!canStart}
             >
               <Text style={styles.buttonText}>{running ? 'Running…' : 'Start backup'}</Text>
@@ -233,6 +249,18 @@ export default function App() {
               <Text style={styles.buttonText}>Pause</Text>
             </Pressable>
           </View>
+
+          {heldBecause && !running && (
+            <View style={styles.status}>
+              <Text style={styles.statusText}>
+                Holding off — {heldBecause}. A full backup warms the phone up and eats
+                battery, so it waits for a charger and Wi-Fi.
+              </Text>
+              <Pressable style={styles.button} onPress={() => void start(true)}>
+                <Text style={styles.buttonText}>Back up anyway</Text>
+              </Pressable>
+            </View>
+          )}
 
           <View style={styles.status}>
             {running && <ActivityIndicator color="#8ab4f8" />}

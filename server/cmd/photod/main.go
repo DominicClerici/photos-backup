@@ -24,6 +24,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
+	"github.com/dominicclerici/photos-backup/server/internal/uploads"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
 	"github.com/dominicclerici/photos-backup/server/internal/worker"
 )
@@ -77,6 +78,9 @@ func run(log *slog.Logger) error {
 	queue := jobs.NewQueue(store.Pool())
 	blobs := blobstore.New(root)
 	derivatives := derivstore.New(derivRoot)
+	// Beside the blobs, not on the SSD: a committed session becomes a blob by
+	// rename, and a rename only works within one filesystem.
+	staging := uploads.New(filepath.Join(root, "incoming"))
 
 	srv := &api.Server{
 		Store:       store,
@@ -85,8 +89,11 @@ func run(log *slog.Logger) error {
 		Manifest:    manifest.New(filepath.Join(root, "manifest.jsonl")),
 		Converter:   converter,
 		Queue:       queue,
+		Uploads:     staging,
 		Log:         log,
 	}
+
+	go sweepUploads(ctx, log, staging, cfg.UploadSessionTTL)
 
 	// Missing tooling is reported, never fatal. An upload has to be able to
 	// reach the disk on a host where ffmpeg was never installed — the archive
@@ -170,6 +177,37 @@ func run(log *slog.Logger) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		return httpSrv.Shutdown(shutdownCtx)
+	}
+}
+
+// sweepUploads clears abandoned partial uploads, once at startup and hourly
+// after that.
+//
+// A phone that gives up on a video mid-transfer leaves its bytes behind, and
+// nothing else ever references them. Without this the archive quietly grows a
+// pile of partials that `du` can see and no query can explain.
+func sweepUploads(ctx context.Context, log *slog.Logger, staging *uploads.Store, ttl time.Duration) {
+	sweep := func() {
+		removed, err := staging.Sweep(ttl)
+		if err != nil {
+			log.Warn("could not sweep partial uploads", "error", err, "dir", staging.Dir())
+			return
+		}
+		if removed > 0 {
+			log.Info("swept abandoned partial uploads", "count", removed, "older_than", ttl)
+		}
+	}
+
+	sweep()
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
 	}
 }
 

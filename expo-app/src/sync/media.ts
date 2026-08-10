@@ -8,6 +8,7 @@ import {
   type AssetMetadata,
 } from 'expo-media-library';
 
+import { sweepChunks } from './chunked';
 import {
   errorText,
   SyncError,
@@ -164,12 +165,19 @@ export class PhotoKitMediaSource implements MediaSource {
     };
   }
 
-  /** Deletes extracted videos a previous run left behind. */
+  /**
+   * Deletes temporary files a previous run left behind: extracted Live Photo
+   * videos, and any chunk the resumable uploader staged before it was killed.
+   *
+   * Both leak 8MB-to-100MB at a time on a device with finite space, and neither
+   * is enumerable from anywhere else once the run that created it is gone.
+   */
   async sweep(): Promise<number> {
-    const directory = liveDirectory();
-    if (!directory.exists) return 0;
+    let removed = sweepChunks();
 
-    let removed = 0;
+    const directory = liveDirectory();
+    if (!directory.exists) return removed;
+
     for (const entry of directory.list()) {
       if (entry instanceof File && deleteQuietly(entry)) removed += 1;
     }

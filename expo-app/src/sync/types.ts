@@ -114,9 +114,19 @@ export type UploadResponse = {
   duplicate: boolean;
 };
 
+/** Fraction of one original that has reached the server, for the progress line. */
+export type UploadProgress = (sent: number, total: number) => void;
+
 export interface Transport {
   check(deviceId: string, items: CheckRequestItem[]): Promise<CheckResultItem[]>;
   upload(request: UploadRequest): Promise<UploadResponse>;
+  /**
+   * The resumable path, for originals big enough that restarting one is a real
+   * cost. Asks the server where it got to and sends only the rest, so a video
+   * interrupted by a dropped connection or an app kill continues rather than
+   * starting over.
+   */
+  uploadResumable(request: UploadRequest, onProgress?: UploadProgress): Promise<UploadResponse>;
 }
 
 export type EnumeratedAsset = NewItem;

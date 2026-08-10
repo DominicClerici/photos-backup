@@ -16,6 +16,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
+	"github.com/dominicclerici/photos-backup/server/internal/uploads"
 )
 
 type Server struct {
@@ -25,6 +26,10 @@ type Server struct {
 	Manifest    *manifest.Log
 	Converter   *derive.Converter
 	Queue       *jobs.Queue
+	// Uploads holds partially-received originals. Optional: without it the
+	// resumable endpoints answer 404 and single-shot uploads still work, which
+	// is the right degradation for a server whose staging directory is gone.
+	Uploads *uploads.Store
 	// Nudge wakes the derivative workers after an upload commits, so the first
 	// thumbnail appears in about the time it takes to make one rather than at
 	// the next poll. Optional: without it the pools still find the work.
@@ -37,6 +42,14 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("POST /v1/sync/check", s.handleSyncCheck)
 	mux.HandleFunc("POST /v1/assets", s.handleUpload)
+
+	// Resumable uploads. The id is derived from the declaration, so POST
+	// /v1/uploads is both "begin" and "where did I get to".
+	mux.HandleFunc("POST /v1/uploads", s.handleCreateUpload)
+	mux.HandleFunc("GET /v1/uploads/{id}", s.handleUploadStatus)
+	mux.HandleFunc("PUT /v1/uploads/{id}", s.handleUploadChunk)
+	mux.HandleFunc("POST /v1/uploads/{id}/commit", s.handleCommitUpload)
+	mux.HandleFunc("DELETE /v1/uploads/{id}", s.handleAbortUpload)
 
 	mux.HandleFunc("GET /v1/timeline", s.handleTimeline)
 	mux.HandleFunc("POST /v1/timeline/states", s.handleTimelineStates)
@@ -91,34 +104,6 @@ func (s *Server) lookup(w http.ResponseWriter, r *http.Request) (db.Asset, bool)
 func isBadUUID(err error) bool {
 	return strings.Contains(err.Error(), "invalid input syntax for type uuid") ||
 		strings.Contains(err.Error(), "invalid UUID")
-}
-
-func contentTypeFor(ext string) string {
-	switch strings.ToLower(ext) {
-	case ".heic", ".heif":
-		return "image/heic"
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".png":
-		return "image/png"
-	case ".gif":
-		return "image/gif"
-	case ".mov":
-		return "video/quicktime"
-	case ".mp4", ".m4v":
-		return "video/mp4"
-	default:
-		return "application/octet-stream"
-	}
-}
-
-// mediaKindFor classifies an upload once, on the way in, so no query downstream
-// has to pattern-match a MIME string.
-func mediaKindFor(contentType string) string {
-	if strings.HasPrefix(contentType, "video/") {
-		return db.MediaVideo
-	}
-	return db.MediaImage
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

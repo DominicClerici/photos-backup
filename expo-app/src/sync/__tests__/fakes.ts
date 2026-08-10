@@ -7,6 +7,7 @@ import type {
   OpenedAsset,
   QueueItem,
   Transport,
+  UploadProgress,
   UploadRequest,
   UploadResponse,
 } from '../types';
@@ -48,6 +49,8 @@ type UploadResponder = (request: UploadRequest, callIndex: number) => UploadResp
 export class FakeTransport implements Transport {
   readonly checkCalls: CheckCall[] = [];
   readonly uploads: UploadRequest[] = [];
+  /** Local ids that went down the resumable path rather than single-shot. */
+  readonly resumable: string[] = [];
 
   constructor(
     private readonly checkResponder: CheckResponder,
@@ -64,6 +67,22 @@ export class FakeTransport implements Transport {
   async upload(request: UploadRequest): Promise<UploadResponse> {
     const index = this.uploads.length;
     this.uploads.push(request);
+    return this.uploadResponder(request, index);
+  }
+
+  async uploadResumable(
+    request: UploadRequest,
+    onProgress?: UploadProgress
+  ): Promise<UploadResponse> {
+    const index = this.uploads.length;
+    this.uploads.push(request);
+    this.resumable.push(request.localId);
+
+    // Two updates, so a test can tell that progress was reported at all and
+    // that it ended at the full size.
+    onProgress?.(Math.floor(request.size / 2), request.size);
+    onProgress?.(request.size, request.size);
+
     return this.uploadResponder(request, index);
   }
 }

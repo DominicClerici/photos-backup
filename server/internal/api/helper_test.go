@@ -25,6 +25,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
+	"github.com/dominicclerici/photos-backup/server/internal/uploads"
 )
 
 const (
@@ -85,6 +86,7 @@ func newHarness(t *testing.T) *harness {
 		Manifest:    manifest.New(manifestPath),
 		Converter:   derive.New(),
 		Queue:       jobs.NewQueue(store.Pool()),
+		Uploads:     uploads.New(filepath.Join(root, "incoming")),
 		Nudge:       func() { h.nudges.Add(1) },
 		Log:         slog.New(slog.DiscardHandler),
 	}

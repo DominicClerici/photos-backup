@@ -26,10 +26,12 @@ proxies `/api/*` here; see its README to bring the browser side up.
 | `WORKER_DISABLED` | unset | run as a pure API server; nothing drains the queue |
 | `VIDEO_ENCODER` | `libx264` | ffmpeg encoder for playback renditions |
 | `MAGICK_BIN` / `FFMPEG_BIN` / `FFPROBE_BIN` / `EXIFTOOL_BIN` | on `PATH` | binary overrides |
+| `UPLOAD_SESSION_TTL` | `24h` | how long an abandoned partial upload is kept |
 | `MDNS_DISABLED` | unset | stop advertising; publish via Avahi instead |
 
 Moving to the archive machine is `PHOTOS_ROOT=/mnt/photos` plus a
-`DERIVATIVES_ROOT` on the SSD. Nothing else changes.
+`DERIVATIVES_ROOT` on the SSD. Nothing else changes; `deploy/` has the systemd
+units and the Fedora notes.
 
 `DERIVATIVES_ROOT` is separate because the two directories want opposite
 things: originals want the big slow drive and can never be regenerated;
@@ -41,6 +43,11 @@ rebuilt from the blobs.
 ```
 POST /v1/sync/check              dedup pre-check
 POST /v1/assets                  raw body, metadata in X-Photo-* headers
+POST /v1/uploads                 open or resume a chunked upload
+GET  /v1/uploads/{id}            how much of it the server holds
+PUT  /v1/uploads/{id}            one chunk, positioned by Content-Range
+POST /v1/uploads/{id}/commit     verify, store, index
+DELETE /v1/uploads/{id}          abandon
 GET  /v1/timeline                JSON page, newest first, keyset cursor
 POST /v1/timeline/states         re-read derivative state for specific ids
 GET  /v1/assets/{id}             JSON metadata for the viewer panel
@@ -59,6 +66,72 @@ Upload headers: `X-Photo-Filename`, `X-Photo-Md5`, `X-Photo-Size`,
 Every media response is content-addressed, so it carries a strong `ETag` and
 `Cache-Control: immutable`. `/preview` checks `If-None-Match` *before*
 converting, which is what keeps paging back through a viewer free.
+
+## Resumable uploads
+
+Anything under 64MB goes through `POST /v1/assets` in one request. Above that,
+the client opens a session and sends 8MB chunks.
+
+The session id is **derived from the declaration** — `sha256(deviceId, localId,
+md5, size)` — rather than allocated. So `POST /v1/uploads` is both "begin" and
+"where did I get to": a phone killed mid-video knows nothing about the transfer
+beyond the file it was sending, asks the same question again, and is told the
+offset. Nothing about an in-flight upload has to survive on the client.
+
+Partial uploads live in `$PHOTOS_ROOT/incoming` as `<id>.part` alongside a
+`<id>.json` holding the declaration. The received length *is* the size of the
+part file, so there is no counter that can disagree with the bytes. Every chunk
+is appended and `fsync`ed before its new offset is reported, which is what makes
+a reported offset a promise rather than a guess.
+
+A chunk that starts anywhere else gets `409` **with the real offset in the body**,
+so a client whose idea of progress has drifted re-seeks instead of restarting a
+550MB video. Commit re-reads the assembled file to compute both digests, checks
+them against the declaration, and renames it into the blob tree — from there it
+is the same code a single-shot upload runs, so the two cannot drift apart.
+
+Abandoned sessions are swept at startup and hourly (`UPLOAD_SESSION_TTL`), and
+by `photobackup verify --fix`.
+
+`incoming/` is under `PHOTOS_ROOT` and not separately configurable, because a
+committed session becomes a blob by rename and a rename cannot cross a
+filesystem.
+
+## Classifying an upload
+
+The filename's extension is trusted when it is recognised, and the leading 512
+bytes settle it when it is not. That is not a nicety: a Google Takeout export
+strips the extension off every Live Photo's paired video, and 216 of the 3,116
+files in the Phase 4 test corpus arrived that way. Without sniffing they became
+`application/octet-stream`, were filed as images, failed their thumbnail, and
+never had a playback rendition queued.
+
+Go's `http.DetectContentType` is not enough on its own — it only recognises MP4
+brands containing "mp4", so it calls every HEIC and every QuickTime movie an
+octet-stream. `internal/mediatype` reads the `ftyp` brands properly, including
+the compatible-brand list where HEIC usually hides, and recognises the
+`ftyp`-less QuickTime that iOS writes with `moov` at the end, which even
+`file(1)` reports as "data".
+
+A file nothing identifies is still archived, as an octet-stream. An archive that
+refuses what it cannot classify is not an archive.
+
+## Timestamp precision
+
+Client-supplied capture and modification times are truncated to milliseconds on
+the way in, and compared at that precision afterwards.
+
+This is load-bearing. A device mapping is only trusted while its stored
+`modified_at` still equals what the phone reports, and that equality is exact.
+Go carries nanoseconds, Postgres stores microseconds, and JSON and RFC3339
+headers disagree about how many decimals to write — so a client that spells the
+same instant two different ways stores one and asks about the other, is told
+"unknown" forever, and re-hashes its entire library on every run. The Phase 4
+load harness did exactly this, and at 100GB it is the difference between a
+backup that finishes and one that reads every original on the phone every time.
+
+Milliseconds because that is the precision an iOS asset date actually has once
+it has been through JavaScript; `Date.toISOString()` always emits three decimals.
 
 ## Derivatives
 
@@ -126,8 +199,50 @@ A crash after the blob lands leaves the archive intact and the index behind;
 re-uploading the same bytes reconciles it, because every step keys off the
 SHA-256 and is idempotent.
 
-The one known gap: a crash between the rename and the manifest append leaves a
-blob with no manifest line. `photobackup verify` reconciles that in Phase 4.
+The one known gap — a crash between the rename and the manifest append leaves a
+blob with no manifest line — is what `photobackup verify --fix` reconciles, and
+what `photobackup reindex --adopt-orphans` recovers if the database is also gone.
+
+## photobackup
+
+The maintenance CLI. Reads the same environment photod does.
+
+```sh
+photobackup verify [--deep] [--fix]     audit the archive against itself
+photobackup export --to DIR [--copy]    materialize a date tree of hardlinks
+photobackup reindex [--adopt-orphans]   rebuild the database from manifest.jsonl
+```
+
+**verify** runs five passes: assets against blobs, blobs against assets, the
+manifest in both directions, and the derivative state against the files it
+claims. Default is `stat` only and takes seconds; `--deep` re-hashes every
+original, which is the bit-rot check and what the weekly timer runs.
+
+`--fix` applies only the repairs with one obvious answer: append a missing
+manifest line from the database row, re-enqueue a derivative that has gone
+missing, delete an abandoned partial. It never deletes a blob and never
+"repairs" a hash mismatch — the only honest response to an original that no
+longer matches its own name is a human with a second copy.
+
+| exit | meaning |
+|---|---|
+| 0 | intact |
+| 1 | findings, none of them lost or damaged originals |
+| 2 | originals missing or no longer matching their hash |
+
+**export** materializes `YYYY/YYYY-MM-DD/original-filename` as hardlinks to the
+blobs, using the same sort time and UTC offset the gallery groups on. The blob
+tree is meaningless without the database; this is how that price is paid back,
+and it costs no bytes. It refuses to cross a filesystem boundary rather than
+silently falling back to copying — `--copy` if that is genuinely wanted.
+
+**reindex** replays `manifest.jsonl`, restoring asset rows *and* the device
+mappings. The mappings matter as much as the rows: without them the phone is
+told "unknown" for everything it holds and re-hashes its whole library on the
+next run, recovering the archive but not the property that makes backing it up
+cheap. `--adopt-orphans` also indexes blobs the log never recorded, reading
+their type off the file. Idempotent, so running it against a merely incomplete
+database is safe.
 
 ## Dependencies
 

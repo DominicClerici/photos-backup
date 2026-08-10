@@ -2,6 +2,9 @@
 server/data/
 photos/
 
+# Where the Phase 4 load runs put their archive.
+server/loaddata/
+
 node_modules/
 .DS_Store
 

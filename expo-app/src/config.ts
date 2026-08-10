@@ -5,10 +5,15 @@ const CONFIG_FILE = new File(Paths.document, 'photobackup-config.json');
 export const DEFAULT_SERVER = 'http://10.0.4.120:8787';
 
 /**
- * The Phase 2 exit criterion is 110 items. 0 means the whole library, which is
- * what Phase 4 switches to for the real backfill.
+ * 0 means the whole library, which is what a real backup is.
+ *
+ * Phase 2 defaulted this to 110, the size of the test fixture. That was right
+ * while the exit criterion was those 110 items and wrong the moment the app was
+ * pointed at a real camera roll, where it would quietly archive the newest
+ * hundred photos and call itself up to date. The field is still editable, for
+ * deliberately limiting a test run.
  */
-export const DEFAULT_MAX_ITEMS = 110;
+export const DEFAULT_MAX_ITEMS = 0;
 
 export type Config = {
   /** Typed in by hand; the fallback when mDNS finds nothing. */

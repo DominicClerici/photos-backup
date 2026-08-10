@@ -111,9 +111,11 @@ func validateCheckRequest(req syncCheckRequest) error {
 // different assets identify nothing, and fall through to want: the bytes come
 // over the wire and the real sha256 settles it.
 func (s *Server) checkItems(ctx context.Context, deviceID string, items []syncCheckItem) ([]syncCheckResult, error) {
+	// Normalized to the same precision the upload path stores, or the equality
+	// this lookup depends on could never hold. See normalizeTime.
 	refs := make([]db.LocalRef, len(items))
 	for i, item := range items {
-		refs[i] = db.LocalRef{LocalID: item.LocalID, ModifiedAt: item.ModifiedAt}
+		refs[i] = db.LocalRef{LocalID: item.LocalID, ModifiedAt: normalizeTime(item.ModifiedAt)}
 	}
 	known, err := s.Store.KnownMappings(ctx, deviceID, refs)
 	if err != nil {
@@ -163,7 +165,7 @@ func (s *Server) checkItems(ctx context.Context, deviceID string, items []syncCh
 				learned = append(learned, db.Mapping{
 					LocalID:    item.LocalID,
 					AssetID:    matches[key].AssetID,
-					ModifiedAt: item.ModifiedAt,
+					ModifiedAt: normalizeTime(item.ModifiedAt),
 				})
 			}
 		default:

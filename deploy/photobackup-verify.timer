@@ -1,0 +1,21 @@
+# Weekly, overnight. Bit rot is slow; catching it within a week is plenty, and
+# a full re-read of the archive has no business competing with daytime use.
+#
+# UNTESTED. See deploy/README.md.
+#
+#   sudo systemctl enable --now photobackup-verify.timer
+#   systemctl list-timers photobackup-verify
+
+[Unit]
+Description=Weekly deep verify of the photo archive
+
+[Timer]
+OnCalendar=Sun 03:00
+# The machine is a workstation, not a server: it will be asleep or off at 3am
+# often enough that a missed run has to be made up rather than skipped.
+Persistent=true
+# So several timers waking at once do not all start reading the disk together.
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target

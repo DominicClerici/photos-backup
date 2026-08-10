@@ -4,6 +4,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"time"
 )
 
 type Config struct {
@@ -47,6 +48,11 @@ type Config struct {
 	// everywhere; the archive machine's NVIDIA card can try h264_nvenc.
 	VideoEncoder string
 
+	// UploadSessionTTL is how long a partial upload is kept after its last
+	// chunk. Long enough to outlast a phone that lost Wi-Fi overnight, short
+	// enough that abandoned transfers do not accumulate on the archive drive.
+	UploadSessionTTL time.Duration
+
 	// Binary overrides for hosts where the tools are not on PATH.
 	MagickBin   string
 	FFmpegBin   string
@@ -71,6 +77,8 @@ func FromEnv() Config {
 
 		VideoEncoder: or(os.Getenv("VIDEO_ENCODER"), "libx264"),
 
+		UploadSessionTTL: duration(os.Getenv("UPLOAD_SESSION_TTL"), 24*time.Hour),
+
 		MagickBin:   or(os.Getenv("MAGICK_BIN"), "magick"),
 		FFmpegBin:   or(os.Getenv("FFMPEG_BIN"), "ffmpeg"),
 		FFprobeBin:  or(os.Getenv("FFPROBE_BIN"), "ffprobe"),
@@ -94,6 +102,16 @@ func positive(v string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+// duration falls back on anything unparseable or non-positive, for the same
+// reason positive does: a typo should cost the default, not the daemon.
+func duration(v string, fallback time.Duration) time.Duration {
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
 }
 
 func or(v, fallback string) string {

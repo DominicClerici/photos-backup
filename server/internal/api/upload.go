@@ -1,10 +1,12 @@
 package api
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/blobstore"
 	"github.com/dominicclerici/photos-backup/server/internal/db"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
+	"github.com/dominicclerici/photos-backup/server/internal/mediatype"
 )
 
 type uploadResponse struct {
@@ -34,8 +37,19 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ext := strings.ToLower(filepath.Ext(meta.filename))
-	res, err := s.Blobs.Put(r.Body, ext, blobstore.Expected{MD5: meta.md5, Size: meta.size})
+	// Classification has to happen before the blob is stored, because the
+	// content type decides the extension and the extension decides the path.
+	// Peeking off a buffered reader keeps this to one look at the first 512
+	// bytes, with the body still fully streamable afterwards.
+	body := bufio.NewReaderSize(r.Body, mediatype.SniffLen)
+	head, err := body.Peek(mediatype.SniffLen)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, bufio.ErrBufferFull) {
+		writeError(w, http.StatusBadRequest, "could not read upload body: "+err.Error())
+		return
+	}
+	contentType, ext := mediatype.Detect(meta.filename, head)
+
+	res, err := s.Blobs.Put(body, ext, blobstore.Expected{MD5: meta.md5, Size: meta.size})
 	switch {
 	case errors.Is(err, blobstore.ErrChecksumMismatch), errors.Is(err, blobstore.ErrSizeMismatch):
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
@@ -46,17 +60,35 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.finishUpload(w, r.Context(), res, ext, contentType, meta)
+}
+
+// finishUpload is everything after the bytes are safely on disk: the manifest
+// line, the database row, and the nudge that wakes the derivative workers.
+//
+// Both upload paths end here. A single-shot POST and a committed chunked
+// session differ only in how the blob arrived, and giving them separate commit
+// code is how you end up with two commit orderings and tests for one of them.
+func (s *Server) finishUpload(
+	w http.ResponseWriter,
+	ctx context.Context,
+	res blobstore.Result,
+	ext, contentType string,
+	meta uploadMeta,
+) {
 	if res.Created {
 		entry := manifest.Entry{
-			SHA256:     res.SHA256,
-			MD5:        res.MD5,
-			Size:       res.Size,
-			Filename:   meta.filename,
-			CapturedAt: meta.capturedAt,
-			ModifiedAt: meta.modifiedAt,
-			DeviceID:   meta.deviceID,
-			LocalID:    meta.localID,
-			StoredAt:   time.Now().UTC(),
+			SHA256:      res.SHA256,
+			MD5:         res.MD5,
+			Size:        res.Size,
+			Filename:    meta.filename,
+			ContentType: contentType,
+			Ext:         ext,
+			CapturedAt:  meta.capturedAt,
+			ModifiedAt:  meta.modifiedAt,
+			DeviceID:    meta.deviceID,
+			LocalID:     meta.localID,
+			StoredAt:    time.Now().UTC(),
 		}
 		if err := s.Manifest.Append(entry); err != nil {
 			s.logger().Error("append manifest", "error", err, "sha256", res.SHA256)
@@ -65,15 +97,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	contentType := contentTypeFor(ext)
-	id, inserted, err := s.Store.RecordAsset(r.Context(), db.Asset{
+	id, inserted, err := s.Store.RecordAsset(ctx, db.Asset{
 		SHA256:           res.SHA256,
 		MD5:              res.MD5,
 		ByteSize:         res.Size,
 		OriginalFilename: meta.filename,
 		Ext:              ext,
 		ContentType:      contentType,
-		MediaKind:        mediaKindFor(contentType),
+		MediaKind:        mediatype.Kind(contentType),
 		CapturedAt:       meta.capturedAt,
 		ModifiedAt:       meta.modifiedAt,
 		DeviceID:         meta.deviceID,
@@ -155,8 +186,30 @@ func optionalTimeHeader(r *http.Request, name string) (*time.Time, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s is not RFC3339: %q", name, raw)
 	}
-	t = t.UTC()
-	return &t, nil
+	return normalizeTime(&t), nil
+}
+
+// normalizeTime rounds a client-supplied timestamp to a precision the database
+// and every later comparison can agree on.
+//
+// This matters more than it looks. A device mapping is only trusted while its
+// stored modified_at still equals what the phone reports, and that equality is
+// exact. Go carries nanoseconds, Postgres stores microseconds, and JSON and
+// RFC3339 headers disagree about how many decimals to write — so a client that
+// formats the same instant two different ways stores one and asks about the
+// other, is told "unknown" forever, and re-hashes its entire library on every
+// single run. Truncating on the way in makes the comparison stable regardless
+// of how the client spelled it.
+//
+// Milliseconds, because that is the precision an iOS asset date actually has
+// once it has been through JavaScript, and pretending to more is inviting the
+// same mismatch back in a smaller form.
+func normalizeTime(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	rounded := t.UTC().Truncate(time.Millisecond)
+	return &rounded
 }
 
 func requiredHeader(r *http.Request, name string) (string, error) {

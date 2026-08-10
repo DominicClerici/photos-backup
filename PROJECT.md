@@ -265,8 +265,39 @@ second index; neither is worth it before the archive is real.
 ### Phase 4 — Real-load hardening
 
 Chunked resumable video upload, `photobackup verify`, `photobackup export`,
-systemd units, then the real 100GB run. Expect this phase to surface problems that
-110 items never could.
+`photobackup reindex`, systemd units, then the real 100GB run. Expect this phase
+to surface problems that 110 items never could.
+
+Rehearsed against a 9.6GB / 3,116-file Google Takeout export before the real
+run, driven by `cmd/loadgen` — a Go client that speaks the phone's exact
+protocol, so the archive can be run at size without a phone in the loop. It is a
+test client, not a product surface; if it and the app ever disagree, it is wrong.
+
+Three things that 110 items could not have shown, all of them found by the
+rehearsal rather than by reading the code:
+
+**216 files had no extension.** A Takeout export strips it off every Live
+Photo's paired video. Classified by filename alone they became octet-stream
+images: thumbnail failed, no playback rendition queued, error tile in the
+gallery — 7% of the library. The fix is sniffing the leading bytes when the name
+says nothing, which also had to handle the `ftyp`-less QuickTime iOS writes,
+where even `file(1)` gives up and says "data".
+
+**Every run re-hashed the entire library.** The upload path stored `modified_at`
+at one precision and `sync/check` compared it at another, so the device mapping
+could never match and the second run fell all the way through to a content
+check. It self-healed after two runs, which is exactly why 110 items never
+showed it. At 100GB it is the difference between a 300ms no-op and reading every
+original on the phone, every time. Timestamps are now normalized on the way in.
+
+**Videos are the long pole.** 962 of the 3,116 files need a transcode, and at
+`TRANSCODE_CONCURRENCY=1` that queue outlives the uploads by a wide margin. The
+split pools did their job — thumbnails were never starved, and the gallery was
+usable long before the transcodes finished — but the number wants raising on a
+machine that is otherwise idle.
+
+Deferred deliberately: pairing, device tokens, and TLS. §6 describes them and no
+phase owned them; they are their own phase now, after the pipe is proven.
 
 ### v2
 

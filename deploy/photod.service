@@ -1,0 +1,56 @@
+# photod — the archive daemon. Uploads in, gallery out, derivatives in between.
+#
+# UNTESTED. Written alongside Phase 4 while the configuration surface was fresh;
+# it has not yet been run on the Fedora box. See deploy/README.md.
+#
+#   sudo cp deploy/photod.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now photod
+
+[Unit]
+Description=photod photo archive
+Documentation=https://github.com/dominicclerici/photos-backup
+After=network-online.target postgresql.service
+Wants=network-online.target
+# The archive lives on the external drive. Starting without it mounted would
+# create an empty blob tree at the mount point and quietly archive into it,
+# which is worse than not starting.
+RequiresMountsFor=/mnt/photos
+
+[Service]
+Type=simple
+User=photod
+Group=photod
+EnvironmentFile=/etc/photod/photod.env
+ExecStart=/usr/local/bin/photod
+Restart=on-failure
+RestartSec=5s
+
+# An upload in flight should finish rather than be cut off; photod drains for
+# 15s of its own accord, so give it a little more than that.
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# The daemon needs the archive, the derivatives, and nothing else on the disk.
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/mnt/photos /var/lib/photod
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# mDNS needs a UDP socket; nothing here needs anything more exotic.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# ffmpeg and ImageMagick are the whole point of the worker pools, so no
+# MemoryMax here — a 4K transcode legitimately wants a lot. Nice instead, so a
+# backfill never makes the workstation feel slow.
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+
+[Install]
+WantedBy=multi-user.target

@@ -121,6 +121,65 @@ func (s *Store) Put(r io.Reader, ext string, expect Expected) (Result, error) {
 	return res, nil
 }
 
+// Adopt commits a file that is already complete on disk, verifying it against
+// the same declaration a streamed upload is held to and moving it into the blob
+// tree.
+//
+// This is how a resumable upload finishes. The digests are computed by reading
+// the file back rather than by carrying hash state across the chunks that built
+// it: a session can span a server restart, and a re-read of even a 550MB video
+// costs well under a second, where persisting and restoring the internal state
+// of two hashes is a serialization format with nothing to gain.
+//
+// The source file is consumed. On success it has been renamed into the tree; on
+// a digest mismatch it is left where it is for the caller to discard, because a
+// store is not the right place to decide that someone's bytes should be
+// deleted.
+func (s *Store) Adopt(path, ext string, expect Expected) (Result, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return Result{}, fmt.Errorf("open staged upload: %w", err)
+	}
+
+	shaSum := sha256.New()
+	md5Sum := md5.New()
+	size, err := io.Copy(io.MultiWriter(shaSum, md5Sum), f)
+	closeErr := f.Close()
+	if err != nil {
+		return Result{}, fmt.Errorf("read staged upload: %w", err)
+	}
+	if closeErr != nil {
+		return Result{}, fmt.Errorf("close staged upload: %w", closeErr)
+	}
+
+	res := Result{
+		SHA256: hex.EncodeToString(shaSum.Sum(nil)),
+		MD5:    hex.EncodeToString(md5Sum.Sum(nil)),
+		Size:   size,
+	}
+	if res.Size != expect.Size {
+		return Result{}, fmt.Errorf("%w: declared %d, received %d", ErrSizeMismatch, expect.Size, res.Size)
+	}
+	if !strings.EqualFold(res.MD5, expect.MD5) {
+		return Result{}, fmt.Errorf("%w: declared %s, received %s", ErrChecksumMismatch, expect.MD5, res.MD5)
+	}
+
+	dst := s.Path(res.SHA256, ext)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return Result{}, fmt.Errorf("create blob dir: %w", err)
+	}
+	if _, err := os.Stat(dst); err == nil {
+		// Already archived. The staged copy is redundant, not precious.
+		os.Remove(path)
+		return res, nil
+	}
+	if err := os.Rename(path, dst); err != nil {
+		return Result{}, fmt.Errorf("commit blob: %w", err)
+	}
+	res.Created = true
+	return res, nil
+}
+
 // Open returns a reader over a stored blob.
 func (s *Store) Open(sha256hex, ext string) (*os.File, error) {
 	return os.Open(s.Path(sha256hex, ext))
