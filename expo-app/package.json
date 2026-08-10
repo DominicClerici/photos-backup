@@ -27,7 +27,7 @@
   },
   "scripts": {
     "start": "expo start",
-    "ios": "expo run:ios",
+    "ios": "expo run:ios --device",
     "test": "jest",
     "typecheck": "tsc --noEmit"
   },
