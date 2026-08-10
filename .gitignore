@@ -4,3 +4,5 @@ photos/
 
 node_modules/
 .DS_Store
+
+PHOTOS_TEST/
