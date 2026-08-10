@@ -1,8 +1,8 @@
 {
   "expo": {
-    "name": "photobackup",
-    "slug": "photobackup",
-    "version": "0.1.0",
+    "name": "photobackup-spike",
+    "slug": "expo-app",
+    "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -10,15 +10,27 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.dominicrumor.photobackup",
       "infoPlist": {
-        "NSLocalNetworkUsageDescription": "Connects to your photobackup server on the local network.",
+        "NSLocalNetworkUsageDescription": "Finds the photobackup server on your local network.",
+        "NSBonjourServices": ["_photobackup._tcp"],
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
         }
       }
     },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
     "plugins": [
       "expo-dev-client",
-      ["./plugins/withDevelopmentTeam", { "teamId": "5XYSB2XHVT" }],
       [
         "expo-media-library",
         {

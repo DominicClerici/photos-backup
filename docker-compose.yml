@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: photobackup
+      POSTGRES_PASSWORD: photobackup
+      POSTGRES_DB: photobackup
+    ports:
+      - "5432:5432"
+    volumes:
+      # postgres:18+ expects the mount one level up, so it can keep
+      # major-version-specific subdirectories and support pg_upgrade --link.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U photobackup"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:

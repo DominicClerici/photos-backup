@@ -1,0 +1,6 @@
+# Archived originals and the recovery log never belong in git.
+server/data/
+photos/
+
+node_modules/
+.DS_Store

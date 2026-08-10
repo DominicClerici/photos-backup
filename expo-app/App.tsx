@@ -1,425 +1,223 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { StatusBar } from 'expo-status-bar';
+import { usePermissions } from 'expo-media-library';
+import { useCallback, useEffect, useState } from 'react';
 import {
-  AppState,
-  Platform,
+  ActivityIndicator,
+  FlatList,
+  Image,
+  Pressable,
   SafeAreaView,
-  ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from 'react-native';
-import { StatusBar } from 'expo-status-bar';
-import * as MediaLibrary from 'expo-media-library';
 
-import { countLibrary } from './src/library';
-import { clearLog, formatTime, loadPersisted, log as rawLog, subscribe, type LogLine } from './src/log';
-import { fetchTimeline, loadServerUrl, ping, resetTimeline, saveServerUrl } from './src/net';
-import { runMd5, runLegacyMd5 } from './src/tests/q1-md5';
-import { runUploadSourceMatrix } from './src/tests/q1b-uploadsource';
-import { cancelActive, runBackgroundUpload } from './src/tests/q2-background';
-import { runLivePhoto } from './src/tests/q3-livephoto';
-import { runMdns } from './src/tests/q4-mdns';
-import type { TestContext, TestResult } from './src/tests/types';
-import { errText } from './src/tests/types';
-import { Btn, C, Card, KV, LivenessBar, Row, Verdict, mono } from './src/ui';
+import { loadConfig, saveConfig } from './src/config';
+import { recentPhotos, thumbnailUri, type PickerItem } from './src/library';
+import { errorText, uploadAsset, type UploadResult, type UploadStage } from './src/upload';
 
-type Slot = { busy: boolean; result: TestResult | null; error: string | null };
-const IDLE: Slot = { busy: false, result: null, error: null };
+const GRID_COLUMNS = 3;
+const PHOTO_LIMIT = 30;
 
-export default function App() {
-  const [serverUrl, setServerUrl] = useState(loadServerUrl);
-  const [health, setHealth] = useState<string>('not checked');
-  const [healthOk, setHealthOk] = useState<boolean | null>(null);
-  const [perm, setPerm] = useState<MediaLibrary.PermissionResponse | null>(null);
-  const [library, setLibrary] = useState<string>('—');
-  const [lines, setLines] = useState<LogLine[]>([]);
-  const [slots, setSlots] = useState<Record<string, Slot>>({});
-  const [sizeMb, setSizeMb] = useState('20');
-  const [throttleKb, setThrottleKb] = useState('200');
-
-  useEffect(() => subscribe(setLines), []);
+/**
+ * Resolves its own URI on mount rather than resolving the whole page up front,
+ * so a slow PhotoKit lookup delays one tile instead of the entire grid.
+ */
+function Thumbnail({ id }: { id: string }) {
+  const [uri, setUri] = useState<string | null>(null);
 
   useEffect(() => {
-    const restored = loadPersisted();
-    rawLog('app', `launched (restored ${restored} lines from a previous session)`);
-    const sub = AppState.addEventListener('change', (state) => rawLog('appstate', state));
-    MediaLibrary.getPermissionsAsync().then(setPerm);
-    return () => sub.remove();
-  }, []);
+    let active = true;
+    thumbnailUri(id)
+      .then((resolved) => {
+        if (active) setUri(resolved);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [id]);
 
-  const slot = (key: string) => slots[key] ?? IDLE;
+  if (!uri) return <View style={styles.thumbnail} />;
+  return <Image source={{ uri }} style={styles.thumbnail} />;
+}
 
-  const run = useCallback(
-    async (key: string, fn: (ctx: TestContext) => Promise<TestResult>) => {
-      setSlots((s) => ({ ...s, [key]: { busy: true, result: null, error: null } }));
-      rawLog(key, '--- run start ---');
-      const ctx: TestContext = { serverUrl, log: (m) => rawLog(key, m) };
-      try {
-        const result = await fn(ctx);
-        rawLog(key, `--- ${result.ok ? 'PASS' : 'FAIL'}: ${result.verdict} ---`);
-        setSlots((s) => ({ ...s, [key]: { busy: false, result, error: null } }));
-      } catch (e) {
-        rawLog(key, `--- THREW: ${errText(e)} ---`);
-        setSlots((s) => ({ ...s, [key]: { busy: false, result: null, error: errText(e) } }));
-      }
-    },
-    [serverUrl]
-  );
+const STAGE_LABEL: Record<UploadStage, string> = {
+  resolving: 'Resolving original…',
+  hashing: 'Hashing — the app will freeze for a moment',
+  uploading: 'Uploading…',
+  done: 'Done',
+};
+
+export default function App() {
+  const [permission, requestPermission] = usePermissions();
+  const [config, setConfig] = useState(() => loadConfig());
+  const [photos, setPhotos] = useState<PickerItem[]>([]);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [health, setHealth] = useState<string>('not checked');
+  const [stage, setStage] = useState<UploadStage | null>(null);
+  const [result, setResult] = useState<UploadResult | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+
+  const granted = permission?.granted ?? false;
+  const limitedAccess = permission?.accessPrivileges === 'limited';
+
+  useEffect(() => {
+    if (!permission) return;
+    if (!permission.granted && permission.canAskAgain) requestPermission();
+  }, [permission, requestPermission]);
+
+  useEffect(() => {
+    if (!granted) return;
+    recentPhotos(PHOTO_LIMIT)
+      .then((items) => {
+        setPhotos(items);
+        setLibraryError(null);
+      })
+      .catch((e) => setLibraryError(errorText(e)));
+  }, [granted]);
 
   const checkHealth = useCallback(async () => {
     setHealth('checking…');
     try {
-      const { ms, body } = await ping(serverUrl);
-      setHealth(`${body.name} · ${ms} ms`);
-      setHealthOk(true);
-      rawLog('health', `${serverUrl} ok in ${ms}ms`);
+      const res = await fetch(`${config.serverUrl}/health`);
+      setHealth(res.ok ? `reachable (${res.status})` : `HTTP ${res.status}`);
     } catch (e) {
-      setHealth(errText(e));
-      setHealthOk(false);
-      rawLog('health', `${serverUrl} failed: ${errText(e)}`);
+      setHealth(`unreachable — ${errorText(e)}`);
     }
-  }, [serverUrl]);
+  }, [config.serverUrl]);
 
-  const requestPerm = useCallback(async () => {
-    const res = await MediaLibrary.requestPermissionsAsync();
-    setPerm(res);
-    rawLog('perm', `status=${res.status} accessPrivileges=${res.accessPrivileges ?? 'n/a'}`);
-    if (res.granted) {
-      const counts = await countLibrary();
-      setLibrary(`${counts.photos} photos · ${counts.videos} videos`);
-      rawLog('perm', `library: ${counts.photos} photos, ${counts.videos} videos`);
-    }
-  }, []);
+  const onPick = useCallback(
+    async (item: PickerItem) => {
+      if (stage) return;
+      setResult(null);
+      setFailure(null);
+      try {
+        const uploaded = await uploadAsset(item.id, {
+          serverUrl: config.serverUrl,
+          deviceId: config.deviceId,
+          onStage: setStage,
+        });
+        setResult(uploaded);
+      } catch (e) {
+        setFailure(errorText(e));
+      } finally {
+        setStage(null);
+      }
+    },
+    [config, stage]
+  );
 
-  const limited = perm?.accessPrivileges === 'limited';
-  const permTone = !perm?.granted ? 'bad' : limited ? 'warn' : 'ok';
-
-  const bgOptions = useMemo(
-    () => ({
-      sizeMb: Math.max(1, Number(sizeMb) || 20),
-      throttleBytesPerSec: Math.max(10_000, (Number(throttleKb) || 200) * 1024),
-    }),
-    [sizeMb, throttleKb]
+  const onChangeServer = useCallback(
+    (serverUrl: string) => {
+      const next = { ...config, serverUrl };
+      setConfig(next);
+      saveConfig(next);
+    },
+    [config]
   );
 
   return (
-    <View style={st.root}>
+    <SafeAreaView style={styles.screen}>
       <StatusBar style="light" />
-      <SafeAreaView style={st.safe}>
-        <ScrollView contentContainerStyle={st.scroll} keyboardShouldPersistTaps="handled">
-          <Text style={st.h1}>photos-backup · phase 0</Text>
-          <Text style={st.sub}>
-            Four Expo assumptions, answered on real hardware. Every result that matters is
-            cross-checked against the test server rather than trusted from the device.
-          </Text>
+      <Text style={styles.title}>photobackup</Text>
 
-          <Card
-            n="00"
-            title="Environment"
-            tone={healthOk === null ? 'idle' : healthOk ? 'ok' : 'bad'}
-            status={healthOk === null ? 'unknown' : healthOk ? 'reachable' : 'unreachable'}>
-            <Text style={st.label}>test server</Text>
-            <TextInput
-              style={st.input}
-              value={serverUrl}
-              onChangeText={(t) => {
-                setServerUrl(t.trim());
-                saveServerUrl(t.trim());
-              }}
-              autoCapitalize="none"
-              autoCorrect={false}
-              keyboardType="url"
-              placeholderTextColor={C.dim}
-            />
-            <Row>
-              <Btn label="Ping" onPress={checkHealth} />
-              <Btn
-                label="Reset timeline"
-                tone="quiet"
-                onPress={() => resetTimeline(serverUrl).catch(() => {})}
-              />
-            </Row>
-            <KV k="health" v={health} />
-            <KV k="platform" v={`${Platform.OS} ${Platform.Version}`} />
-
-            <View style={st.divider} />
-
-            <Row>
-              <Btn label="Photo permission" onPress={requestPerm} />
-              {limited ? (
-                <Btn
-                  label="Fix limited access"
-                  tone="danger"
-                  onPress={() => MediaLibrary.presentPermissionsPicker()}
-                />
-              ) : null}
-            </Row>
-            <KV k="status" v={perm ? `${perm.status} (granted=${perm.granted})` : 'not requested'} />
-            <KV k="accessPrivileges" v={perm?.accessPrivileges ?? '—'} />
-            <KV k="library" v={library} />
-            {limited ? (
-              <Verdict
-                ok={false}
-                text={'Risk #4 confirmed live: "Select Photos" silently hides the rest of the library. accessPrivileges is how v1 detects it.'}
-              />
-            ) : null}
-            {perm?.granted && !limited ? (
-              <Verdict ok text="Full library access — accessPrivileges === 'all'." />
-            ) : null}
-          </Card>
-
-          <Card
-            n="Q1"
-            title="Native MD5 of a large file"
-            question="Can expo-file-system hash a multi-hundred-MB video without loading it into JS or into RAM — and what does it cost?"
-            tone={tone(slot('q1'))}
-            status={status(slot('q1'))}>
-            <LivenessBar />
-            <Text style={st.hint}>
-              Watch the bar while it hashes. File.md5 is a synchronous JSI property, so a freeze here
-              is the real cost of the API.
-            </Text>
-            <Row>
-              <Btn label="Run" busy={slot('q1').busy} onPress={() => run('q1', runMd5)} />
-              <Btn
-                label="Legacy (may crash)"
-                tone="danger"
-                busy={slot('q1-legacy').busy}
-                onPress={() => run('q1-legacy', runLegacyMd5)}
-              />
-            </Row>
-            <Outcome slot={slot('q1')} />
-            <Outcome slot={slot('q1-legacy')} />
-          </Card>
-
-          <Card
-            n="Q1b"
-            title="Where can an upload read from?"
-            question="Q1 uploaded a PhotoKit original and failed; Q3 uploaded from the app container and succeeded. Which variable actually matters — the sandbox, or the URI fragment?"
-            tone={tone(slot('q1b'))}
-            status={status(slot('q1b'))}>
-            <Text style={st.hint}>
-              Runs the smallest video five ways: PhotoKit uri and fragment-stripped uri, each on a
-              background and a foreground session, plus a copy inside the app container.
-            </Text>
-            <Row>
-              <Btn label="Run matrix" busy={slot('q1b').busy} onPress={() => run('q1b', runUploadSourceMatrix)} />
-            </Row>
-            <Outcome slot={slot('q1b')} />
-          </Card>
-
-          <Card
-            n="Q2"
-            title="Background upload survives suspension"
-            question="Does a sessionType:'background' upload keep sending bytes after the app is suspended — and does the JS side ever find out?"
-            tone={tone(slot('q2'))}
-            status={status(slot('q2'))}>
-            <Row>
-              <View style={st.field}>
-                <Text style={st.label}>payload MB</Text>
-                <TextInput
-                  style={[st.input, st.inputSm]}
-                  value={sizeMb}
-                  onChangeText={setSizeMb}
-                  keyboardType="number-pad"
-                />
-              </View>
-              <View style={st.field}>
-                <Text style={st.label}>throttle KB/s</Text>
-                <TextInput
-                  style={[st.input, st.inputSm]}
-                  value={throttleKb}
-                  onChangeText={setThrottleKb}
-                  keyboardType="number-pad"
-                />
-              </View>
-              <View style={st.field}>
-                <Text style={st.label}>expected</Text>
-                <Text style={st.expected}>
-                  ~{((bgOptions.sizeMb * 1024 * 1024) / bgOptions.throttleBytesPerSec).toFixed(0)}s
-                </Text>
-              </View>
-            </Row>
-            <Text style={st.hint}>
-              Start it, then press Home and count. Byte arrival is recorded server-side, so the answer
-              does not depend on the app being alive to report it.
-            </Text>
-            <Row>
-              <Btn
-                label="Run (background)"
-                busy={slot('q2').busy}
-                onPress={() => run('q2', (ctx) => runBackgroundUpload(ctx, { ...bgOptions, sessionType: 'background' }))}
-              />
-              <Btn
-                label="Control (foreground)"
-                tone="quiet"
-                busy={slot('q2-fg').busy}
-                onPress={() => run('q2-fg', (ctx) => runBackgroundUpload(ctx, { ...bgOptions, sessionType: 'foreground' }))}
-              />
-              <Btn label="Cancel" tone="danger" onPress={cancelActive} />
-            </Row>
-            <Outcome slot={slot('q2')} />
-            <Outcome slot={slot('q2-fg')} />
-            <ServerTimeline serverUrl={serverUrl} />
-          </Card>
-
-          <Card
-            n="Q3"
-            title="Live Photo paired .mov"
-            question="Can the companion video of a Live Photo be retrieved through expo-media-library, or does this force a Swift module?"
-            tone={tone(slot('q3'))}
-            status={status(slot('q3'))}>
-            <Row>
-              <Btn label="Run" busy={slot('q3').busy} onPress={() => run('q3', runLivePhoto)} />
-            </Row>
-            <Outcome slot={slot('q3')} />
-          </Card>
-
-          <Card
-            n="Q4"
-            title="mDNS discovery from a dev client"
-            question="Does react-native-zeroconf resolve _photobackup._tcp under RN 0.86 bridgeless, and is the address it returns dialable?"
-            tone={tone(slot('q4'))}
-            status={status(slot('q4'))}>
-            <Text style={st.hint}>
-              iOS shows the Local Network prompt on the first scan. Accept it; if you miss it, the scan
-              silently returns nothing.
-            </Text>
-            <Row>
-              <Btn label="Scan 12s" busy={slot('q4').busy} onPress={() => run('q4', runMdns)} />
-            </Row>
-            <Outcome slot={slot('q4')} />
-          </Card>
-
-          <Card n="LOG" title="Device log" tone="idle" status={`${lines.length} lines`}>
-            <Text style={st.hint}>
-              Persisted to disk, so it survives a force-quit. Reloaded on launch.
-            </Text>
-            <Row>
-              <Btn label="Clear" tone="quiet" onPress={clearLog} />
-            </Row>
-            <View style={st.logBox}>
-              {lines.slice(-160).map((l) => (
-                <Text key={l.seq} style={st.logLine} selectable>
-                  <Text style={st.logTime}>{formatTime(l.t)} </Text>
-                  <Text style={st.logTag}>{l.tag.padEnd(9)}</Text>
-                  {l.msg}
-                </Text>
-              ))}
-              {lines.length === 0 ? <Text style={st.logLine}>empty</Text> : null}
-            </View>
-          </Card>
-
-          <View style={{ height: 40 }} />
-        </ScrollView>
-      </SafeAreaView>
-    </View>
-  );
-}
-
-function tone(s: Slot): 'ok' | 'bad' | 'warn' | 'idle' {
-  if (s.busy) return 'warn';
-  if (s.error) return 'bad';
-  if (!s.result) return 'idle';
-  return s.result.ok ? 'ok' : 'bad';
-}
-
-function status(s: Slot) {
-  if (s.busy) return 'running';
-  if (s.error) return 'threw';
-  if (!s.result) return 'not run';
-  return s.result.ok ? 'pass' : 'fail';
-}
-
-function Outcome({ slot }: { slot: Slot }) {
-  if (slot.error) return <Verdict ok={false} text={slot.error} />;
-  if (!slot.result) return null;
-  return (
-    <View style={{ gap: 8 }}>
-      <Verdict ok={slot.result.ok} text={slot.result.verdict} />
-      <View style={{ gap: 4 }}>
-        {slot.result.details.map(([k, v]) => (
-          <KV key={k} k={k} v={v} />
-        ))}
+      <View style={styles.row}>
+        <TextInput
+          style={styles.input}
+          value={config.serverUrl}
+          onChangeText={onChangeServer}
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType="url"
+          placeholder="http://10.0.0.2:8787"
+          placeholderTextColor="#666"
+        />
+        <Pressable style={styles.button} onPress={checkHealth}>
+          <Text style={styles.buttonText}>Check</Text>
+        </Pressable>
       </View>
-    </View>
-  );
-}
+      <Text style={styles.muted}>server: {health}</Text>
 
-function ServerTimeline({ serverUrl }: { serverUrl: string }) {
-  const [rows, setRows] = useState<string[]>([]);
-  const load = useCallback(async () => {
-    try {
-      const events = await fetchTimeline(serverUrl);
-      setRows(
-        events.slice(-40).map((e) => {
-          const d = Object.entries(e.detail)
-            .filter(([k]) => k !== 'clientTime')
-            .map(([k, v]) => `${k}=${v}`)
-            .join(' ');
-          return `${(e.ms / 1000).toFixed(1)}s ${e.event} ${d}`;
-        })
-      );
-    } catch (e) {
-      setRows([errText(e)]);
-    }
-  }, [serverUrl]);
+      {!granted && (
+        <Text style={styles.warning}>
+          Photo library access is required. Grant it in Settings to pick a photo.
+        </Text>
+      )}
+      {limitedAccess && (
+        <Text style={styles.warning}>
+          Limited access is on, so only hand-picked photos are visible. Choose “All Photos” in
+          Settings for a real backup.
+        </Text>
+      )}
+      {libraryError && <Text style={styles.warning}>Library error: {libraryError}</Text>}
 
-  return (
-    <View style={{ gap: 8 }}>
-      <Row>
-        <Btn label="Pull server timeline" tone="quiet" onPress={load} />
-      </Row>
-      {rows.length ? (
-        <View style={st.logBox}>
-          {rows.map((r, i) => (
-            <Text key={i} style={st.logLine} selectable>
-              {r}
-            </Text>
-          ))}
+      {stage ? (
+        <View style={styles.status}>
+          <ActivityIndicator color="#8ab4f8" />
+          <Text style={styles.statusText}>{STAGE_LABEL[stage]}</Text>
         </View>
-      ) : null}
-    </View>
+      ) : (
+        <Text style={styles.muted}>Tap a photo to back it up.</Text>
+      )}
+
+      {result && (
+        <View style={styles.result}>
+          <Text style={styles.resultTitle}>
+            {result.duplicate ? 'Already archived' : 'Archived'} — {result.filename}
+          </Text>
+          <Text style={styles.muted}>sha256 {result.sha256.slice(0, 16)}…</Text>
+          <Text style={styles.muted}>
+            {(result.size / 1024 / 1024).toFixed(2)} MB · hash {result.hashMs} ms · upload{' '}
+            {result.uploadMs} ms
+          </Text>
+        </View>
+      )}
+      {failure && (
+        <View style={styles.result}>
+          <Text style={styles.failureTitle}>Upload failed</Text>
+          <Text style={styles.muted}>{failure}</Text>
+        </View>
+      )}
+
+      <FlatList
+        data={photos}
+        keyExtractor={(item) => item.id}
+        numColumns={GRID_COLUMNS}
+        contentContainerStyle={styles.grid}
+        renderItem={({ item }) => (
+          <Pressable style={styles.cell} onPress={() => onPick(item)} disabled={stage !== null}>
+            <Thumbnail id={item.id} />
+          </Pressable>
+        )}
+      />
+    </SafeAreaView>
   );
 }
 
-const st = StyleSheet.create({
-  root: { flex: 1, backgroundColor: C.bg },
-  safe: { flex: 1 },
-  scroll: { padding: 14, paddingTop: 8 },
-  h1: { color: C.text, fontSize: 22, fontWeight: '700', letterSpacing: -0.3 },
-  sub: { color: C.dim, fontSize: 12.5, lineHeight: 18, marginTop: 6, marginBottom: 18 },
-  label: { color: C.dim, fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.7 },
-  hint: { color: C.dim, fontSize: 11.5, lineHeight: 16 },
+const styles = StyleSheet.create({
+  screen: { flex: 1, backgroundColor: '#111', paddingHorizontal: 16 },
+  title: { color: '#eee', fontSize: 20, fontWeight: '600', marginTop: 8, marginBottom: 12 },
+  row: { flexDirection: 'row', gap: 8, alignItems: 'center' },
   input: {
-    backgroundColor: C.bg,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: C.border,
+    flex: 1,
+    backgroundColor: '#1c1c1c',
+    color: '#eee',
     borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 9,
-    color: C.text,
-    fontFamily: mono,
-    fontSize: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
   },
-  inputSm: { width: 96 },
-  field: { gap: 4 },
-  expected: { color: C.text, fontFamily: mono, fontSize: 12, paddingVertical: 9 },
-  divider: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: C.border,
-    marginVertical: 4,
-  },
-  logBox: {
-    backgroundColor: C.bg,
-    borderRadius: 8,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: C.border,
-    padding: 8,
-    gap: 2,
-  },
-  logLine: { color: C.text, fontFamily: mono, fontSize: 9.5, lineHeight: 13 },
-  logTime: { color: C.dim },
-  logTag: { color: C.accent },
+  button: { backgroundColor: '#2d4a7c', borderRadius: 8, paddingHorizontal: 16, paddingVertical: 11 },
+  buttonText: { color: '#eee', fontWeight: '600' },
+  muted: { color: '#888', fontSize: 12, marginTop: 6 },
+  warning: { color: '#e8b84b', fontSize: 12, marginTop: 8 },
+  status: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 10 },
+  statusText: { color: '#8ab4f8', fontSize: 13 },
+  result: { backgroundColor: '#1c1c1c', borderRadius: 8, padding: 12, marginTop: 10 },
+  resultTitle: { color: '#7ed492', fontWeight: '600' },
+  failureTitle: { color: '#e2685f', fontWeight: '600' },
+  grid: { paddingVertical: 12 },
+  cell: { flex: 1 / GRID_COLUMNS, aspectRatio: 1, padding: 2 },
+  thumbnail: { flex: 1, borderRadius: 4, backgroundColor: '#222' },
 });
