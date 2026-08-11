@@ -161,10 +161,22 @@ func (h *harness) derive(t *testing.T, assetID string) {
 		t.Fatalf("read exif: %v", err)
 	}
 
-	if err := h.srv.Derivatives.Write(asset.SHA256, derivstore.Thumb, func(w io.Writer) error {
-		return h.srv.Converter.Thumb(ctx, src, w)
-	}); err != nil {
-		t.Fatalf("write thumb: %v", err)
+	var targets []derive.ThumbTarget
+	for _, size := range derivstore.ThumbSizes {
+		staged, cleanup, err := h.srv.Derivatives.Stage("thumb-*.webp")
+		if err != nil {
+			t.Fatalf("stage thumb: %v", err)
+		}
+		defer cleanup()
+		targets = append(targets, derive.ThumbTarget{Size: size, Path: staged})
+	}
+	if err := h.srv.Converter.Thumbs(ctx, src, targets); err != nil {
+		t.Fatalf("write thumbs: %v", err)
+	}
+	for _, target := range targets {
+		if err := h.srv.Derivatives.Commit(asset.SHA256, derivstore.ThumbSuffix(target.Size), target.Path); err != nil {
+			t.Fatalf("commit thumb: %v", err)
+		}
 	}
 
 	width, height := data.DisplaySize()

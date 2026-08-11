@@ -68,8 +68,11 @@ POST /v1/timeline/states         re-read derivative state for specific ids
 GET  /v1/assets/{id}             JSON metadata for the viewer panel
 GET  /v1/assets/{id}/original    exact stored bytes
 GET  /v1/assets/{id}/thumb       stored 256px square WebP
+GET  /v1/assets/{id}/thumb/{px}  the same square at 96, 256 or 512
 GET  /v1/assets/{id}/preview     2048px WebP, rendered per request
 GET  /v1/assets/{id}/playback    H.264 MP4, Range-capable
+GET  /v1/assets/{id}/live/thumb[/{px}]  a Live Photo's motion, same sizes
+GET  /v1/assets/{id}/live/preview       1080p with audio, rendered per request
 GET  /v1/jobs                    queue depth and the failure list
 GET  /health                     also reports pending and failed job counts
 ```
@@ -83,6 +86,12 @@ rather than a silent correction.
 Every media response is content-addressed, so it carries a strong `ETag` and
 `Cache-Control: immutable`. `/preview` checks `If-None-Match` *before*
 converting, which is what keeps paging back through a viewer free.
+
+The unsized `/thumb` is the 256px rendition and is the only one every asset is
+guaranteed to have; a size that has not been rendered yet is a `404`, never the
+nearest one that exists. Since these URLs are cached forever, answering
+`/thumb/512` with the 256px file would pin the wrong bytes in a browser long
+after the real rendition landed. The gallery falls back on its own.
 
 ## Authentication
 
@@ -373,7 +382,10 @@ original, which is the bit-rot check and what the weekly timer runs.
 
 `--fix` applies only the repairs with one obvious answer: append a missing
 manifest line from the database row, re-enqueue a derivative that has gone
-missing, delete an abandoned partial. It never deletes a blob and never
+missing, delete an abandoned partial. It is also how a new thumbnail size is
+backfilled — a library ingested before the size existed is missing a derivative
+by exactly the same test — so a run of `photobackup verify --fix` after adding
+one requeues every asset that needs re-rendering. It never deletes a blob and never
 "repairs" a hash mismatch — the only honest response to an original that no
 longer matches its own name is a human with a second copy.
 

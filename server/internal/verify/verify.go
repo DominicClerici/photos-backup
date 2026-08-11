@@ -280,27 +280,29 @@ func checkDerivatives(ctx context.Context, d Deps, opt Options, r *Report, a db.
 	}
 
 	// A paired video has no still thumbnail by design — the tile it appears in
-	// belongs to the photo it is paired with. Its motion rendition is checked
+	// belongs to the photo it is paired with. Its motion renditions are checked
 	// instead.
 	if a.IsLivePair() {
-		if a.LiveState == db.DerivedReady && !d.Derivatives.Exists(a.SHA256, derivstore.LiveThumb) {
-			r.Findings = append(r.Findings, Finding{
-				Kind: DerivativeMissing, SHA256: a.SHA256,
-				Path:   d.Derivatives.Path(a.SHA256, derivstore.LiveThumb),
-				Detail: "marked ready but the Live Photo rendition is gone",
-				Fixed:  opt.Fix && requeue(ctx, d, jobs.KindMetadata, a.ID) == nil,
-			})
+		if a.LiveState == db.DerivedReady {
+			if missing, path := missingSizes(d, a.SHA256, derivstore.LiveSuffix); len(missing) > 0 {
+				r.Findings = append(r.Findings, Finding{
+					Kind: DerivativeMissing, SHA256: a.SHA256, Path: path,
+					Detail: fmt.Sprintf("marked ready but the Live Photo rendition is gone at %s", sizeList(missing)),
+					Fixed:  opt.Fix && requeue(ctx, d, jobs.KindMetadata, a.ID) == nil,
+				})
+			}
 		}
 		return
 	}
 
-	if a.DerivedState == db.DerivedReady && !d.Derivatives.Exists(a.SHA256, derivstore.Thumb) {
-		r.Findings = append(r.Findings, Finding{
-			Kind: DerivativeMissing, SHA256: a.SHA256,
-			Path:   d.Derivatives.Path(a.SHA256, derivstore.Thumb),
-			Detail: "marked ready but the thumbnail is gone",
-			Fixed:  opt.Fix && requeue(ctx, d, jobs.KindMetadata, a.ID) == nil,
-		})
+	if a.DerivedState == db.DerivedReady {
+		if missing, path := missingSizes(d, a.SHA256, derivstore.ThumbSuffix); len(missing) > 0 {
+			r.Findings = append(r.Findings, Finding{
+				Kind: DerivativeMissing, SHA256: a.SHA256, Path: path,
+				Detail: fmt.Sprintf("marked ready but the thumbnail is gone at %s", sizeList(missing)),
+				Fixed:  opt.Fix && requeue(ctx, d, jobs.KindMetadata, a.ID) == nil,
+			})
+		}
 	}
 
 	if a.PlaybackState == db.DerivedReady && !d.Derivatives.Exists(a.SHA256, derivstore.Playback) {
@@ -310,6 +312,45 @@ func checkDerivatives(ctx context.Context, d Deps, opt Options, r *Report, a db.
 			Detail: "marked ready but the playback rendition is gone",
 			Fixed:  opt.Fix && requeue(ctx, d, jobs.KindPlayback, a.ID) == nil,
 		})
+	}
+}
+
+// missingSizes reports which stored sizes an asset is short of, and the path of
+// the first one, so an asset with several gaps is still one finding rather than
+// one per size — which is the difference between a report and a wall of text
+// the first time a library is checked after a new size is introduced.
+//
+// A library built before a size existed is exactly this case, and it is how the
+// backfill is driven: `photobackup verify --fix` finds every asset that has
+// only the sizes it was ingested with and requeues the job that renders the
+// rest.
+func missingSizes(d Deps, sha string, suffix func(int) string) ([]int, string) {
+	var missing []int
+	var first string
+	for _, size := range derivstore.ThumbSizes {
+		if d.Derivatives.Exists(sha, suffix(size)) {
+			continue
+		}
+		if first == "" {
+			first = d.Derivatives.Path(sha, suffix(size))
+		}
+		missing = append(missing, size)
+	}
+	return missing, first
+}
+
+func sizeList(sizes []int) string {
+	parts := make([]string, len(sizes))
+	for i, size := range sizes {
+		parts[i] = fmt.Sprintf("%dpx", size)
+	}
+	switch len(parts) {
+	case 1:
+		return parts[0]
+	case 2:
+		return parts[0] + " and " + parts[1]
+	default:
+		return strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
 	}
 }
 

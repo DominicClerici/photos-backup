@@ -38,12 +38,17 @@ func TestMetadataJobThumbnailsAPhotoAndReadsItsEXIF(t *testing.T) {
 		t.Error("GPS was not recorded")
 	}
 
-	stat, err := os.Stat(h.Derivatives.Path(asset.SHA256, derivstore.Thumb))
-	if err != nil {
-		t.Fatalf("thumbnail was not written: %v", err)
-	}
-	if stat.Size() == 0 {
-		t.Error("thumbnail is empty")
+	// Every stored size, from the one metadata job. The gallery switches
+	// between them as it zooms, so a run that produced only some of them would
+	// leave photos that vanish at one zoom level and not another.
+	for _, size := range derivstore.ThumbSizes {
+		stat, err := os.Stat(h.Derivatives.Path(asset.SHA256, derivstore.ThumbSuffix(size)))
+		if err != nil {
+			t.Fatalf("%dpx thumbnail was not written: %v", size, err)
+		}
+		if stat.Size() == 0 {
+			t.Errorf("%dpx thumbnail is empty", size)
+		}
 	}
 
 	// A photo has nothing to transcode, so nothing must be queued for it.
@@ -97,9 +102,12 @@ func TestMetadataJobPostersAVideoAndQueuesTheTranscode(t *testing.T) {
 		t.Errorf("Width = %v, want 640", got.Width)
 	}
 	// The poster goes through the same square thumbnailer photos use, so video
-	// tiles and photo tiles cannot drift apart.
-	if !h.Derivatives.Exists(asset.SHA256, derivstore.Thumb) {
-		t.Fatal("no poster thumbnail for the video")
+	// tiles and photo tiles cannot drift apart — including in how many sizes
+	// they come in.
+	for _, size := range derivstore.ThumbSizes {
+		if !h.Derivatives.Exists(asset.SHA256, derivstore.ThumbSuffix(size)) {
+			t.Fatalf("no %dpx poster thumbnail for the video", size)
+		}
 	}
 
 	if got.PlaybackState != db.DerivedPending {

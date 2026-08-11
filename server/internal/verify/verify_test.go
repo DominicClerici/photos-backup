@@ -2,9 +2,11 @@ package verify_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -217,11 +219,13 @@ func TestMissingDerivativeIsRequeued(t *testing.T) {
 	ctx := context.Background()
 	asset := a.add(t, "IMG_0001.HEIC", fixture(t, "sample.heic"), captured)
 
-	if err := a.derivs.Write(asset.SHA256, derivstore.Thumb, func(w io.Writer) error {
-		_, err := w.Write([]byte("a thumbnail"))
-		return err
-	}); err != nil {
-		t.Fatalf("write thumb: %v", err)
+	for _, size := range derivstore.ThumbSizes {
+		if err := a.derivs.Write(asset.SHA256, derivstore.ThumbSuffix(size), func(w io.Writer) error {
+			_, err := w.Write([]byte("a thumbnail"))
+			return err
+		}); err != nil {
+			t.Fatalf("write thumb: %v", err)
+		}
 	}
 	if err := a.store.SetDerivedState(ctx, asset.ID, db.DerivedReady); err != nil {
 		t.Fatalf("set derived state: %v", err)
@@ -249,6 +253,40 @@ func TestMissingDerivativeIsRequeued(t *testing.T) {
 	}
 	if pending != 1 {
 		t.Errorf("%d pending metadata jobs, want 1", pending)
+	}
+}
+
+// A library ingested before a thumbnail size existed has the base rendition and
+// nothing else. That is the same finding as a deleted one, deliberately: it is
+// what turns `photobackup verify --fix` into the backfill for a new size,
+// rather than needing a migration that knows how to render photos.
+func TestAnAssetMissingOnlyTheNewerSizesIsRequeued(t *testing.T) {
+	a := newArchive(t)
+	ctx := context.Background()
+	asset := a.add(t, "IMG_0001.HEIC", fixture(t, "sample.heic"), captured)
+
+	if err := a.derivs.Write(asset.SHA256, derivstore.Thumb, func(w io.Writer) error {
+		_, err := w.Write([]byte("a thumbnail"))
+		return err
+	}); err != nil {
+		t.Fatalf("write thumb: %v", err)
+	}
+	if err := a.store.SetDerivedState(ctx, asset.ID, db.DerivedReady); err != nil {
+		t.Fatalf("set derived state: %v", err)
+	}
+
+	report := a.run(t, verify.Options{Fix: true})
+	found := only(t, report, verify.DerivativeMissing)
+	if !found.Fixed {
+		t.Error("--fix did not requeue the missing sizes")
+	}
+	for _, size := range derivstore.ThumbSizes {
+		if size == derivstore.BaseThumbSize {
+			continue
+		}
+		if !strings.Contains(found.Detail, fmt.Sprintf("%dpx", size)) {
+			t.Errorf("finding does not name the missing %dpx rendition: %s", size, found.Detail)
+		}
 	}
 }
 

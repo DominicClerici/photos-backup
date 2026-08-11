@@ -2,11 +2,14 @@ package api
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
 
 	"golang.org/x/image/webp"
+
+	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 )
 
 func TestThumbServesTheStoredRendition(t *testing.T) {
@@ -33,6 +36,50 @@ func TestThumbServesTheStoredRendition(t *testing.T) {
 	}
 	if b := img.Bounds(); b.Dx() != 256 || b.Dy() != 256 {
 		t.Errorf("thumb is %dx%d, want 256x256", b.Dx(), b.Dy())
+	}
+}
+
+// Each stored size is served at its own URL, at exactly the size it names. The
+// gallery swaps between them as it zooms, and a URL that answered with anything
+// but what it says would be cached immutably in that wrong shape.
+func TestThumbServesEveryStoredSize(t *testing.T) {
+	h := newHarness(t)
+	up := decodeUpload(t, h.upload(t, loadFixture(t), nil))
+	h.derive(t, up.ID)
+
+	for _, size := range derivstore.ThumbSizes {
+		resp := h.get(t, fmt.Sprintf("/v1/assets/%s/thumb/%d", up.ID, size))
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d for %dpx, want 200: %s", resp.StatusCode, size, body)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		img, err := webp.Decode(bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("%dpx thumb is not decodable WebP: %v", size, err)
+		}
+		if b := img.Bounds(); b.Dx() != size || b.Dy() != size {
+			t.Errorf("thumb is %dx%d, want %[3]dx%[3]d", b.Dx(), b.Dy(), size)
+		}
+	}
+}
+
+// A size this archive does not render is a 404 rather than the nearest one it
+// has. The gallery decides what to fall back to; the server does not decide it
+// for every client that will ever cache the answer.
+func TestThumbRefusesASizeItDoesNotStore(t *testing.T) {
+	h := newHarness(t)
+	up := decodeUpload(t, h.upload(t, loadFixture(t), nil))
+	h.derive(t, up.ID)
+
+	for _, path := range []string{"/thumb/97", "/thumb/1024", "/thumb/abc"} {
+		resp := h.get(t, "/v1/assets/"+up.ID+path)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("status = %d for %s, want 404", resp.StatusCode, path)
+		}
 	}
 }
 

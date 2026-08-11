@@ -2,6 +2,11 @@
 // than generated because the surface is small and stable; if it grows, the Go
 // structs in internal/db and internal/api are the source of truth.
 
+// The sizes live in layout.ts, beside the zoom levels that choose between them.
+// Nothing is imported back the other way at runtime — layout.ts takes only a
+// type from here — so this is a dependency rather than a cycle.
+import { BASE_THUMB_SIZE, type ThumbSize } from "./layout";
+
 export type MediaKind = "image" | "video";
 export type DerivedState = "pending" | "ready" | "failed";
 export type PlaybackState = "none" | "pending" | "ready" | "failed";
@@ -128,10 +133,25 @@ export async function fetchStates(
   return body.items ?? [];
 }
 
-export const thumbUrl = (id: string) => `${MEDIA_BASE}/v1/assets/${id}/thumb`;
+/**
+ * A stored thumbnail. No size, or the base size, is the unsized route: the same
+ * URL the gallery has always used, so the bytes stay in one cache entry rather
+ * than two.
+ *
+ * The base is also the only size every asset is guaranteed to have. A library
+ * ingested before the others existed gets them when a backfill runs, and until
+ * then asking for one is a 404 the caller falls back from.
+ */
+export const thumbUrl = (id: string, size?: ThumbSize) =>
+  size === undefined || size === BASE_THUMB_SIZE
+    ? `${MEDIA_BASE}/v1/assets/${id}/thumb`
+    : `${MEDIA_BASE}/v1/assets/${id}/thumb/${size}`;
 export const previewUrl = (id: string) => `${MEDIA_BASE}/v1/assets/${id}/preview`;
-/** A Live Photo's motion, addressed by the still's id. */
-export const liveThumbUrl = (id: string) => `${MEDIA_BASE}/v1/assets/${id}/live/thumb`;
+/** A Live Photo's motion, addressed by the still's id, in the same sizes. */
+export const liveThumbUrl = (id: string, size?: ThumbSize) =>
+  size === undefined || size === BASE_THUMB_SIZE
+    ? `${MEDIA_BASE}/v1/assets/${id}/live/thumb`
+    : `${MEDIA_BASE}/v1/assets/${id}/live/thumb/${size}`;
 export const livePreviewUrl = (id: string) => `${MEDIA_BASE}/v1/assets/${id}/live/preview`;
 export const playbackUrl = (id: string) => `${MEDIA_BASE}/v1/assets/${id}/playback`;
 export const originalUrl = (id: string) => `${MEDIA_BASE}/v1/assets/${id}/original`;

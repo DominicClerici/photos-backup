@@ -12,7 +12,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"runtime/debug"
@@ -225,7 +224,7 @@ func (r *Runner) run(ctx context.Context, job jobs.Job) (err error) {
 }
 
 // runMetadata reads an original and produces everything the gallery needs to
-// draw it: the metadata row and the 256px thumbnail.
+// draw it: the metadata row and a thumbnail at every stored size.
 func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 	asset, err := r.Store.Asset(ctx, assetID)
 	if err != nil {
@@ -253,7 +252,7 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 			return err
 		}
 	default:
-		if err := r.writeThumb(ctx, asset.SHA256, src); err != nil {
+		if err := r.writeThumbs(ctx, asset.SHA256, src); err != nil {
 			return err
 		}
 	}
@@ -263,10 +262,11 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 	}
 
 	if asset.IsLivePair() {
-		// No transcode is queued for these. The grid plays the 256px rendition
-		// just built, and the viewer renders its larger one per request — so a
-		// library where a third of the items are Live Photos does not put a
-		// third of itself through the transcode queue for three seconds each.
+		// No transcode is queued for these. The grid plays whichever of the
+		// renditions just built matches its zoom level, and the viewer renders
+		// its larger one per request — so a library where a third of the items
+		// are Live Photos does not put a third of itself through the transcode
+		// queue for three seconds each.
 		state := db.DerivedReady
 		if !decodable {
 			state = db.DerivedFailed
@@ -334,11 +334,11 @@ func (r *Runner) videoMetadata(ctx context.Context, asset db.Asset, src string, 
 		}
 		return false, err
 	}
-	return true, r.writeThumb(ctx, asset.SHA256, poster)
+	return true, r.writeThumbs(ctx, asset.SHA256, poster)
 }
 
 // liveMetadata handles a Live Photo's paired video: what ffprobe knows about
-// it, and the 256px motion thumbnail the grid plays on hover.
+// it, and the motion thumbnails the grid plays on hover, one per stored size.
 //
 // No poster frame and no still thumbnail, unlike an ordinary video. The tile
 // this asset appears in belongs to the still it is paired with, and that still
@@ -361,13 +361,17 @@ func (r *Runner) liveMetadata(ctx context.Context, asset db.Asset, src string, m
 		meta.DurationSeconds = &d
 	}
 
-	staged, cleanup, err := r.Derivatives.Stage("live-*" + derivstore.LiveThumb)
-	if err != nil {
-		return false, err
+	targets := make([]video.LiveThumbTarget, 0, len(derivstore.ThumbSizes))
+	for _, size := range derivstore.ThumbSizes {
+		staged, cleanup, err := r.Derivatives.Stage("live-*" + derivstore.LiveSuffix(size))
+		if err != nil {
+			return false, err
+		}
+		defer cleanup()
+		targets = append(targets, video.LiveThumbTarget{Size: size, Path: staged})
 	}
-	defer cleanup()
 
-	if err := r.Video.LiveThumb(ctx, src, staged, info); err != nil {
+	if err := r.Video.LiveThumbs(ctx, src, targets, info); err != nil {
 		if errors.Is(err, video.ErrNotPlayable) {
 			r.log().Warn("no motion thumbnail; the still will not come to life",
 				"asset", asset.ID, "error", err)
@@ -375,13 +379,41 @@ func (r *Runner) liveMetadata(ctx context.Context, asset db.Asset, src string, m
 		}
 		return false, err
 	}
-	return true, r.Derivatives.Commit(asset.SHA256, derivstore.LiveThumb, staged)
+	for _, target := range targets {
+		if err := r.Derivatives.Commit(asset.SHA256, derivstore.LiveSuffix(target.Size), target.Path); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
-func (r *Runner) writeThumb(ctx context.Context, sha, src string) error {
-	return r.Derivatives.Write(sha, derivstore.Thumb, func(w io.Writer) error {
-		return r.Images.Thumb(ctx, src, w)
-	})
+// writeThumbs builds every stored size of a still and publishes them together.
+//
+// Together because the sizes are one rendition of one photo as far as anything
+// downstream is concerned: a metadata job that wrote two of three and then died
+// would leave an asset marked ready whose gallery goes blank at one zoom level
+// and not the others. Staging them all and committing at the end means a failed
+// run leaves exactly what was there before.
+func (r *Runner) writeThumbs(ctx context.Context, sha, src string) error {
+	targets := make([]derive.ThumbTarget, 0, len(derivstore.ThumbSizes))
+	for _, size := range derivstore.ThumbSizes {
+		staged, cleanup, err := r.Derivatives.Stage("thumb-*.webp")
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		targets = append(targets, derive.ThumbTarget{Size: size, Path: staged})
+	}
+
+	if err := r.Images.Thumbs(ctx, src, targets); err != nil {
+		return err
+	}
+	for _, target := range targets {
+		if err := r.Derivatives.Commit(sha, derivstore.ThumbSuffix(target.Size), target.Path); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // runPlayback builds the browser-playable rendition of a video.

@@ -28,6 +28,54 @@ const (
 	LiveThumb = ".live.mp4"
 )
 
+// ThumbSizes are the square edge lengths every still is rendered at, smallest
+// first, and the sizes a Live Photo's motion is rendered at beside it. The
+// gallery picks one per zoom level: 96 for the two smallest cells, 512 for the
+// two largest, and the base everywhere between.
+//
+// Three sizes rather than one because the extremes are both wasteful in the
+// same way. A 256px file drawn in a 64px cell is fifteen times the pixels the
+// screen will use, times a screenful of tiles; the same file stretched into a
+// 512px cell is the one place the grid visibly softens.
+var ThumbSizes = []int{96, 256, 512}
+
+// BaseThumbSize is the size everything else falls back to, and the only one
+// whose files carry an unadorned suffix.
+//
+// The bare name is not tidiness, it is the reason this change did not have to
+// re-render an existing library: every `.thumb.webp` and `.live.mp4` already on
+// disk is still exactly what it claims to be, and only the two new sizes have
+// to be built. The API's plain /thumb and /live/thumb routes answer from these
+// same files, so a client that knows nothing about sizes is unaffected.
+const BaseThumbSize = 256
+
+// ThumbSuffix names the still rendition of a given size.
+func ThumbSuffix(size int) string {
+	if size == BaseThumbSize {
+		return Thumb
+	}
+	return fmt.Sprintf(".thumb%d.webp", size)
+}
+
+// LiveSuffix names the motion rendition of a given size.
+func LiveSuffix(size int) string {
+	if size == BaseThumbSize {
+		return LiveThumb
+	}
+	return fmt.Sprintf(".live%d.mp4", size)
+}
+
+// IsThumbSize reports whether a size is one this archive stores. It exists so
+// the API can reject `/thumb/97` before it turns into a path on disk.
+func IsThumbSize(size int) bool {
+	for _, s := range ThumbSizes {
+		if s == size {
+			return true
+		}
+	}
+	return false
+}
+
 type Store struct {
 	root string
 }

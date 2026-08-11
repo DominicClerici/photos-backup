@@ -13,7 +13,6 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/db"
 	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
-	"github.com/dominicclerici/photos-backup/server/internal/video"
 )
 
 // ingestLivePair archives a still and the paired video that declares it, the
@@ -71,8 +70,10 @@ func TestMetadataJobBuildsTheMotionThumbnailForALivePair(t *testing.T) {
 	if got.LiveState != db.DerivedReady {
 		t.Fatalf("LiveState = %q, want ready", got.LiveState)
 	}
-	if !h.Derivatives.Exists(paired.SHA256, derivstore.LiveThumb) {
-		t.Error("no motion thumbnail was written")
+	for _, size := range derivstore.ThumbSizes {
+		if !h.Derivatives.Exists(paired.SHA256, derivstore.LiveSuffix(size)) {
+			t.Errorf("no %dpx motion thumbnail was written", size)
+		}
 	}
 	if h.Derivatives.Exists(paired.SHA256, derivstore.Thumb) {
 		t.Error("a poster thumbnail was written for a paired video; nothing would ever draw it")
@@ -114,12 +115,14 @@ func TestMotionThumbnailIsTheSameSquareAsTheStillThumbnail(t *testing.T) {
 	h.claimAndRun(t, jobs.KindMetadata)
 	h.claimAndRun(t, jobs.KindMetadata)
 
-	info, err := h.Video.Probe(context.Background(), h.Derivatives.Path(paired.SHA256, derivstore.LiveThumb))
-	if err != nil {
-		t.Fatalf("probe the motion thumbnail: %v", err)
-	}
-	if w, hgt := info.DisplaySize(); w != video.LiveThumbSize || hgt != video.LiveThumbSize {
-		t.Errorf("motion thumbnail is %dx%d, want %[3]dx%[3]d", w, hgt, video.LiveThumbSize)
+	for _, size := range derivstore.ThumbSizes {
+		info, err := h.Video.Probe(context.Background(), h.Derivatives.Path(paired.SHA256, derivstore.LiveSuffix(size)))
+		if err != nil {
+			t.Fatalf("probe the %dpx motion thumbnail: %v", size, err)
+		}
+		if w, hgt := info.DisplaySize(); w != size || hgt != size {
+			t.Errorf("motion thumbnail is %dx%d, want %[3]dx%[3]d", w, hgt, size)
+		}
 	}
 }
 

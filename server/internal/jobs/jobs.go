@@ -24,7 +24,7 @@ import (
 type Kind string
 
 const (
-	// KindMetadata is exiftool plus the 256px thumbnail, and a poster frame for
+	// KindMetadata is exiftool plus the stored thumbnails, and a poster frame for
 	// video. The gallery cannot render an asset until this finishes.
 	KindMetadata Kind = "metadata"
 	// KindPlayback is the H.264 MP4 rendition of a video. Slow, and only the

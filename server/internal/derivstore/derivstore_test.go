@@ -142,6 +142,36 @@ func TestRemoveToleratesAMissingFile(t *testing.T) {
 	}
 }
 
+// The suffixes are the on-disk contract: a library's derivatives are found by
+// name and nothing records what they were called, so a change here orphans every
+// file already generated. The base size keeping the bare name is what let the
+// other two be added without re-rendering anything.
+func TestSuffixesAreTheNamesAlreadyOnDisk(t *testing.T) {
+	for _, tc := range []struct {
+		size       int
+		thumb      string
+		liveMotion string
+	}{
+		{96, ".thumb96.webp", ".live96.mp4"},
+		{256, ".thumb.webp", ".live.mp4"},
+		{512, ".thumb512.webp", ".live512.mp4"},
+	} {
+		if got := ThumbSuffix(tc.size); got != tc.thumb {
+			t.Errorf("ThumbSuffix(%d) = %q, want %q", tc.size, got, tc.thumb)
+		}
+		if got := LiveSuffix(tc.size); got != tc.liveMotion {
+			t.Errorf("LiveSuffix(%d) = %q, want %q", tc.size, got, tc.liveMotion)
+		}
+		if !IsThumbSize(tc.size) {
+			t.Errorf("IsThumbSize(%d) = false, but it has a suffix", tc.size)
+		}
+	}
+
+	if IsThumbSize(97) || IsThumbSize(0) {
+		t.Error("IsThumbSize accepted a size nothing renders")
+	}
+}
+
 func assertStagingEmpty(t *testing.T, s *Store) {
 	t.Helper()
 	entries, err := os.ReadDir(filepath.Join(s.Root(), "tmp"))

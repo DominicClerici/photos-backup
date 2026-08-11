@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { liveThumbUrl, thumbUrl, type TimelineItem } from "@/lib/api";
 import { formatDuration } from "@/lib/format";
+import { BASE_THUMB_SIZE, type ThumbSize } from "@/lib/layout";
 import { cn } from "@/lib/utils";
 
 /**
@@ -24,6 +25,8 @@ interface Props {
    * while scaling one that is already big enough only costs a composite.
    */
   size: number;
+  /** Which stored rendition to draw, chosen from the zoom level by the grid. */
+  thumbSize: ThumbSize;
   transform: string;
   /** Where the render loop finds this tile in the day model, without a lookup. */
   day: number;
@@ -31,7 +34,7 @@ interface Props {
   onOpen: (id: string) => void;
 }
 
-export function Tile({ item, size, transform, day, offset, onOpen }: Props) {
+export function Tile({ item, size, thumbSize, transform, day, offset, onOpen }: Props) {
   const [broken, setBroken] = useState(false);
   const [seenState, setSeenState] = useState(item.state);
 
@@ -47,6 +50,7 @@ export function Tile({ item, size, transform, day, offset, onOpen }: Props) {
   // would 404 by design. Every other state is worth an attempt: a metadata job
   // can fail *after* writing the thumbnail, and that photo should still appear.
   const attempt = item.state !== "pending" && !broken;
+  const { src, fallback } = useThumb(item.id, thumbSize, seenState, attempt);
   const label = item.kind === "video" ? "Video" : "Photo";
 
   return (
@@ -62,12 +66,16 @@ export function Tile({ item, size, transform, day, offset, onOpen }: Props) {
       {attempt ? (
         <img
           className="block size-full object-cover transition-[filter] group-hover:brightness-[1.08]"
-          src={thumbUrl(item.id)}
+          src={src}
           alt=""
           loading="lazy"
           decoding="async"
           draggable={false}
-          onError={() => setBroken(true)}
+          onError={() => {
+            // A size that was never rendered is not a broken photo; only the
+            // base rendition failing means there is nothing to draw.
+            if (!fallback()) setBroken(true);
+          }}
         />
       ) : (
         <span
@@ -82,7 +90,7 @@ export function Tile({ item, size, transform, day, offset, onOpen }: Props) {
         </span>
       )}
 
-      {attempt && item.live === "ready" ? <Motion id={item.id} /> : null}
+      {attempt && item.live === "ready" ? <Motion id={item.id} size={thumbSize} /> : null}
 
       {item.live && item.live !== "failed" ? (
         <span
@@ -104,6 +112,78 @@ export function Tile({ item, size, transform, day, offset, onOpen }: Props) {
 }
 
 /**
+ * The rendition a tile is currently drawing, and the only place a zoom changes
+ * which one that is.
+ *
+ * A new size is loaded out of sight and swapped in once it has arrived, because
+ * assigning a fresh `src` to a mounted <img> blanks it until the bytes land —
+ * across a screenful of tiles at the end of every zoom, that is a flash of empty
+ * grid for a picture that was already there. By the time the swap happens the
+ * image is in the browser's cache, so it paints in the same frame.
+ *
+ * A size that 404s falls back to the base rendition, which every asset has: a
+ * library ingested before these sizes existed keeps drawing, at the size it does
+ * have, until `photobackup verify --fix` has rendered the rest.
+ */
+function useThumb(
+  id: string,
+  size: ThumbSize,
+  state: TimelineItem["state"],
+  drawing: boolean,
+) {
+  const [missing, setMissing] = useState<Set<ThumbSize>>(() => new Set());
+
+  // Reset alongside `broken`: a job that has just finished may well have
+  // written the size that was not there when this tile first asked for it.
+  const [seenState, setSeenState] = useState(state);
+  if (seenState !== state) {
+    setSeenState(state);
+    if (missing.size > 0) setMissing(new Set());
+  }
+
+  const target = thumbUrl(id, missing.has(size) ? BASE_THUMB_SIZE : size);
+  const [shown, setShown] = useState(target);
+
+  useEffect(() => {
+    if (target === shown) return;
+    if (!drawing) {
+      // Nothing on screen to protect — a tile still waiting on its job, or one
+      // that has already given up. Follow the zoom without spending a request
+      // on a rendition that provably is not there.
+      setShown(target);
+      return;
+    }
+    const probe = new Image();
+    probe.onload = () => setShown(target);
+    // Leave `shown` alone: what is on screen is a picture of the right photo at
+    // the wrong size, which beats a hole in the grid. Recording the gap is what
+    // sends the next render to the base rendition instead.
+    probe.onerror = () => setMissing((prev) => new Set(prev).add(size));
+    probe.src = target;
+    return () => {
+      probe.onload = null;
+      probe.onerror = null;
+    };
+  }, [drawing, target, shown, size]);
+
+  /**
+   * What to do when the <img> itself fails, which is the case the preload above
+   * cannot cover: the very first rendition a tile asks for is mounted directly,
+   * with nothing yet on screen to keep. Reports whether there is anything left
+   * to try — false means the base rendition is the one that failed, and the tile
+   * has genuinely lost its picture.
+   */
+  const fallback = (): boolean => {
+    if (shown === thumbUrl(id, BASE_THUMB_SIZE)) return false;
+    setMissing((prev) => new Set(prev).add(size));
+    setShown(thumbUrl(id, BASE_THUMB_SIZE));
+    return true;
+  };
+
+  return { src: shown, fallback };
+}
+
+/**
  * The three seconds a Live Photo carries, played over its own still.
  *
  * The still stays mounted underneath rather than being swapped out. The video
@@ -114,7 +194,7 @@ export function Tile({ item, size, transform, day, offset, onOpen }: Props) {
  * Hover, not touch: pointerenter fires for a tap too, but pointerleave often
  * does not, which leaves a video playing under a finger that has moved on.
  */
-function Motion({ id }: { id: string }) {
+function Motion({ id, size }: { id: string; size: ThumbSize }) {
   const timer = useRef(0);
   const [armed, setArmed] = useState(false);
   const [visible, setVisible] = useState(false);
@@ -141,7 +221,10 @@ function Motion({ id }: { id: string }) {
         <video
           className="block size-full object-cover transition-opacity duration-150"
           style={{ opacity: visible ? 1 : 0 }}
-          src={liveThumbUrl(id)}
+          // Matched to the still it plays over. Nothing to preload or fall back
+          // from: this is mounted on hover over an image that stays underneath,
+          // so a size that is not there yet simply never fades in.
+          src={liveThumbUrl(id, size)}
           // Muted is not a preference here: a hover is not a user gesture, and
           // every browser refuses to autoplay sound without one.
           muted

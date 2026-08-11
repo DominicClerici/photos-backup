@@ -20,6 +20,7 @@ import {
   itemAtPoint,
   layoutLevel,
   metricsFor,
+  thumbSizeFor,
   tileRect,
   visibleItems,
   DEFAULT_ZOOM,
@@ -151,6 +152,11 @@ export function Timeline({
   const frame = frameAt(levels, z);
   const boxLevel = clamp(settled ? Math.round(zoom.target) : env.current.boxLevel, 0, MAX_ZOOM);
   const box = levels[boxLevel].metrics.cellSize;
+  // The rendition follows the box for the same reason the box exists: it is the
+  // largest size this transition will draw, so zooming in upgrades the picture
+  // as soon as the tiles are laid out for it, and zooming out keeps the larger
+  // one until the grid has settled at the smaller cell.
+  const thumb = thumbSizeFor(boxLevel);
 
   const needed = visibleItems(
     days,
@@ -517,6 +523,7 @@ export function Timeline({
                 key={item.id}
                 item={item}
                 size={box}
+                thumbSize={thumb}
                 day={day}
                 offset={offset}
                 transform={`translate(${r.x}px,${r.y}px) scale(${r.size / box})`}

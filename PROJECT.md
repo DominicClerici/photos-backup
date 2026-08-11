@@ -161,10 +161,33 @@ thumbnails are `libheif` and `ffmpeg` subprocess calls. Go only orchestrates.
 
 $DERIVATIVES_ROOT/                  the SSD; defaults to /mnt/photos/derivatives
   ab/cd/abcd1234.thumb.webp         256px square, stored
-  3f/9a/3f9a77b2.thumb.webp         poster frame for video, same shape
+  ab/cd/abcd1234.thumb96.webp       96px, for the two smallest zoom levels
+  ab/cd/abcd1234.thumb512.webp      512px, for the two largest
+  3f/9a/3f9a77b2.thumb.webp         poster frame for video, same shape and sizes
   3f/9a/3f9a77b2.mp4                H.264 playback rendition, video only
   7c/21/7c21ba05.live.mp4           256px square, a Live Photo's motion
+  7c/21/7c21ba05.live96.mp4         the same three seconds at the other sizes
+  7c/21/7c21ba05.live512.mp4
 ```
+
+Three thumbnail sizes because the grid zooms across a range no single size
+covers: a 256px file is fifteen times the pixels a 64px cell will use, times a
+screenful of tiles, and the same file is visibly soft stretched into a 512px
+one. The gallery picks the smallest size that fills the cell — 96, 256, 512 —
+and 256 keeps its unadorned name so introducing the other two re-rendered
+nothing that already existed.
+
+All three come out of one subprocess per asset, because decoding is what a
+rendition costs: a 12-megapixel HEIC takes a few hundred milliseconds to get
+into memory and a couple of milliseconds to squeeze into a 96px square. The same
+holds for the Live Photo clips, which are one ffmpeg with a `split` filter
+rather than three.
+
+A library ingested before a size existed has only the sizes it was ingested
+with. `photobackup verify --fix` is the backfill: a missing size reads as a
+missing derivative, and the repair for that has always been to requeue the job
+that renders it. Until that runs the gallery draws the base rendition at those
+zoom levels, which is a size mismatch and not a hole.
 
 Originals live on the archive partition — 500GB of the 6TB drive, mounted at
 `/mnt/photos`. Postgres and derivatives should live on the workstation SSD for
@@ -202,17 +225,18 @@ What it gets built is deliberately lopsided against what an ordinary video gets:
 
 | | ordinary video | Live Photo's video |
 |---|---|---|
-| poster `.thumb.webp` | yes | **no** — the tile belongs to the still |
+| poster `.thumb*.webp` | yes | **no** — the tile belongs to the still |
 | stored H.264 `.mp4` | yes, via the transcode queue | **no** |
-| `.live.mp4`, 256px square | no | yes, in the metadata job |
+| `.live*.mp4`, one per thumbnail size | no | yes, in the metadata job |
 | 1080p with audio | n/a | rendered per request, stored nowhere |
 
 Roughly a third of an iPhone library is a Live Photo. Putting each of those
 three seconds through the transcode queue would swamp the videos that genuinely
 need it, for a rendition only ever played while a mouse button is held down —
 so the viewer's copy is rendered on demand, the same trade §5 already makes for
-the 2048px photo preview. The 256px one *is* stored, because the grid asks for
-it on hover and an ffmpeg per hover is not a thing that can be allowed.
+the 2048px photo preview. The thumbnail-sized ones *are* stored, because the
+grid asks for one on hover and an ffmpeg per hover is not a thing that can be
+allowed.
 
 The one place this differs from the photo preview: those renditions are kept in
 memory briefly after rendering. A `<video>` asks for its bytes more than once —
@@ -320,8 +344,8 @@ zero bytes.
 Worker pool, ffmpeg/libheif thumbnails, video posters, virtualized web timeline,
 full-size viewer.
 
-Two job kinds in two separately sized pools: `metadata` (exiftool, the 256px
-thumbnail, a video's poster frame) and `playback` (H.264/AAC MP4). They are
+Two job kinds in two separately sized pools: `metadata` (exiftool, the stored
+thumbnails, a video's poster frame) and `playback` (H.264/AAC MP4). They are
 split because a handful of 4K transcodes would otherwise take every worker slot
 and starve the thumbnails behind them, which during a backfill looks exactly
 like a gallery that has stopped working.

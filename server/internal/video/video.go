@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,11 +29,14 @@ import (
 // the original is always one click away for anything more.
 const PlaybackMaxEdge = 1920
 
-// LiveThumbSize is the square a Live Photo's motion thumbnail is cropped to. It
-// matches derive.Converter's thumbnail exactly, because the two are shown in
-// the same cell and anything else makes the picture jump as one replaces the
-// other.
-const LiveThumbSize = 256
+// LiveThumbTarget is one square size of a Live Photo's motion and the file it
+// should be written to. The sizes match the still thumbnails exactly, because
+// the two are shown in the same cell and anything else makes the picture jump
+// as one replaces the other.
+type LiveThumbTarget struct {
+	Size int
+	Path string
+}
 
 // LiveThumbMaxSeconds bounds it in time. A Live Photo is about three seconds,
 // and this is here for the day something else is labelled as one: a
@@ -333,40 +337,72 @@ func (t *Tool) Transcode(ctx context.Context, src, dst string, info Info) error 
 	return nil
 }
 
-// LiveThumb writes a Live Photo's motion thumbnail: 256px square, silent, and
-// small enough that a grid can pull one down the instant a pointer lands on a
-// tile.
+// LiveThumbs writes a Live Photo's motion thumbnail at every size asked for:
+// square, silent, and small enough that a grid can pull one down the instant a
+// pointer lands on a tile.
 //
 // Square-cropped rather than fitted, matching the still thumbnail's own crop,
-// because the two are shown in the same 256px cell and the video replaces the
-// image in place. A fitted video would letterbox against the tile and the
-// picture would visibly jump on hover.
+// because the two are shown in the same cell and the video replaces the image
+// in place. A fitted video would letterbox against the tile and the picture
+// would visibly jump on hover.
 //
 // Silent because nothing can play audio here: this fires on hover, without a
 // user gesture, and every browser blocks unmuted autoplay without one. Dropping
 // the track rather than muting the element saves the bytes too.
-func (t *Tool) LiveThumb(ctx context.Context, src, dst string, info Info) error {
-	size := LiveThumbSize
+//
+// One ffmpeg for all of them, like the stills: the clip is decoded once, cropped
+// once at the largest size, and the smaller ones are scaled off that same
+// filter graph. Three separate runs would decode the same three seconds three
+// times over, which during a backfill is the whole cost of the feature.
+func (t *Tool) LiveThumbs(ctx context.Context, src string, targets []LiveThumbTarget, info Info) error {
+	if len(targets) == 0 {
+		return nil
+	}
+	ordered := slices.SortedFunc(slices.Values(targets), func(a, b LiveThumbTarget) int {
+		return b.Size - a.Size
+	})
+
+	// increase-then-crop is ImageMagick's `-resize ^` and `-extent` in ffmpeg's
+	// vocabulary: fill the box, then cut the overflow away. Everything after the
+	// split is already square, so the smaller sizes are a plain scale.
+	largest := ordered[0].Size
+	graph := fmt.Sprintf(
+		"[0:v]scale=w=%d:h=%d:force_original_aspect_ratio=increase:flags=lanczos,crop=%d:%d,split=%d[o0]",
+		largest, largest, largest, largest, len(ordered))
+	for i := 1; i < len(ordered); i++ {
+		graph += fmt.Sprintf("[s%d]", i)
+	}
+	for i := 1; i < len(ordered); i++ {
+		graph += fmt.Sprintf(";[s%d]scale=w=%d:h=%d:flags=lanczos[o%d]", i, ordered[i].Size, ordered[i].Size, i)
+	}
+
 	args := []string{
 		"-nostdin", "-y", "-v", "error",
-		"-i", src,
+		// Before -i, so the limit applies to what is read rather than having to
+		// be repeated on every output.
 		"-t", strconv.Itoa(LiveThumbMaxSeconds),
-		"-an",
-		// increase-then-crop is ImageMagick's `-resize ^` and `-extent` in
-		// ffmpeg's vocabulary: fill the box, then cut the overflow away.
-		"-vf", fmt.Sprintf("scale=w=%d:h=%d:force_original_aspect_ratio=increase:flags=lanczos,crop=%d:%d",
-			size, size, size, size),
-		"-c:v", t.encoder(),
-		// Looser than the playback rendition. At 256px the difference is
-		// invisible and the file is a third of the size, which is what a grid
-		// firing these off on hover needs it to be.
-		"-crf", "30",
-		"-preset", "veryfast",
-		"-pix_fmt", "yuv420p",
-		"-movflags", "+faststart",
-		dst,
+		"-i", src,
+		"-filter_complex", graph,
 	}
-	return t.encode(ctx, args, src, dst, "live thumbnail")
+	dsts := make([]string, len(ordered))
+	for i, target := range ordered {
+		dsts[i] = target.Path
+		args = append(args,
+			// Only the filter's video comes through, so the paired clip's audio
+			// track is dropped by never being mapped.
+			"-map", fmt.Sprintf("[o%d]", i),
+			"-c:v", t.encoder(),
+			// Looser than the playback rendition. At thumbnail size the
+			// difference is invisible and the file is a third of the size, which
+			// is what a grid firing these off on hover needs it to be.
+			"-crf", "30",
+			"-preset", "veryfast",
+			"-pix_fmt", "yuv420p",
+			"-movflags", "+faststart",
+			target.Path,
+		)
+	}
+	return t.encode(ctx, args, src, dsts, "live thumbnail")
 }
 
 // LivePreview writes the rendition the viewer plays on press-and-hold: 1080p,
@@ -405,14 +441,14 @@ func (t *Tool) LivePreview(ctx context.Context, src, dst string, info Info) erro
 		"-movflags", "+faststart",
 		dst,
 	)
-	return t.encode(ctx, args, src, dst, "live preview")
+	return t.encode(ctx, args, src, []string{dst}, "live preview")
 }
 
-// encode runs one ffmpeg and insists that something playable came out of it,
-// for the same reason Transcode does: an ffmpeg that exits 0 having encoded
-// nothing is a failure disguised as a success, and it surfaces later as a
-// player that shows a black rectangle.
-func (t *Tool) encode(ctx context.Context, args []string, src, dst, what string) error {
+// encode runs one ffmpeg and insists that something playable came out of every
+// output it was given, for the same reason Transcode does: an ffmpeg that exits
+// 0 having encoded nothing is a failure disguised as a success, and it surfaces
+// later as a player that shows a black rectangle.
+func (t *Tool) encode(ctx context.Context, args []string, src string, dsts []string, what string) error {
 	cmd := exec.CommandContext(ctx, t.ffmpeg(), args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -420,12 +456,14 @@ func (t *Tool) encode(ctx context.Context, args []string, src, dst, what string)
 	runErr := cmd.Run()
 	complaint := strings.TrimSpace(stderr.String())
 
-	if err := t.checkPlayable(ctx, dst); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("render %s of %s: %w", what, src, ctx.Err())
+	for _, dst := range dsts {
+		if err := t.checkPlayable(ctx, dst); err != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("render %s of %s: %w", what, src, ctx.Err())
+			}
+			return fmt.Errorf("render %s of %s: %w (ffmpeg %s; stderr: %s)",
+				what, src, err, exitStatus(runErr), orNone(complaint))
 		}
-		return fmt.Errorf("render %s of %s: %w (ffmpeg %s; stderr: %s)",
-			what, src, err, exitStatus(runErr), orNone(complaint))
 	}
 	if runErr != nil {
 		return fmt.Errorf("render %s of %s: %w: %s", what, src, runErr, complaint)

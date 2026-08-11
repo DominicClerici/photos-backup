@@ -62,9 +62,9 @@ every rendition, which is why the app reads the archive over 8787 and needs no
 signed URLs.
 
 Next's `<Image>` is deliberately unused. It exists to resize arbitrary source
-images at the edge; photod already emits a thumbnail at exactly the size the
-grid wants, and routing it through the optimizer would add a hop to re-encode
-something that is already a 256px WebP.
+images at the edge; photod already stores a thumbnail at each size the grid
+asks for, and routing it through the optimizer would add a hop to re-encode
+something that is already a square WebP of the right dimensions.
 
 ## How the timeline is virtualized
 
@@ -84,10 +84,19 @@ Tiles are square because the stored thumbnail is a square center crop: the
 browser never rescales it, and row height follows from cell size alone. The
 cost is that the grid crops — the viewer shows the real framing.
 
-Cells target 160 CSS px and stretch to divide the container evenly. That is
-deliberately near the ceiling for a 256px thumbnail: much larger and a 2x
-display starts to show it. Raising `THUMB_SIZE` on the server and re-running the
-metadata jobs is the lever if the grid should get bigger.
+Cells settle on one of seven zoom levels — 64 to 512 CSS px — and stretch below
+that ceiling to divide the container evenly. `thumbSizeFor` in `layout.ts` maps
+a level to the stored rendition that draws it: the smallest of photod's 96, 256
+and 512 that can fill the cell without being stretched. Downscaling is free and
+upscaling is not, so it rounds up, and the two outer levels each get a size of
+their own rather than stretching or wasting the middle one.
+
+A tile loads a new size out of sight and swaps it in once it has arrived,
+because assigning a fresh `src` to a mounted `<img>` blanks it until the bytes
+land — a flash of empty grid at the end of every zoom otherwise. A size photod
+has not rendered yet 404s, and the tile falls back to the 256px rendition every
+asset has, so a library still waiting on `photobackup verify --fix` draws at the
+wrong size rather than not at all.
 
 ## What the client polls, and what it does not
 

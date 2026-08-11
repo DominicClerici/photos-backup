@@ -23,15 +23,41 @@ export const DEFAULT_HEADER_HEIGHT = 52;
  *
  * A level is a ceiling rather than an exact size: cells still shrink below it so
  * that a row divides the container evenly, the same way the grid has always
- * responded to window width. Stored thumbnails are 256px square, so the two
- * largest levels draw them upscaled until the pipeline grows a bigger
- * derivative — the same trade in reverse as the 96px thumbnail planned for the
- * two smallest.
+ * responded to window width.
  */
-export const ZOOM_LEVELS = [64, 96, 160, 256, 384, 512];
+export const ZOOM_LEVELS = [64, 96, 160, 208, 256, 384, 512];
 export const MAX_ZOOM = ZOOM_LEVELS.length - 1;
 /** 160px — the nearest level to what the grid used before zoom existed. */
 export const DEFAULT_ZOOM = 2;
+
+/**
+ * The square sizes photod stores a thumbnail and a Live Photo's motion at,
+ * smallest first. Mirrors `derivstore.ThumbSizes` on the server.
+ */
+export const THUMB_SIZES = [96, 256, 512] as const;
+export type ThumbSize = (typeof THUMB_SIZES)[number];
+/** The size served by the unsized route, and what everything falls back to. */
+export const BASE_THUMB_SIZE: ThumbSize = 256;
+
+/**
+ * The stored size a zoom level draws from: the smallest one that can fill the
+ * cell without being stretched.
+ *
+ * Which works out as the sizes the pipeline was built for — 96 for the two
+ * smallest levels, 256 for the three in the middle, 512 for the two largest —
+ * but says why rather than listing it, so adding a level or a size cannot leave
+ * the two tables disagreeing. A level is a ceiling on the cell, so a size that
+ * covers the ceiling covers the cell.
+ *
+ * Downscaling is free and upscaling is not, which is why this rounds up. The
+ * asymmetry is the whole reason for the extra sizes: at 64px the old 256px file
+ * was fifteen times the pixels the screen would use, and at 512px it was the one
+ * place the grid visibly softened.
+ */
+export function thumbSizeFor(level: number): ThumbSize {
+  const cell = ZOOM_LEVELS[clamp(Math.round(level), 0, MAX_ZOOM)];
+  return THUMB_SIZES.find((size) => size >= cell) ?? THUMB_SIZES[THUMB_SIZES.length - 1];
+}
 
 export interface GridMetrics {
   columns: number;

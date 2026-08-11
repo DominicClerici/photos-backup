@@ -3,6 +3,8 @@ package derive
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -27,44 +29,82 @@ func decode(t *testing.T, out *bytes.Buffer) (width, height int) {
 	return b.Dx(), b.Dy()
 }
 
-func TestThumbIsAlwaysSquare(t *testing.T) {
-	var out bytes.Buffer
+func decodeFile(t *testing.T, path string) (width, height int) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read rendition: %v", err)
+	}
+	return decode(t, bytes.NewBuffer(data))
+}
+
+// targets names one file per size in a directory that goes away with the test.
+func targets(t *testing.T, sizes ...int) []ThumbTarget {
+	t.Helper()
+	dir := t.TempDir()
+	out := make([]ThumbTarget, len(sizes))
+	for i, size := range sizes {
+		out[i] = ThumbTarget{Size: size, Path: filepath.Join(dir, fmt.Sprint(size)+".webp")}
+	}
+	return out
+}
+
+func TestThumbsAreAlwaysSquareAtEverySize(t *testing.T) {
 	// 400x300, so the crop has to take a slice off both sides rather than
-	// letterboxing.
-	if err := New().Thumb(context.Background(), fixture("sample.heic"), &out); err != nil {
-		t.Fatalf("Thumb: %v\n\nIs ImageMagick installed with the libheif delegate?", err)
+	// letterboxing, and 512 is past the original — the small sizes must not
+	// inherit anything from that.
+	want := targets(t, 96, 256, 512)
+	if err := New().Thumbs(context.Background(), fixture("sample.heic"), want); err != nil {
+		t.Fatalf("Thumbs: %v\n\nIs ImageMagick installed with the libheif delegate?", err)
 	}
 
-	w, h := decode(t, &out)
-	if w != 256 || h != 256 {
-		t.Errorf("thumb is %dx%d, want 256x256", w, h)
+	for _, target := range want {
+		w, h := decodeFile(t, target.Path)
+		if w != target.Size || h != target.Size {
+			t.Errorf("thumb is %dx%d, want %dx%d", w, h, target.Size, target.Size)
+		}
 	}
 }
 
 // A portrait original must come out square too. If the crop were skipped for
 // one aspect ratio, the grid's fixed row height would break.
-func TestThumbSquaresARealIPhonePortrait(t *testing.T) {
-	var out bytes.Buffer
-	if err := New().Thumb(context.Background(), fixture("iphone-portrait.heic"), &out); err != nil {
-		t.Fatalf("Thumb: %v", err)
+func TestThumbsSquareARealIPhonePortrait(t *testing.T) {
+	want := targets(t, 96, 256, 512)
+	if err := New().Thumbs(context.Background(), fixture("iphone-portrait.heic"), want); err != nil {
+		t.Fatalf("Thumbs: %v", err)
 	}
 
-	w, h := decode(t, &out)
-	if w != 256 || h != 256 {
-		t.Errorf("thumb is %dx%d, want 256x256", w, h)
+	for _, target := range want {
+		w, h := decodeFile(t, target.Path)
+		if w != target.Size || h != target.Size {
+			t.Errorf("thumb is %dx%d, want %dx%d", w, h, target.Size, target.Size)
+		}
 	}
 }
 
-func TestThumbHonorsAConfiguredSize(t *testing.T) {
-	c := New()
-	c.ThumbSize = 64
-
-	var out bytes.Buffer
-	if err := c.Thumb(context.Background(), fixture("sample.heic"), &out); err != nil {
-		t.Fatalf("Thumb: %v", err)
+// The chain steps down from the largest size, so the targets arriving in any
+// order has to mean the same thing.
+func TestThumbsDoNotDependOnTheOrderAskedFor(t *testing.T) {
+	want := targets(t, 256, 512, 96)
+	if err := New().Thumbs(context.Background(), fixture("iphone-portrait.heic"), want); err != nil {
+		t.Fatalf("Thumbs: %v", err)
 	}
 
-	w, h := decode(t, &out)
+	for _, target := range want {
+		w, h := decodeFile(t, target.Path)
+		if w != target.Size || h != target.Size {
+			t.Errorf("thumb is %dx%d, want %dx%d", w, h, target.Size, target.Size)
+		}
+	}
+}
+
+func TestThumbsHonorAnyRequestedSize(t *testing.T) {
+	want := targets(t, 64)
+	if err := New().Thumbs(context.Background(), fixture("sample.heic"), want); err != nil {
+		t.Fatalf("Thumbs: %v", err)
+	}
+
+	w, h := decodeFile(t, want[0].Path)
 	if w != 64 || h != 64 {
 		t.Errorf("thumb is %dx%d, want 64x64", w, h)
 	}
@@ -169,11 +209,9 @@ func TestPreviewRunsConcurrentlyUpToTheCap(t *testing.T) {
 }
 
 func TestConversionReportsTheFailingInput(t *testing.T) {
-	var out bytes.Buffer
-
-	err := New().Thumb(context.Background(), fixture("does-not-exist.heic"), &out)
+	err := New().Thumbs(context.Background(), fixture("does-not-exist.heic"), targets(t, 256))
 	if err == nil {
-		t.Fatal("Thumb succeeded on a missing file, want an error")
+		t.Fatal("Thumbs succeeded on a missing file, want an error")
 	}
 	// The error text lands in jobs.last_error, so it has to identify the file.
 	if !bytes.Contains([]byte(err.Error()), []byte("does-not-exist.heic")) {

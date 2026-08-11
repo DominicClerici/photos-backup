@@ -16,6 +16,7 @@ import {
   itemTop,
   layoutLevel,
   metricsFor,
+  thumbSizeFor,
   tileRect,
   visibleItems,
   DEFAULT_ZOOM,
@@ -338,4 +339,32 @@ test("dayAt reports the day covering a scroll position", () => {
   assert.equal(dayAt(days, frame, headerY(frame, 2) - 1)?.label, days[1].label);
   assert.equal(dayAt(days, frame, 999_999)?.label, days[2].label);
   assert.equal(dayAt([], frame, 0), null);
+});
+
+test("thumbSizeFor picks the smallest rendition that fills the cell", () => {
+  // The mapping the pipeline was built for: 96 for the two smallest levels, the
+  // base for the three in the middle, 512 for the two largest.
+  assert.deepEqual(
+    ZOOM_LEVELS.map((_, level) => thumbSizeFor(level)),
+    [96, 96, 256, 256, 256, 512, 512],
+  );
+});
+
+test("thumbSizeFor never draws a cell larger than the rendition it picks", () => {
+  for (let level = 0; level <= MAX_ZOOM; level++) {
+    assert.ok(
+      thumbSizeFor(level) >= ZOOM_LEVELS[level],
+      `level ${level} draws a ${ZOOM_LEVELS[level]}px cell from a ${thumbSizeFor(level)}px file`,
+    );
+  }
+});
+
+// The zoom is a continuous scalar and the grid asks for a rendition mid-flight,
+// so a fractional level has to resolve to one of the sizes rather than to
+// undefined.
+test("thumbSizeFor handles positions between and beyond the levels", () => {
+  assert.equal(thumbSizeFor(0.4), 96);
+  assert.equal(thumbSizeFor(1.6), 256);
+  assert.equal(thumbSizeFor(-3), 96);
+  assert.equal(thumbSizeFor(MAX_ZOOM + 3), 512);
 });

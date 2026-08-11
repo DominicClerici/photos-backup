@@ -151,12 +151,19 @@ func (s *Server) readRoutes(mux *http.ServeMux, allow guard) {
 	mux.HandleFunc("GET /v1/assets/{id}", allow(s.handleAssetDetail))
 	mux.HandleFunc("GET /v1/assets/{id}/original", allow(s.handleOriginal))
 	mux.HandleFunc("GET /v1/assets/{id}/thumb", allow(s.handleThumb))
+	// The other stored sizes, which the gallery picks between as it zooms. The
+	// unsized route above is the base one and is not going anywhere: a client
+	// that has no opinion about size — the phone app, a link someone saved —
+	// should not have to learn what sizes this archive happens to keep.
+	mux.HandleFunc("GET /v1/assets/{id}/thumb/{size}", allow(s.handleThumbSized))
 	mux.HandleFunc("GET /v1/assets/{id}/preview", allow(s.handlePreview))
 	mux.HandleFunc("GET /v1/assets/{id}/playback", allow(s.handlePlayback))
 
-	// A Live Photo's motion, addressed by the still's id. Two sizes for the two
-	// places it plays: the grid's hover and the viewer's press-and-hold.
+	// A Live Photo's motion, addressed by the still's id. The stored sizes are
+	// the grid's, which plays it on hover; the viewer's press-and-hold gets its
+	// own rendition, rendered per request.
 	mux.HandleFunc("GET /v1/assets/{id}/live/thumb", allow(s.handleLiveThumb))
+	mux.HandleFunc("GET /v1/assets/{id}/live/thumb/{size}", allow(s.handleLiveThumbSized))
 	mux.HandleFunc("GET /v1/assets/{id}/live/preview", allow(s.handleLivePreview))
 
 	// Guarded with the rest: a failed job carries a filename and an error string,

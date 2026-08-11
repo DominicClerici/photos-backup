@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/dominicclerici/photos-backup/server/internal/db"
@@ -41,7 +42,8 @@ func (s *Server) handleOriginal(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, asset.OriginalFilename, asset.UploadedAt, f)
 }
 
-// handleThumb serves the stored 256px rendition.
+// handleThumb serves the base stored rendition, the one every client gets
+// without asking for a size.
 //
 // It answers from the file rather than from derived_state, so a photo whose
 // metadata job failed after the thumbnail was written still shows its picture.
@@ -52,6 +54,26 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.serveDerivative(w, r, asset, derivstore.Thumb, "image/webp")
+}
+
+// handleThumbSized serves one named size of the stored rendition.
+//
+// A size the archive does not store is a 404 rather than a nearest match, and a
+// size it stores but has not built yet is the same 404 the base route already
+// answers with. Both matter because these URLs are immutable-cached: answering
+// /thumb/512 with the 256px file would pin the wrong bytes in a browser's cache
+// long after the real rendition existed. The gallery falls back on its own,
+// which is a decision it can revisit on the next zoom.
+func (s *Server) handleThumbSized(w http.ResponseWriter, r *http.Request) {
+	asset, ok := s.lookup(w, r)
+	if !ok {
+		return
+	}
+	size, ok := thumbSize(w, r)
+	if !ok {
+		return
+	}
+	s.serveDerivative(w, r, asset, derivstore.ThumbSuffix(size), "image/webp")
 }
 
 // handlePlayback serves the browser-playable rendition of a video.
@@ -67,13 +89,39 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	s.serveDerivative(w, r, asset, derivstore.Playback, "video/mp4")
 }
 
-// handleLiveThumb serves the 256px motion rendition the grid plays on hover.
+// handleLiveThumb serves the base motion rendition the grid plays on hover.
 func (s *Server) handleLiveThumb(w http.ResponseWriter, r *http.Request) {
 	video, ok := s.livePair(w, r)
 	if !ok {
 		return
 	}
 	s.serveDerivative(w, r, video, derivstore.LiveThumb, "video/mp4")
+}
+
+// handleLiveThumbSized serves that motion at one of the other stored sizes, so
+// the clip that plays on hover is the same size as the still it replaces at
+// every zoom level.
+func (s *Server) handleLiveThumbSized(w http.ResponseWriter, r *http.Request) {
+	video, ok := s.livePair(w, r)
+	if !ok {
+		return
+	}
+	size, ok := thumbSize(w, r)
+	if !ok {
+		return
+	}
+	s.serveDerivative(w, r, video, derivstore.LiveSuffix(size), "video/mp4")
+}
+
+// thumbSize reads the {size} path value, refusing anything this archive does
+// not render before it can become a path on disk.
+func thumbSize(w http.ResponseWriter, r *http.Request) (int, bool) {
+	size, err := strconv.Atoi(r.PathValue("size"))
+	if err != nil || !derivstore.IsThumbSize(size) {
+		writeError(w, http.StatusNotFound, "no rendition is stored at that size")
+		return 0, false
+	}
+	return size, true
 }
 
 // handleLivePreview renders the 1080p rendition on demand and stores nothing.

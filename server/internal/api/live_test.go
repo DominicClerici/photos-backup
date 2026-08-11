@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -84,6 +85,29 @@ func TestLiveThumbIsServedByTheStillsID(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if len(body) == 0 {
 		t.Error("the motion thumbnail came back empty")
+	}
+}
+
+// The motion has the same sizes as the still it plays over, because the grid
+// swaps one for the other in the same cell at whatever size that cell is.
+func TestLiveThumbIsServedAtEveryStoredSize(t *testing.T) {
+	h := newHarness(t)
+	stillID, videoID := uploadLivePair(t, h)
+	writeLiveThumb(t, h, videoID)
+
+	for _, size := range derivstore.ThumbSizes {
+		resp := h.get(t, fmt.Sprintf("/v1/assets/%s/live/thumb/%d", stillID, size))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d for %dpx, want 200", resp.StatusCode, size)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		if len(body) == 0 {
+			t.Errorf("the %dpx motion thumbnail came back empty", size)
+		}
+	}
+
+	if resp := h.get(t, "/v1/assets/"+stillID+"/live/thumb/97"); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d for an unstored size, want 404", resp.StatusCode)
 	}
 }
 
@@ -199,17 +223,23 @@ func writeLiveThumb(t *testing.T, h *harness, videoID string) {
 	if err != nil {
 		t.Fatalf("probe: %v\n\nIs ffmpeg installed?", err)
 	}
-	staged, cleanup, err := h.srv.Derivatives.Stage("live-*" + derivstore.LiveThumb)
-	if err != nil {
-		t.Fatalf("stage: %v", err)
+	var targets []video.LiveThumbTarget
+	for _, size := range derivstore.ThumbSizes {
+		staged, cleanup, err := h.srv.Derivatives.Stage("live-*" + derivstore.LiveSuffix(size))
+		if err != nil {
+			t.Fatalf("stage: %v", err)
+		}
+		defer cleanup()
+		targets = append(targets, video.LiveThumbTarget{Size: size, Path: staged})
 	}
-	defer cleanup()
 
-	if err := tool.LiveThumb(ctx, src, staged, info); err != nil {
-		t.Fatalf("LiveThumb: %v", err)
+	if err := tool.LiveThumbs(ctx, src, targets, info); err != nil {
+		t.Fatalf("LiveThumbs: %v", err)
 	}
-	if err := h.srv.Derivatives.Commit(asset.SHA256, derivstore.LiveThumb, staged); err != nil {
-		t.Fatalf("commit: %v", err)
+	for _, target := range targets {
+		if err := h.srv.Derivatives.Commit(asset.SHA256, derivstore.LiveSuffix(target.Size), target.Path); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
 	}
 	if err := h.store.SetLiveState(ctx, videoID, db.DerivedReady); err != nil {
 		t.Fatalf("SetLiveState: %v", err)
