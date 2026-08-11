@@ -119,6 +119,52 @@ test('reports a refused read as unauthorized', async () => {
   expect((error as SyncError).status).toBe(401);
 });
 
+test('reads the backup card numbers from the server, with the token', async () => {
+  const fetcher = fakeFetch([
+    [
+      '/v1/stats',
+      () =>
+        json({
+          device: {
+            archived: 1284,
+            bytes: 105453486080,
+            photos: 1102,
+            videos: 182,
+            last_upload_at: '2026-08-11T13:04:22Z',
+          },
+          archive: {
+            assets: 12406,
+            bytes: 402653184000,
+            photos: 10233,
+            videos: 2173,
+            pending_jobs: 41,
+            failed_jobs: 0,
+          },
+        }),
+    ],
+  ]);
+
+  const stats = await clientWith('pbk_secret').stats();
+
+  expect(authorization(fetcher.calls[0])).toBe('Bearer pbk_secret');
+  expect(stats.device.archived).toBe(1284);
+  expect(stats.archive.pending_jobs).toBe(41);
+});
+
+// photod answers these from the token rather than from the open read path, so an
+// unpaired phone is refused here where it would be served a timeline. The card
+// has to tell the two apart: one is "pair this phone", the other is "the server
+// is down".
+test('reports stats refused without a pairing as unauthorized', async () => {
+  fakeFetch([['/v1/stats', () => json({ error: 'a device token is required' }, 401)]]);
+
+  const error = await clientWith(null)
+    .stats()
+    .catch((e: unknown) => e);
+
+  expect(isUnauthorized(error)).toBe(true);
+});
+
 test('trims a trailing slash off the server address', () => {
   expect(clientWith('t', 'https://server.local:8787/').mediaUrl('abc', 'preview')).toBe(
     'https://server.local:8787/v1/assets/abc/preview'

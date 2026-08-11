@@ -17,6 +17,13 @@ import { resolveServer, type ServerResolution } from './src/discovery';
 import { checkGalleryAccess, type CheckResult } from './src/gallery/check';
 import { GalleryClient } from './src/gallery/client';
 import { clearCredential, loadCredential, pair, type Credential } from './src/pairing';
+import {
+  clearCachedStats,
+  loadCachedStats,
+  saveCachedStats,
+  type CachedStats,
+} from './src/stats/cache';
+import { formatAge, formatBytes, formatCount, formatLastBackup } from './src/stats/format';
 import { DEFAULT_GATE, NO_GATE, readConditions } from './src/sync/conditions';
 import { DEFAULT_ENGINE_CONFIG, SyncEngine } from './src/sync/engine';
 import { PhotoKitMediaSource } from './src/sync/media';
@@ -61,6 +68,11 @@ export default function App() {
   const [pairError, setPairError] = useState<string | null>(null);
   const [galleryCheck, setGalleryCheck] = useState<CheckResult | null>(null);
   const [checkingGallery, setCheckingGallery] = useState(false);
+  /** Seeded from the cache so the card has numbers before the first fetch lands. */
+  const [stats, setStats] = useState<CachedStats | null>(loadCachedStats);
+  /** True when the last refresh failed and what is on screen is the cache. */
+  const [statsStale, setStatsStale] = useState(false);
+  const [loadingStats, setLoadingStats] = useState(false);
 
   // The transport reads both of these on every request, so a re-resolved address
   // or a fresh pairing takes effect without rebuilding the engine mid-run.
@@ -113,6 +125,39 @@ export default function App() {
     if (!store) return;
     void refreshQueue(store);
   }, [store, refreshQueue]);
+
+  /**
+   * Re-reads what the archive holds.
+   *
+   * A failure is deliberately not an error on screen. These numbers describe
+   * photos that are archived whether or not the phone can reach the server to
+   * ask about them, so an unreachable server marks the card stale and leaves the
+   * last known figures up rather than blanking it.
+   */
+  const refreshStats = useCallback(async () => {
+    if (!serverUrl.current || !deviceToken.current) return;
+    setLoadingStats(true);
+    try {
+      const entry = { fetchedAt: Date.now(), stats: await gallery.current.stats() };
+      setStats(entry);
+      saveCachedStats(entry);
+      setStatsStale(false);
+    } catch {
+      setStatsStale(true);
+    } finally {
+      setLoadingStats(false);
+    }
+  }, []);
+
+  // Once, as soon as there is both an address and a token. On a fresh install
+  // that is not at launch at all — the gate stays shut until a pairing succeeds,
+  // and the fetch happens then.
+  const statsFetched = useRef(false);
+  useEffect(() => {
+    if (statsFetched.current || !credential || !server?.url) return;
+    statsFetched.current = true;
+    void refreshStats();
+  }, [credential, server, refreshStats]);
 
   const findServer = useCallback(async () => {
     setResolving(true);
@@ -170,6 +215,13 @@ export default function App() {
     setCredential(null);
     deviceToken.current = null;
     setGalleryCheck(null);
+
+    // The cached figures belong to the device that was just forgotten. Left up,
+    // they would credit whatever phone pairs next with somebody else's backup.
+    clearCachedStats();
+    setStats(null);
+    setStatsStale(false);
+    statsFetched.current = false;
   }, []);
 
   /**
@@ -241,9 +293,12 @@ export default function App() {
       } finally {
         setRunning(false);
         await refreshQueue(store);
+        // The moment the archived count matters most is the moment a run ends,
+        // and it is the one moment it is guaranteed to have changed.
+        await refreshStats();
       }
     },
-    [store, credential, config.maxItems, refreshQueue, unpair]
+    [store, credential, config.maxItems, refreshQueue, refreshStats, unpair]
   );
 
   const pause = useCallback(() => {
@@ -467,7 +522,15 @@ export default function App() {
             <Text style={styles.statusText}>{progress.activity}</Text>
           </View>
 
-          <Counts counts={progress.counts} />
+          <ArchiveSummary
+            entry={stats}
+            stale={statsStale}
+            loading={loadingStats}
+            paired={Boolean(credential)}
+          />
+
+          <Text style={styles.subheading}>this run</Text>
+          <RunCounts counts={progress.counts} />
 
           <View style={styles.row}>
             <Text style={styles.label}>Newest items to consider</Text>
@@ -520,19 +583,99 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 }
 
 /**
- * Groups the five working states into the three numbers that actually answer
- * "how far along is this": still to look at, still to send, and archived.
+ * What is actually archived, as photod reports it.
+ *
+ * These numbers used to be counted from the local queue, which made them a
+ * record of what this app had done rather than of what is stored: reinstalling
+ * it, or losing the SQLite file, showed zero archived against a library that was
+ * entirely backed up. The archive is the only thing that knows what the archive
+ * holds, so it is asked.
+ *
+ * The cost is that they arrive over the network and can be missing. An
+ * unreachable server shows the last known figures marked stale rather than
+ * dashes, because the photos are archived either way and a blank card would
+ * imply otherwise.
  */
-function Counts({ counts }: { counts: StateCounts }) {
+function ArchiveSummary({
+  entry,
+  stale,
+  loading,
+  paired,
+}: {
+  entry: CachedStats | null;
+  stale: boolean;
+  loading: boolean;
+  paired: boolean;
+}) {
+  if (!paired) {
+    return <Text style={styles.muted}>Pair this phone to see what the archive holds.</Text>;
+  }
+
+  if (!entry) {
+    return (
+      <>
+        <View style={styles.counts}>
+          <Count label="archived" value="—" />
+          <Count label="stored" value="—" />
+          <Count label="last backup" value="—" />
+        </View>
+        <Text style={styles.muted}>
+          {loading ? 'asking the server…' : 'could not reach the server for these yet.'}
+        </Text>
+      </>
+    );
+  }
+
+  const { device, archive } = entry.stats;
+  const now = Date.now();
+  return (
+    <>
+      <View style={styles.counts}>
+        <Count label="archived" value={formatCount(device.archived)} tone="good" />
+        <Count label="stored" value={formatBytes(device.bytes)} />
+        <Count label="last backup" value={formatLastBackup(device.last_upload_at, now)} />
+      </View>
+      <Text style={styles.muted}>
+        {formatCount(device.photos)} photos · {formatCount(device.videos)} videos from this phone
+      </Text>
+      <Text style={styles.muted}>
+        The archive holds {formatCount(archive.assets)} items, {formatBytes(archive.bytes)}
+        {archive.pending_jobs > 0 &&
+          ` · ${formatCount(archive.pending_jobs)} thumbnails still being built`}
+      </Text>
+      {archive.failed_jobs > 0 && (
+        <Text style={styles.warning}>
+          {formatCount(archive.failed_jobs)} derivatives failed on the server. Nothing is lost —
+          the originals are archived — but those tiles will not fill in.
+        </Text>
+      )}
+      {stale && (
+        <Text style={styles.warning}>
+          as of {formatAge(entry.fetchedAt, now)} — could not reach the server to refresh.
+        </Text>
+      )}
+    </>
+  );
+}
+
+/**
+ * The queue, which is about this run and nothing else.
+ *
+ * `archived` and `total` used to be here and are the server's now. What is left
+ * is the part only the phone can know: what it has yet to look at, what it has
+ * yet to send, and what it could not.
+ */
+function RunCounts({ counts }: { counts: StateCounts }) {
   const queued = counts.pending + counts.unknown + counts.hashed;
-  const total = queued + counts.want + counts.done + counts.failed;
   return (
     <View style={styles.counts}>
-      <Count label="queued" value={queued} />
-      <Count label="to send" value={counts.want} />
-      <Count label="archived" value={counts.done} tone="good" />
-      <Count label="failed" value={counts.failed} tone={counts.failed > 0 ? 'bad' : undefined} />
-      <Count label="total" value={total} />
+      <Count label="queued" value={String(queued)} />
+      <Count label="to send" value={String(counts.want)} />
+      <Count
+        label="failed"
+        value={String(counts.failed)}
+        tone={counts.failed > 0 ? 'bad' : undefined}
+      />
     </View>
   );
 }
@@ -543,7 +686,7 @@ function Count({
   tone,
 }: {
   label: string;
-  value: number;
+  value: string;
   tone?: 'good' | 'bad';
 }) {
   const color = tone === 'good' ? styles.good : tone === 'bad' ? styles.bad : styles.countValue;
@@ -618,6 +761,16 @@ const styles = StyleSheet.create({
   counts: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 },
   count: { alignItems: 'center' },
   countValue: { color: '#eee', fontSize: 18, fontWeight: '600' },
+  subheading: {
+    color: '#666',
+    fontSize: 11,
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+    borderTopWidth: 1,
+    borderTopColor: '#2a2a2a',
+    paddingTop: 8,
+    marginTop: 4,
+  },
   countLabel: { color: '#777', fontSize: 11 },
   checkRow: { flexDirection: 'row', gap: 8, alignItems: 'flex-start' },
   checkLabel: { color: '#ddd', fontSize: 13 },

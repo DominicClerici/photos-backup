@@ -59,3 +59,34 @@ export type AssetDetail = {
  * archived file itself — the only one that is a download rather than a view.
  */
 export type MediaVariant = 'thumb' | 'preview' | 'playback' | 'original';
+
+/**
+ * What this phone has put into the archive.
+ *
+ * `bytes` is summed per local item, so a photo saved twice in the library counts
+ * twice — it matches what the phone thinks it backed up rather than the disk the
+ * archive spent, which is deduplicated and reported by ArchiveStats.
+ */
+export type DeviceStats = {
+  archived: number;
+  bytes: number;
+  photos: number;
+  videos: number;
+  /** Absent for a device that has never had anything archived. */
+  last_upload_at?: string;
+};
+
+/** The whole archive, every device included, counted once per stored original. */
+export type ArchiveStats = {
+  assets: number;
+  bytes: number;
+  photos: number;
+  videos: number;
+  pending_jobs: number;
+  failed_jobs: number;
+};
+
+export type Stats = {
+  device: DeviceStats;
+  archive: ArchiveStats;
+};

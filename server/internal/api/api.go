@@ -64,6 +64,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/uploads/{id}/commit", s.requireDevice(s.handleCommitUpload))
 	mux.HandleFunc("DELETE /v1/uploads/{id}", s.requireDevice(s.handleAbortUpload))
 
+	// A read, but not one readRoutes can carry. Every other read answers the
+	// same thing to every paired device, which is why guard drops the identity
+	// and why a device id only ever reaches the database through a
+	// deviceHandler. This one is scoped to who is asking, so it takes the
+	// authenticated path instead of widening guard to smuggle an identity
+	// through the read routes.
+	//
+	// The cost is that the plaintext listener cannot serve it, so the browser
+	// gallery cannot read these numbers. It does not show them today, and an
+	// unauthenticated archive-wide variant for it is a separate decision.
+	mux.HandleFunc("GET /v1/stats", s.requireDevice(s.handleStats))
+
 	// Reads are authenticated here and open on the plaintext listener. Which
 	// listener a request arrived on is the whole of the difference, so it is
 	// settled once, at the routing table, rather than sampled inside handlers.
@@ -97,6 +109,9 @@ func (s *Server) PlaintextHandler() http.Handler {
 		"PUT /v1/uploads/{id}",
 		"POST /v1/uploads/{id}/commit",
 		"DELETE /v1/uploads/{id}",
+		// Not a write, but it needs a device token to know whose stats to
+		// report, and a token is exactly what this listener will not accept.
+		"GET /v1/stats",
 	} {
 		mux.HandleFunc(route, refuseInsecure)
 	}
