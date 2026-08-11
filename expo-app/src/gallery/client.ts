@@ -1,5 +1,5 @@
 import { errorText, SyncError } from '../sync/types';
-import type { AssetDetail, MediaVariant, TimelineItem, TimelinePage } from './types';
+import type { AssetDetail, MediaVariant, Stats, TimelineItem, TimelinePage } from './types';
 
 /**
  * The read path answers from Postgres and the disk, so a request that has not
@@ -78,6 +78,17 @@ export class GalleryClient {
   /** Everything known about one asset, for a viewer's metadata panel. */
   asset(id: string): Promise<AssetDetail> {
     return this.getJson<AssetDetail>(`/v1/assets/${id}`);
+  }
+
+  /**
+   * How much of this phone's library is archived, and what the archive holds.
+   *
+   * The one read whose answer depends on which device asked, so photod serves it
+   * from the token rather than from the open read path — an unpaired phone gets
+   * a 401 here where it would get a timeline anywhere else.
+   */
+  stats(): Promise<Stats> {
+    return this.getJson<Stats>('/v1/stats');
   }
 
   /**
