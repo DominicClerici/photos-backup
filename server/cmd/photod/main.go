@@ -25,6 +25,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/discovery"
 	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
+	"github.com/dominicclerici/photos-backup/server/internal/livecache"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/tlsca"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
@@ -78,6 +79,15 @@ func run(log *slog.Logger) error {
 	converter.Binary = cfg.MagickBin
 	converter.PreviewConcurrency = cfg.PreviewConcurrency
 
+	// Shared with the worker pools below rather than built twice. The pools
+	// build the stored renditions and the API renders Live Photos on demand,
+	// and both are the same ffmpeg configured the same way.
+	videoTool := video.New()
+	videoTool.FFmpeg = cfg.FFmpegBin
+	videoTool.FFprobe = cfg.FFprobeBin
+	videoTool.Encoder = cfg.VideoEncoder
+	videoTool.LiveConcurrency = cfg.LivePreviewConcurrency
+
 	queue := jobs.NewQueue(store.Pool())
 	blobs := blobstore.New(root)
 	derivatives := derivstore.New(derivRoot)
@@ -87,15 +97,17 @@ func run(log *slog.Logger) error {
 	paired := devices.New(store.Pool())
 
 	srv := &api.Server{
-		Store:       store,
-		Blobs:       blobs,
-		Derivatives: derivatives,
-		Manifest:    manifest.New(filepath.Join(root, "manifest.jsonl")),
-		Converter:   converter,
-		Queue:       queue,
-		Uploads:     staging,
-		Devices:     paired,
-		Log:         log,
+		Store:        store,
+		Blobs:        blobs,
+		Derivatives:  derivatives,
+		Manifest:     manifest.New(filepath.Join(root, "manifest.jsonl")),
+		Converter:    converter,
+		Video:        videoTool,
+		LivePreviews: livecache.New(cfg.LivePreviewCacheBytes),
+		Queue:        queue,
+		Uploads:      staging,
+		Devices:      paired,
+		Log:          log,
 	}
 
 	go sweepUploads(ctx, log, staging, cfg.UploadSessionTTL)
@@ -132,11 +144,6 @@ func run(log *slog.Logger) error {
 	checkTools(log, cfg)
 
 	if !cfg.WorkerDisabled {
-		videoTool := video.New()
-		videoTool.FFmpeg = cfg.FFmpegBin
-		videoTool.FFprobe = cfg.FFprobeBin
-		videoTool.Encoder = cfg.VideoEncoder
-
 		exif := exifdata.New()
 		exif.Binary = cfg.ExiftoolBin
 

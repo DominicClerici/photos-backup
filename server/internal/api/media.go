@@ -2,6 +2,8 @@ package api
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -63,6 +65,108 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.serveDerivative(w, r, asset, derivstore.Playback, "video/mp4")
+}
+
+// handleLiveThumb serves the 256px motion rendition the grid plays on hover.
+func (s *Server) handleLiveThumb(w http.ResponseWriter, r *http.Request) {
+	video, ok := s.livePair(w, r)
+	if !ok {
+		return
+	}
+	s.serveDerivative(w, r, video, derivstore.LiveThumb, "video/mp4")
+}
+
+// handleLivePreview renders the 1080p rendition on demand and stores nothing.
+//
+// It is the photo preview's counterpart in every respect: same conditional
+// check before any work is done, same immutable caching, same reasoning about
+// why a file on disk would buy nothing. The one difference is that these bytes
+// are held in memory for a while afterwards, because a video element asks for
+// them more than once — see the livecache package.
+func (s *Server) handleLivePreview(w http.ResponseWriter, r *http.Request) {
+	video, ok := s.livePair(w, r)
+	if !ok {
+		return
+	}
+	if s.Video == nil || s.LivePreviews == nil {
+		writeError(w, http.StatusNotFound, "this server cannot render live previews")
+		return
+	}
+
+	etag := etagFor(video.SHA256, "live-preview")
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", immutable)
+	if etagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	data, err := s.LivePreviews.Get(r.Context(), video.SHA256, func(ctx context.Context) ([]byte, error) {
+		return s.renderLivePreview(ctx, video)
+	})
+	if err != nil {
+		if r.Context().Err() != nil {
+			return // client went away mid-render
+		}
+		s.logger().Error("render live preview", "error", err, "sha256", video.SHA256)
+		writeError(w, http.StatusInternalServerError, "could not render the live preview")
+		return
+	}
+
+	w.Header().Set("Content-Type", "video/mp4")
+	// ServeContent, so a player that opens with a range probe — which Safari
+	// always does — gets a 206 rather than the whole file it did not ask for.
+	http.ServeContent(w, r, video.SHA256+derivstore.LiveThumb, video.UploadedAt, bytes.NewReader(data))
+}
+
+// renderLivePreview transcodes one paired video and reads the result back.
+//
+// Through a staged file rather than a pipe, because `+faststart` rewrites the
+// header once the encode is done and needs somewhere seekable to do it. Without
+// it the whole clip would have to arrive before the first frame played, which
+// for a press-and-hold is the entire interaction.
+func (s *Server) renderLivePreview(ctx context.Context, video db.Asset) ([]byte, error) {
+	staged, cleanup, err := s.Derivatives.Stage("livepreview-*" + derivstore.LiveThumb)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	info, err := s.Video.Probe(ctx, s.Blobs.Path(video.SHA256, video.Ext))
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Video.LivePreview(ctx, s.Blobs.Path(video.SHA256, video.Ext), staged, info); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(staged)
+}
+
+// livePair resolves {id} to the Live Photo video it names.
+//
+// Either half works. The gallery holds stills and asks about those; anything
+// holding the video's own id — a link, a second request from the viewer — is
+// answered rather than told it asked the wrong question.
+func (s *Server) livePair(w http.ResponseWriter, r *http.Request) (db.Asset, bool) {
+	asset, ok := s.lookup(w, r)
+	if !ok {
+		return db.Asset{}, false
+	}
+	if asset.IsLivePair() {
+		return asset, true
+	}
+
+	video, err := s.Store.LiveVideoFor(r.Context(), asset.ID)
+	switch {
+	case errors.Is(err, db.ErrNotFound):
+		writeError(w, http.StatusNotFound, "this asset is not a Live Photo")
+		return db.Asset{}, false
+	case err != nil:
+		s.logger().Error("load paired video", "error", err, "asset", asset.ID)
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return db.Asset{}, false
+	}
+	return video, true
 }
 
 func (s *Server) serveDerivative(w http.ResponseWriter, r *http.Request, asset db.Asset, suffix, contentType string) {

@@ -20,12 +20,25 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // PlaybackMaxEdge bounds the transcode. 1080p is the point past which a home
 // gallery gains nothing visible and starts costing real disk and encode time;
 // the original is always one click away for anything more.
 const PlaybackMaxEdge = 1920
+
+// LiveThumbSize is the square a Live Photo's motion thumbnail is cropped to. It
+// matches derive.Converter's thumbnail exactly, because the two are shown in
+// the same cell and anything else makes the picture jump as one replaces the
+// other.
+const LiveThumbSize = 256
+
+// LiveThumbMaxSeconds bounds it in time. A Live Photo is about three seconds,
+// and this is here for the day something else is labelled as one: a
+// mis-declared feature film should cost a truncated hover animation, not a
+// metadata worker parked for an hour.
+const LiveThumbMaxSeconds = 6
 
 type Tool struct {
 	FFmpeg  string
@@ -37,10 +50,17 @@ type Tool struct {
 	// CRF is the x264 quality target. Ignored by hardware encoders, which is
 	// fine — they read their own rate-control flags and default sensibly.
 	CRF int
+	// LiveConcurrency caps simultaneous on-demand Live Photo renditions. Same
+	// reasoning as derive.Converter's preview cap, and a lower number, because
+	// an ffmpeg costs considerably more than an ImageMagick.
+	LiveConcurrency int
+
+	once sync.Once
+	live chan struct{}
 }
 
 func New() *Tool {
-	return &Tool{FFmpeg: "ffmpeg", FFprobe: "ffprobe", Encoder: "libx264", CRF: 22}
+	return &Tool{FFmpeg: "ffmpeg", FFprobe: "ffprobe", Encoder: "libx264", CRF: 22, LiveConcurrency: 2}
 }
 
 // Info is what ffprobe could tell us about a video's picture.
@@ -312,6 +332,125 @@ func (t *Tool) Transcode(ctx context.Context, src, dst string, info Info) error 
 	}
 	return nil
 }
+
+// LiveThumb writes a Live Photo's motion thumbnail: 256px square, silent, and
+// small enough that a grid can pull one down the instant a pointer lands on a
+// tile.
+//
+// Square-cropped rather than fitted, matching the still thumbnail's own crop,
+// because the two are shown in the same 256px cell and the video replaces the
+// image in place. A fitted video would letterbox against the tile and the
+// picture would visibly jump on hover.
+//
+// Silent because nothing can play audio here: this fires on hover, without a
+// user gesture, and every browser blocks unmuted autoplay without one. Dropping
+// the track rather than muting the element saves the bytes too.
+func (t *Tool) LiveThumb(ctx context.Context, src, dst string, info Info) error {
+	size := LiveThumbSize
+	args := []string{
+		"-nostdin", "-y", "-v", "error",
+		"-i", src,
+		"-t", strconv.Itoa(LiveThumbMaxSeconds),
+		"-an",
+		// increase-then-crop is ImageMagick's `-resize ^` and `-extent` in
+		// ffmpeg's vocabulary: fill the box, then cut the overflow away.
+		"-vf", fmt.Sprintf("scale=w=%d:h=%d:force_original_aspect_ratio=increase:flags=lanczos,crop=%d:%d",
+			size, size, size, size),
+		"-c:v", t.encoder(),
+		// Looser than the playback rendition. At 256px the difference is
+		// invisible and the file is a third of the size, which is what a grid
+		// firing these off on hover needs it to be.
+		"-crf", "30",
+		"-preset", "veryfast",
+		"-pix_fmt", "yuv420p",
+		"-movflags", "+faststart",
+		dst,
+	}
+	return t.encode(ctx, args, src, dst, "live thumbnail")
+}
+
+// LivePreview writes the rendition the viewer plays on press-and-hold: 1080p,
+// with its audio, from the same three seconds.
+//
+// Nothing calls this from the worker. It is rendered per request and never
+// stored, exactly like a photo's 2048px preview and for the same reason — one
+// viewer plays one of these at a time, the bytes are a pure function of a
+// digest, and `Cache-Control: immutable` does what a file on disk would.
+//
+// The audio is kept here and only here. A press-and-hold is a user gesture, so
+// a browser will let it make noise, which is what makes it feel like the Live
+// Photo on the phone rather than a silent loop.
+func (t *Tool) LivePreview(ctx context.Context, src, dst string, info Info) error {
+	if err := t.acquire(ctx); err != nil {
+		return err
+	}
+	defer t.release()
+
+	args := []string{"-nostdin", "-y", "-v", "error", "-i", src}
+	if w, h := info.DisplaySize(); w > PlaybackMaxEdge || h > PlaybackMaxEdge {
+		args = append(args, "-vf", fmt.Sprintf(
+			"scale=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos",
+			PlaybackMaxEdge, PlaybackMaxEdge))
+	}
+	args = append(args,
+		"-c:v", t.encoder(),
+		"-crf", strconv.Itoa(t.crf()),
+		// veryfast, where the stored rendition uses medium. This one is being
+		// waited on by somebody who has already opened the photo, and it is
+		// three seconds long: latency is worth more here than bitrate.
+		"-preset", "veryfast",
+		"-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		"-b:a", "128k",
+		"-movflags", "+faststart",
+		dst,
+	)
+	return t.encode(ctx, args, src, dst, "live preview")
+}
+
+// encode runs one ffmpeg and insists that something playable came out of it,
+// for the same reason Transcode does: an ffmpeg that exits 0 having encoded
+// nothing is a failure disguised as a success, and it surfaces later as a
+// player that shows a black rectangle.
+func (t *Tool) encode(ctx context.Context, args []string, src, dst, what string) error {
+	cmd := exec.CommandContext(ctx, t.ffmpeg(), args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	runErr := cmd.Run()
+	complaint := strings.TrimSpace(stderr.String())
+
+	if err := t.checkPlayable(ctx, dst); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("render %s of %s: %w", what, src, ctx.Err())
+		}
+		return fmt.Errorf("render %s of %s: %w (ffmpeg %s; stderr: %s)",
+			what, src, err, exitStatus(runErr), orNone(complaint))
+	}
+	if runErr != nil {
+		return fmt.Errorf("render %s of %s: %w: %s", what, src, runErr, complaint)
+	}
+	return nil
+}
+
+func (t *Tool) acquire(ctx context.Context) error {
+	t.once.Do(func() {
+		n := t.LiveConcurrency
+		if n <= 0 {
+			n = 2
+		}
+		t.live = make(chan struct{}, n)
+	})
+
+	select {
+	case t.live <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (t *Tool) release() { <-t.live }
 
 // checkPlayable asks ffprobe what a browser would find in the transcode. A
 // shape check is not enough here: a container with a correct header and a track

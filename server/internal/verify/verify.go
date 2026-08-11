@@ -279,6 +279,21 @@ func checkDerivatives(ctx context.Context, d Deps, opt Options, r *Report, a db.
 		return
 	}
 
+	// A paired video has no still thumbnail by design — the tile it appears in
+	// belongs to the photo it is paired with. Its motion rendition is checked
+	// instead.
+	if a.IsLivePair() {
+		if a.LiveState == db.DerivedReady && !d.Derivatives.Exists(a.SHA256, derivstore.LiveThumb) {
+			r.Findings = append(r.Findings, Finding{
+				Kind: DerivativeMissing, SHA256: a.SHA256,
+				Path:   d.Derivatives.Path(a.SHA256, derivstore.LiveThumb),
+				Detail: "marked ready but the Live Photo rendition is gone",
+				Fixed:  opt.Fix && requeue(ctx, d, jobs.KindMetadata, a.ID) == nil,
+			})
+		}
+		return
+	}
+
 	if a.DerivedState == db.DerivedReady && !d.Derivatives.Exists(a.SHA256, derivstore.Thumb) {
 		r.Findings = append(r.Findings, Finding{
 			Kind: DerivativeMissing, SHA256: a.SHA256,

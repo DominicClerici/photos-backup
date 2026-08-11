@@ -163,6 +163,7 @@ $DERIVATIVES_ROOT/                  the SSD; defaults to /mnt/photos/derivatives
   ab/cd/abcd1234.thumb.webp         256px square, stored
   3f/9a/3f9a77b2.thumb.webp         poster frame for video, same shape
   3f/9a/3f9a77b2.mp4                H.264 playback rendition, video only
+  7c/21/7c21ba05.live.mp4           256px square, a Live Photo's motion
 ```
 
 Originals live on the archive partition — 500GB of the 6TB drive, mounted at
@@ -173,6 +174,51 @@ The 2048px preview is **not** stored. It is rendered per request from the blob
 and cached by the browser instead, since the bytes are content-addressed and can
 never go stale. One viewer shows one preview at a time; a stored file would buy
 nothing that `Cache-Control: immutable` does not.
+
+### Live Photos
+
+A Live Photo is two files, and the phone is the only party that knows they
+belong together — the still and its ~3s video share nothing but a capture time,
+and pairing on that would marry a photo to whatever else was shot in the same
+second. So the app declares it, on the video's upload, and the server stores the
+declaration rather than trying to infer one.
+
+The declaration is separate from its resolution, because they become true at
+different moments. `live_parent_local_id` is what the phone said and is known
+the instant the bytes land; it is what makes an asset a paired video at all, so
+it decides which derivatives get built and what the timeline hides.
+`live_parent_asset_id` is the still it resolved to, and cannot be filled in
+until that still exists — the two halves share a capture time, the upload queue
+orders by capture time, and nothing decides which goes up first, so it resolves
+from whichever side arrives second.
+
+**The paired video is never an item of its own.** It is archived, verified, and
+downloadable like everything else; it simply is not a thing anyone took a
+picture of, so the timeline shows the still and carries the motion as one extra
+field on it. That is also why it is filtered on the declaration rather than the
+resolution: a video whose still has not arrived yet is still not a photograph.
+
+What it gets built is deliberately lopsided against what an ordinary video gets:
+
+| | ordinary video | Live Photo's video |
+|---|---|---|
+| poster `.thumb.webp` | yes | **no** — the tile belongs to the still |
+| stored H.264 `.mp4` | yes, via the transcode queue | **no** |
+| `.live.mp4`, 256px square | no | yes, in the metadata job |
+| 1080p with audio | n/a | rendered per request, stored nowhere |
+
+Roughly a third of an iPhone library is a Live Photo. Putting each of those
+three seconds through the transcode queue would swamp the videos that genuinely
+need it, for a rendition only ever played while a mouse button is held down —
+so the viewer's copy is rendered on demand, the same trade §5 already makes for
+the 2048px photo preview. The 256px one *is* stored, because the grid asks for
+it on hover and an ffmpeg per hover is not a thing that can be allowed.
+
+The one place this differs from the photo preview: those renditions are kept in
+memory briefly after rendering. A `<video>` asks for its bytes more than once —
+Safari opens with a range probe before requesting the file properly — and
+without it the same three seconds would go through ffmpeg two or three times for
+a single press-and-hold.
 
 `manifest.jsonl` records one line per stored blob: hash, original filename,
 capture time, source device, byte size. It is the disaster-recovery path when the
@@ -418,6 +464,36 @@ Shipped in the app as a proof of connection rather than a gallery: `GalleryClien
 and an access check that reads the timeline, fetches a thumbnail, and confirms the
 same read is refused without the token. The dashboard grows in the browser first
 and gets ported onto this.
+
+### Phase 7 — Live Photos
+
+The gallery was showing every Live Photo twice: once as the photograph, once as
+a silent three-second clip filed beside it. §5 has the design that fixed it and
+the reasoning behind each half; what the phase settled that was not obvious
+going in:
+
+**The pairing had to be declared, and the app already knew it.** Since Phase 2
+the sync engine has enumerated a Live Photo as two queue items and given the
+paired video a local id of `<still>#live`. The server had no idea, because
+nothing ever told it — the id is opaque to it by design, and reading meaning
+into that suffix would have made a client-side naming convention into a wire
+format. One header closed the gap and nothing else moved.
+
+**Neither half can be assumed to arrive first.** Both carry the same capture
+time, the queue orders by capture time, and an interrupted run can deliver them
+minutes apart. The link resolves from whichever side lands second, which is two
+statements in the same transaction as the insert and removes the entire class of
+bug where a backfill's ordering decides whether the gallery looks right.
+
+**Hiding a paired video is not the same risk as hiding a failed derivative.**
+Phase 3 established that an asset is never invisible: a tile is drawn for
+pending, ready and failed alike, because a photo that is archived but unreachable
+is worse than an ugly one. That rule is about failures. A paired video is hidden
+while everything about it is working perfectly, and it is hidden because it is
+not a photograph — the archive still holds it, verifies it, and serves the
+original. The one case it costs something is a still that never uploads, whose
+video is then hidden with nothing to hang it on. Deliberate: three seconds of
+soundless video is not what anyone lost.
 
 ### v2
 

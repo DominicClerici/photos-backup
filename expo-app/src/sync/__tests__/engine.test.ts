@@ -390,3 +390,22 @@ test('a live photo pair is queued and uploaded as two separate items', async () 
   ]);
   expect(h.engine.counts.done).toBe(2);
 });
+
+// The server cannot work the pairing out on its own — the two files share
+// nothing but a capture time. Without this declaration it archives the clip as
+// an item of its own and the gallery draws the same moment twice.
+test('a paired video declares which still it belongs to', async () => {
+  const h = build({
+    transport: new FakeTransport(twoRound('want')),
+    media: new FakeMedia([
+      asset('still'),
+      asset('still#live', { kind: 'live_video', parentLocalId: 'still', filename: 'IMG.MOV' }),
+    ]),
+  });
+
+  await h.engine.run();
+
+  const byLocalId = new Map(h.transport.uploads.map((upload) => [upload.localId, upload]));
+  expect(byLocalId.get('still#live')?.liveParentLocalId).toBe('still');
+  expect(byLocalId.get('still')?.liveParentLocalId).toBeFalsy();
+});

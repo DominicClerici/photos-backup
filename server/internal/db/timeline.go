@@ -25,7 +25,30 @@ type TimelineItem struct {
 	State           string   `json:"state"`
 	PlaybackState   string   `json:"playback_state,omitempty"`
 	DurationSeconds *float64 `json:"duration,omitempty"`
+	// LiveState is the state of this still's paired video, for the half of an
+	// iPhone library that is Live Photos. Omitted when there is no motion, so
+	// the field's presence is the whole answer the grid needs.
+	LiveState string `json:"live,omitempty"`
 }
+
+// visibleAssets is the timeline's view of the library: everything except the
+// paired videos, which are shown as their still's motion rather than as items
+// of their own.
+//
+// It filters on the declaration, not on the resolution. A video whose still has
+// not arrived yet is still a Live Photo's video and still not a thing anyone
+// took, so hiding it does not wait on the pairing being complete.
+const visibleAssets = `live_parent_local_id = ''`
+
+// liveJoin attaches a still's motion state. Lateral with a limit rather than a
+// plain join: the same still can be reached by two devices' copies of the same
+// paired video, and a plain join would draw that photo twice.
+const liveJoin = `
+	left join lateral (
+		select v.live_state from assets v
+		where v.live_parent_asset_id = a.id
+		order by v.uploaded_at, v.id limit 1
+	) live on true`
 
 // TimelinePage is one page of the timeline. NextCursor is empty at the end.
 type TimelinePage struct {
@@ -93,12 +116,14 @@ func (s *Store) Timeline(ctx context.Context, after *Cursor, limit int) (Timelin
 
 	// One extra row tells us whether another page exists without a second query.
 	rows, err := s.pool.Query(ctx, `
-		select id::text, media_kind, sort_time, exif_offset_minutes,
-		       derived_state, playback_state, duration_seconds
-		from assets
-		where $1::timestamptz is null
-		   or (sort_time, id) < ($1::timestamptz, $2::uuid)
-		order by sort_time desc, id desc
+		select a.id::text, a.media_kind, a.sort_time, a.exif_offset_minutes,
+		       a.derived_state, a.playback_state, a.duration_seconds,
+		       coalesce(live.live_state, 'none')
+		from assets a`+liveJoin+`
+		where `+visibleAssets+`
+		  and ($1::timestamptz is null
+		       or (a.sort_time, a.id) < ($1::timestamptz, $2::uuid))
+		order by a.sort_time desc, a.id desc
 		limit $3`, cursorTime, cursorID, limit+1)
 	if err != nil {
 		return TimelinePage{}, fmt.Errorf("query timeline: %w", err)
@@ -111,10 +136,11 @@ func (s *Store) Timeline(ctx context.Context, after *Cursor, limit int) (Timelin
 		var it TimelineItem
 		var sortTime time.Time
 		if err := rows.Scan(&it.ID, &it.MediaKind, &sortTime, &it.OffsetMinutes,
-			&it.State, &it.PlaybackState, &it.DurationSeconds); err != nil {
+			&it.State, &it.PlaybackState, &it.DurationSeconds, &it.LiveState); err != nil {
 			return TimelinePage{}, fmt.Errorf("scan timeline item: %w", err)
 		}
 		it.TakenAt = sortTime
+		it.hideEmptyLiveState()
 		page.Items = append(page.Items, it)
 		last = Cursor{SortTime: sortTime, ID: it.ID}
 	}
@@ -140,10 +166,11 @@ func (s *Store) TimelineStates(ctx context.Context, ids []string) (map[string]Ti
 	}
 
 	rows, err := s.pool.Query(ctx, `
-		select id::text, media_kind, sort_time, exif_offset_minutes,
-		       derived_state, playback_state, duration_seconds
-		from assets
-		where id = any($1::uuid[])`, ids)
+		select a.id::text, a.media_kind, a.sort_time, a.exif_offset_minutes,
+		       a.derived_state, a.playback_state, a.duration_seconds,
+		       coalesce(live.live_state, 'none')
+		from assets a`+liveJoin+`
+		where a.id = any($1::uuid[])`, ids)
 	if err != nil {
 		return nil, fmt.Errorf("query asset states: %w", err)
 	}
@@ -153,11 +180,20 @@ func (s *Store) TimelineStates(ctx context.Context, ids []string) (map[string]Ti
 		var it TimelineItem
 		var sortTime time.Time
 		if err := rows.Scan(&it.ID, &it.MediaKind, &sortTime, &it.OffsetMinutes,
-			&it.State, &it.PlaybackState, &it.DurationSeconds); err != nil {
+			&it.State, &it.PlaybackState, &it.DurationSeconds, &it.LiveState); err != nil {
 			return nil, fmt.Errorf("scan asset state: %w", err)
 		}
 		it.TakenAt = sortTime
+		it.hideEmptyLiveState()
 		states[it.ID] = it
 	}
 	return states, rows.Err()
+}
+
+// hideEmptyLiveState drops the sentinel so a still with no motion sends no
+// field at all rather than a string saying so, across every item in the page.
+func (t *TimelineItem) hideEmptyLiveState() {
+	if t.LiveState == PlaybackNone {
+		t.LiveState = ""
+	}
 }

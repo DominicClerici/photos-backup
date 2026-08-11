@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   fetchAsset,
+  livePreviewUrl,
   originalUrl,
   playbackUrl,
   previewUrl,
@@ -29,6 +30,14 @@ const NAV_BUTTON =
 
 const MEDIA =
   "max-h-full max-w-full object-contain transition-opacity duration-[120ms] ease-out";
+
+/**
+ * How long a press has to be held before a Live Photo starts.
+ *
+ * Short enough to feel like a direct response, long enough that a click meant
+ * to close the viewer or step to the next photo never trips it.
+ */
+const HOLD_MS = 150;
 
 /** Sidebar on a wide screen, bottom sheet under 700px. */
 const PANEL =
@@ -211,15 +220,12 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
               {!loaded ? (
                 <span className="absolute size-[26px] animate-spin rounded-full border-2 border-border border-t-muted-foreground [animation-duration:700ms]" />
               ) : null}
-              {/* The preview renders straight from the blob, so it works even
-                  while the thumbnail job is still queued. */}
-              <img
+              <PhotoStage
                 key={item.id}
-                className={MEDIA}
-                src={previewUrl(item.id)}
+                item={item}
                 alt={detail?.filename ?? ""}
+                loaded={loaded}
                 onLoad={() => setLoaded(true)}
-                style={{ opacity: loaded ? 1 : 0 }}
               />
             </>
           )}
@@ -242,6 +248,128 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
 
       {panelOpen ? <MetadataPanel detail={detail} /> : null}
     </div>
+  );
+}
+
+/**
+ * The photo, and — when it is a Live Photo — the three seconds behind it.
+ *
+ * The 1080p rendition is rendered by the server per request, so it is asked for
+ * the moment the viewer opens rather than when the press begins: the photo is
+ * on screen immediately either way, and by the time anyone has decided to hold
+ * down on it, ffmpeg has long since finished.
+ */
+function PhotoStage({
+  item,
+  alt,
+  loaded,
+  onLoad,
+}: {
+  item: TimelineItem;
+  alt: string;
+  loaded: boolean;
+  onLoad: () => void;
+}) {
+  const video = useRef<HTMLVideoElement>(null);
+  const timer = useRef(0);
+  const [playing, setPlaying] = useState(false);
+  const live = item.live === "ready";
+
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+
+  const stop = useCallback(() => {
+    window.clearTimeout(timer.current);
+    setPlaying(false);
+    const el = video.current;
+    if (el) {
+      el.pause();
+      el.currentTime = 0;
+    }
+  }, []);
+
+  const press = (e: React.PointerEvent) => {
+    if (!live || e.button !== 0) return;
+    // Claims the pointer, so releasing anywhere on the page still ends the
+    // press — including the drag that a hold on a photo naturally becomes.
+    e.currentTarget.setPointerCapture(e.pointerId);
+    // Suppresses the image drag and iOS's press-and-hold callout, both of which
+    // fire on exactly this gesture.
+    e.preventDefault();
+
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(async () => {
+      const el = video.current;
+      if (!el) return;
+      el.currentTime = 0;
+      setPlaying(true);
+      try {
+        await el.play();
+      } catch {
+        // A press is a user gesture, so sound is allowed — but a browser that
+        // disagrees should cost the audio, not the animation.
+        el.muted = true;
+        await el.play().catch(() => setPlaying(false));
+      }
+    }, HOLD_MS);
+  };
+
+  return (
+    <span
+      className="contents"
+      onPointerDown={press}
+      onPointerUp={stop}
+      onPointerCancel={stop}
+    >
+      {/* The preview renders straight from the blob, so it works even while the
+          thumbnail job is still queued. */}
+      <img
+        className={MEDIA}
+        src={previewUrl(item.id)}
+        alt={alt}
+        draggable={false}
+        onLoad={onLoad}
+        style={{ opacity: loaded && !playing ? 1 : 0 }}
+      />
+
+      {live ? (
+        <>
+          <video
+            ref={video}
+            className={cn(MEDIA, "absolute")}
+            style={{ opacity: playing ? 1 : 0 }}
+            src={livePreviewUrl(item.id)}
+            preload="auto"
+            playsInline
+            onEnded={stop}
+            onError={stop}
+          />
+          {!playing ? (
+            <span className="pointer-events-none absolute top-3 left-3 flex items-center gap-1.5 rounded-full bg-card/70 px-2.5 py-1 text-[11px] font-medium tracking-[0.06em] text-muted-foreground uppercase backdrop-blur-[6px]">
+              <LiveGlyph />
+              Hold to play
+            </span>
+          ) : null}
+        </>
+      ) : null}
+    </span>
+  );
+}
+
+function LiveGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+      <circle cx="12" cy="12" r="3.1" fill="currentColor" />
+      <circle cx="12" cy="12" r="6.2" fill="none" stroke="currentColor" strokeWidth="1.5" />
+      <circle
+        cx="12"
+        cy="12"
+        r="9.3"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeDasharray="2.4 2.6"
+      />
+    </svg>
   );
 }
 

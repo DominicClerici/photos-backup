@@ -27,8 +27,10 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/devices"
 	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
+	"github.com/dominicclerici/photos-backup/server/internal/livecache"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
+	"github.com/dominicclerici/photos-backup/server/internal/video"
 )
 
 const (
@@ -96,11 +98,16 @@ func newHarness(t *testing.T) *harness {
 		Derivatives: derivstore.New(derivRoot),
 		Manifest:    manifest.New(manifestPath),
 		Converter:   derive.New(),
-		Queue:       jobs.NewQueue(store.Pool()),
-		Uploads:     uploads.New(filepath.Join(root, "incoming")),
-		Devices:     h.devices,
-		Nudge:       func() { h.nudges.Add(1) },
-		Log:         slog.New(slog.DiscardHandler),
+		// Real ffmpeg, like the real ImageMagick above it: the live preview
+		// endpoint's whole job is to drive one, and a stub would only prove the
+		// stub works.
+		Video:        video.New(),
+		LivePreviews: livecache.New(livecache.DefaultMaxBytes),
+		Queue:        jobs.NewQueue(store.Pool()),
+		Uploads:      uploads.New(filepath.Join(root, "incoming")),
+		Devices:      h.devices,
+		Nudge:        func() { h.nudges.Add(1) },
+		Log:          slog.New(slog.DiscardHandler),
 	}
 
 	ts := httptest.NewServer(h.srv.Handler())

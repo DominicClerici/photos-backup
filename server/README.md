@@ -28,6 +28,8 @@ proxies `/api/*` here; see its README to bring the browser side up.
 | `WORKER_CONCURRENCY` | `4` | metadata + thumbnail workers |
 | `TRANSCODE_CONCURRENCY` | `1` | video transcode workers |
 | `PREVIEW_CONCURRENCY` | `4` | simultaneous on-demand preview conversions |
+| `LIVE_PREVIEW_CONCURRENCY` | `2` | simultaneous on-demand Live Photo renditions |
+| `LIVE_PREVIEW_CACHE_MB` | `64` | memory those renditions are held in between requests |
 | `WORKER_DISABLED` | unset | run as a pure API server; nothing drains the queue |
 | `VIDEO_ENCODER` | `libx264` | ffmpeg encoder for playback renditions |
 | `MAGICK_BIN` / `FFMPEG_BIN` / `FFPROBE_BIN` / `EXIFTOOL_BIN` | on `PATH` | binary overrides |
@@ -279,7 +281,7 @@ Two jobs per asset, in two separately sized pools:
 
 | kind | does | pool |
 |---|---|---|
-| `metadata` | exiftool, the 256px thumbnail, a poster frame for video | `WORKER_CONCURRENCY` |
+| `metadata` | exiftool, the 256px thumbnail, a poster frame for video, a Live Photo's 256px motion | `WORKER_CONCURRENCY` |
 | `playback` | H.264/AAC MP4 capped at 1080p, `+faststart` | `TRANSCODE_CONCURRENCY` |
 
 The pools are split so a handful of 4K transcodes cannot claim every slot and
@@ -289,6 +291,14 @@ gallery doing nothing at all.
 Stored on disk: `<sha>.thumb.webp`, and `<sha>.mp4` for video. The 2048px
 preview is rendered per request and never stored; the browser's cache does the
 caching a derivative file would.
+
+A Live Photo's paired video is the exception to both rows. It queues no
+transcode and gets no poster — the tile it appears in belongs to the still it is
+paired with — and stores one rendition, `<sha>.live.mp4`, 256px square and
+silent, which the grid plays on hover. The 1080p version the viewer plays on
+press-and-hold is rendered per request like a photo preview, and held in memory
+afterwards because a `<video>` asks for its bytes more than once. See PROJECT.md
+§5 for why the split falls this way.
 
 Thumbnails are square center crops. The grid is fixed square cells, so a square
 thumbnail is never downscaled by the browser and the timeline can compute its

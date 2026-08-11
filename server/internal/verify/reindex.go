@@ -132,6 +132,8 @@ func assetFromEntry(d Deps, e manifest.Entry) (db.Asset, bool, error) {
 		ModifiedAt:       e.ModifiedAt,
 		DeviceID:         e.DeviceID,
 		LocalID:          e.LocalID,
+
+		LiveParentLocalID: e.LiveParentLocalID,
 	}, true, nil
 }
 

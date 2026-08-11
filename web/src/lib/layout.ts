@@ -1,21 +1,37 @@
 // The timeline's geometry, kept pure so it can be tested without a DOM.
 //
-// The grid is virtualized against a row model rather than against the item list.
-// A row is either a date heading or one line of tiles, every row's height is
-// known before anything renders, and so the total scroll height is exact from
-// the first frame — the scrollbar never jumps as content loads, and any scroll
-// position resolves to a row with two binary searches.
+// The grid is virtualized against the flat item list rather than against a row
+// model, because zoom has to blend two row shapes at once. At any moment the
+// grid is a mix of the layout at one zoom level and the layout at the next, and
+// every tile's position is a plain lerp between where it sits in each. Levels
+// disagree about how many columns there are, so an item's row and column change
+// under it — interpolating the *result* rather than the inputs is what keeps
+// tiles sliding to their new places instead of jumping there.
+//
+// Each level is stored as one number per day (where that day's heading starts),
+// which makes any tile's position a couple of multiply-adds and keeps the total
+// scroll height exact from the first frame: the scrollbar never jumps as pages
+// load, and any scroll position resolves to an item with a binary search.
 
 import type { TimelineItem } from "./api";
 
 export const DEFAULT_GAP = 4;
 export const DEFAULT_HEADER_HEIGHT = 52;
+
 /**
- * Tiles aim for this width and stretch to divide the container evenly. Stored
- * thumbnails are 256px square, so a cell much past ~170 CSS px starts to look
- * soft on a 2x display.
+ * The cell sizes the grid settles on, smallest first, in CSS pixels.
+ *
+ * A level is a ceiling rather than an exact size: cells still shrink below it so
+ * that a row divides the container evenly, the same way the grid has always
+ * responded to window width. Stored thumbnails are 256px square, so the two
+ * largest levels draw them upscaled until the pipeline grows a bigger
+ * derivative — the same trade in reverse as the 96px thumbnail planned for the
+ * two smallest.
  */
-export const DEFAULT_TARGET_CELL = 160;
+export const ZOOM_LEVELS = [64, 96, 160, 256, 384, 512];
+export const MAX_ZOOM = ZOOM_LEVELS.length - 1;
+/** 160px — the nearest level to what the grid used before zoom existed. */
+export const DEFAULT_ZOOM = 2;
 
 export interface GridMetrics {
   columns: number;
@@ -24,61 +40,68 @@ export interface GridMetrics {
   headerHeight: number;
 }
 
-export type Row =
-  | {
-      kind: "header";
-      key: string;
-      label: string;
-      count: number;
-      top: number;
-      height: number;
-    }
-  | {
-      kind: "tiles";
-      key: string;
-      items: TimelineItem[];
-      top: number;
-      height: number;
-    };
-
-/** A day's full extent, used to float the current date over the grid. */
-export interface Section {
+/** A run of consecutive items sharing a calendar day, as indices into the list. */
+export interface Day {
   key: string;
   label: string;
-  top: number;
-  bottom: number;
+  start: number;
+  count: number;
 }
 
-export interface RowModel {
-  rows: Row[];
-  sections: Section[];
+export interface LevelLayout {
+  metrics: GridMetrics;
+  /** `tops[d]` is where day `d`'s heading starts; the extra last entry is the full height. */
+  tops: number[];
+}
+
+/** The grid frozen at one continuous zoom position, between two levels. */
+export interface Frame {
+  a: LevelLayout;
+  b: LevelLayout;
+  /** How far from `a` to `b`, 0–1. */
+  f: number;
+  cellSize: number;
+  gap: number;
+  headerHeight: number;
   totalHeight: number;
 }
 
-export interface VisibleRange {
+export interface Rect {
+  x: number;
+  y: number;
+  size: number;
+}
+
+export interface ItemRange {
   /** Inclusive. */
   start: number;
   /** Exclusive. */
   end: number;
 }
 
+// Exact at both ends, so a settled grid draws tiles at precisely their cell size
+// rather than a rounding error away from it — the difference between `scale(1)`,
+// which costs nothing, and `scale(0.9999999)`, which resamples every thumbnail.
+function lerp(a: number, b: number, t: number): number {
+  return t === 0 ? a : t === 1 ? b : a + (b - a) * t;
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
 export function metricsFor(
   width: number,
-  opts: {
-    gap?: number;
-    headerHeight?: number;
-    targetCell?: number;
-  } = {},
+  maxCell: number = ZOOM_LEVELS[DEFAULT_ZOOM],
+  opts: { gap?: number; headerHeight?: number } = {},
 ): GridMetrics {
   const gap = opts.gap ?? DEFAULT_GAP;
   const headerHeight = opts.headerHeight ?? DEFAULT_HEADER_HEIGHT;
-  const target = opts.targetCell ?? DEFAULT_TARGET_CELL;
 
   const usable = Math.max(width, 1);
-  // Rounding rather than flooring: flooring always errs toward fewer, larger
-  // cells, which on a wide window pushes tiles well past the size the stored
-  // thumbnail can fill sharply.
-  const columns = Math.max(1, Math.round((usable + gap) / (target + gap)));
+  // Ceiling, so `maxCell` is a promise: one column fewer would push cells past
+  // the size their stored thumbnail can fill sharply.
+  const columns = Math.max(1, Math.ceil((usable + gap) / (maxCell + gap)));
   const cellSize = (usable - gap * (columns - 1)) / columns;
   return { columns, cellSize, gap, headerHeight };
 }
@@ -104,7 +127,7 @@ function pad(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-// buildRows runs again on every page append, so without this a full scroll
+// buildDays runs again on every page append, so without this a full scroll
 // through a large library re-parses every timestamp it has already seen —
 // quadratic work for a list that only ever grows at the end. Item objects are
 // stable across rebuilds, so keying on identity hits nearly always.
@@ -134,130 +157,208 @@ export function dayLabelOf(dayKey: string, now: Date = new Date()): string {
 }
 
 /**
- * Turns a flat, already-sorted item list into positioned rows.
+ * Splits an already-sorted item list into days.
  *
  * Items must arrive newest-first, which is the order the timeline endpoint
  * returns. Days are detected by scanning for a change in day key rather than by
- * bucketing into a map, so paging in more items only ever appends.
+ * bucketing into a map, so paging in more items only ever appends — and an
+ * item's day index and its offset inside that day never change once assigned,
+ * which is what lets the render loop cache them on the DOM.
  */
-export function buildRows(items: TimelineItem[], m: GridMetrics): RowModel {
-  const rows: Row[] = [];
-  const sections: Section[] = [];
-  const rowHeight = m.cellSize + m.gap;
-
-  let top = 0;
-  let index = 0;
-
-  while (index < items.length) {
-    const key = cachedDayKey(items[index]);
-
-    let end = index;
-    while (end < items.length && cachedDayKey(items[end]) === key) {
-      end++;
-    }
-
-    const dayItems = items.slice(index, end);
-    const sectionTop = top;
-
-    rows.push({
-      kind: "header",
-      key: `h:${key}`,
-      label: dayLabelOf(key),
-      count: dayItems.length,
-      top,
-      height: m.headerHeight,
-    });
-    top += m.headerHeight;
-
-    for (let i = 0; i < dayItems.length; i += m.columns) {
-      rows.push({
-        kind: "tiles",
-        key: `r:${key}:${i}`,
-        items: dayItems.slice(i, i + m.columns),
-        top,
-        height: rowHeight,
-      });
-      top += rowHeight;
-    }
-
-    sections.push({ key, label: dayLabelOf(key), top: sectionTop, bottom: top });
-    index = end;
+export function buildDays(items: TimelineItem[]): Day[] {
+  const days: Day[] = [];
+  let i = 0;
+  while (i < items.length) {
+    const key = cachedDayKey(items[i]);
+    let end = i;
+    while (end < items.length && cachedDayKey(items[end]) === key) end++;
+    days.push({ key, label: dayLabelOf(key), start: i, count: end - i });
+    i = end;
   }
+  return days;
+}
 
-  return { rows, sections, totalHeight: top };
+/** Stacks the days into one column of headings and tile rows at a fixed cell size. */
+export function layoutLevel(days: Day[], metrics: GridMetrics): LevelLayout {
+  const tops = new Array<number>(days.length + 1);
+  const rowHeight = metrics.cellSize + metrics.gap;
+
+  let y = 0;
+  for (let d = 0; d < days.length; d++) {
+    tops[d] = y;
+    y += metrics.headerHeight + Math.ceil(days[d].count / metrics.columns) * rowHeight;
+  }
+  tops[days.length] = y;
+
+  return { metrics, tops };
 }
 
 /**
- * The slice of rows worth rendering for a scroll position.
+ * The grid at a continuous zoom position, where integers are the settled levels.
  *
- * Overscan is in pixels rather than rows because rows are two different heights;
- * a fixed row count would overscan unevenly depending on where the headings land.
+ * Positions are continuous across a level boundary — blending a→b at f=1 and
+ * b→c at f=0 both describe exactly layout b — so an animation can cross as many
+ * levels as it likes without a seam.
  */
-export function visibleRange(
-  rows: Row[],
-  scrollTop: number,
-  viewportHeight: number,
-  overscanPx = 0,
-): VisibleRange {
-  if (rows.length === 0) return { start: 0, end: 0 };
+export function frameAt(levels: LevelLayout[], z: number): Frame {
+  const at = clamp(z, 0, levels.length - 1);
+  const i = Math.min(Math.floor(at), levels.length - 2);
+  const a = levels[i];
+  const b = levels[i + 1];
+  const f = at - i;
+  const last = a.tops.length - 1;
 
-  const top = scrollTop - overscanPx;
-  const bottom = scrollTop + viewportHeight + overscanPx;
-
-  const start = lowerBound(rows, top);
-  const end = upperBound(rows, bottom);
-  return { start, end: Math.max(end, start) };
+  return {
+    a,
+    b,
+    f,
+    cellSize: lerp(a.metrics.cellSize, b.metrics.cellSize, f),
+    gap: lerp(a.metrics.gap, b.metrics.gap, f),
+    headerHeight: lerp(a.metrics.headerHeight, b.metrics.headerHeight, f),
+    totalHeight: lerp(a.tops[last], b.tops[last], f),
+  };
 }
 
-/** First row whose bottom edge is past `y`. */
-function lowerBound(rows: Row[], y: number): number {
-  let lo = 0;
-  let hi = rows.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (rows[mid].top + rows[mid].height > y) hi = mid;
-    else lo = mid + 1;
-  }
-  return lo;
+function placeIn(layout: LevelLayout, day: number, offset: number): Rect {
+  const m = layout.metrics;
+  const step = m.cellSize + m.gap;
+  const row = Math.floor(offset / m.columns);
+  const col = offset - row * m.columns;
+  return {
+    x: col * step,
+    y: layout.tops[day] + m.headerHeight + row * step,
+    size: m.cellSize,
+  };
 }
 
-/** One past the last row that begins before `y`. */
-function upperBound(rows: Row[], y: number): number {
-  let lo = 0;
-  let hi = rows.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (rows[mid].top < y) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
+/** Where one tile sits, given its day and its position inside that day. */
+export function tileRect(frame: Frame, day: number, offset: number): Rect {
+  const a = placeIn(frame.a, day, offset);
+  const b = placeIn(frame.b, day, offset);
+  return {
+    x: lerp(a.x, b.x, frame.f),
+    y: lerp(a.y, b.y, frame.f),
+    size: lerp(a.size, b.size, frame.f),
+  };
 }
 
-/** The day heading that belongs pinned at the top for a scroll position. */
-export function sectionAt(sections: Section[], scrollTop: number): Section | null {
-  if (sections.length === 0) return null;
+export function headerY(frame: Frame, day: number): number {
+  return lerp(frame.a.tops[day], frame.b.tops[day], frame.f);
+}
 
+/** The day an item belongs to. */
+export function dayIndexOf(days: Day[], index: number): number {
   let lo = 0;
-  let hi = sections.length - 1;
+  let hi = days.length - 1;
   let found = 0;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    if (sections[mid].top <= scrollTop) {
+    if (days[mid].start <= index) {
       found = mid;
       lo = mid + 1;
     } else {
       hi = mid - 1;
     }
   }
-  return sections[found];
+  return found;
 }
 
-/** Every item currently rendered, which is what the state poller watches. */
-export function itemsInRange(rows: Row[], range: VisibleRange): TimelineItem[] {
-  const out: TimelineItem[] = [];
-  for (let i = range.start; i < range.end && i < rows.length; i++) {
-    const row = rows[i];
-    if (row.kind === "tiles") out.push(...row.items);
+export function itemTop(days: Day[], frame: Frame, index: number): number {
+  const d = dayIndexOf(days, index);
+  return tileRect(frame, d, index - days[d].start).y;
+}
+
+/**
+ * The items worth rendering for a scroll position.
+ *
+ * Tile tops only ever increase with index, in both bracketing layouts and so in
+ * the blend of them, which is what makes the two binary searches valid at any
+ * point in a transition. Overscan is in pixels because a "row" is a different
+ * height at every zoom level.
+ */
+export function visibleItems(
+  days: Day[],
+  count: number,
+  frame: Frame,
+  scrollTop: number,
+  viewportHeight: number,
+  overscanPx = 0,
+): ItemRange {
+  if (count === 0 || days.length === 0) return { start: 0, end: 0 };
+
+  const top = scrollTop - overscanPx;
+  const bottom = scrollTop + viewportHeight + overscanPx;
+
+  let lo = 0;
+  let hi = count;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (itemTop(days, frame, mid) + frame.cellSize > top) hi = mid;
+    else lo = mid + 1;
   }
-  return out;
+  const start = lo;
+
+  hi = count;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (itemTop(days, frame, mid) < bottom) lo = mid + 1;
+    else hi = mid;
+  }
+  return { start, end: Math.max(lo, start) };
+}
+
+/**
+ * The item under a point in grid coordinates, used to pin a spot while zooming.
+ *
+ * The column matters even though only the vertical axis scrolls: two tiles in
+ * the same row at one zoom level land in different rows at the next, so which
+ * one the pointer is over decides what stays put.
+ */
+export function itemAtPoint(
+  days: Day[],
+  count: number,
+  frame: Frame,
+  x: number,
+  y: number,
+): number {
+  if (count === 0 || days.length === 0) return 0;
+
+  // Items sharing a row share a top, so the first item whose bottom edge is
+  // past `y` is the leftmost tile of the row the point falls in.
+  let lo = 0;
+  let hi = count;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (itemTop(days, frame, mid) + frame.cellSize > y) hi = mid;
+    else lo = mid + 1;
+  }
+  const first = Math.min(lo, count - 1);
+
+  const day = days[dayIndexOf(days, first)];
+  const columns = frame.f < 0.5 ? frame.a.metrics.columns : frame.b.metrics.columns;
+  const col = clamp(Math.floor(x / (frame.cellSize + frame.gap)), 0, columns - 1);
+  return Math.min(first + col, day.start + day.count - 1);
+}
+
+/** The day heading that belongs pinned at the top for a scroll position. */
+export function dayAt(
+  days: Day[],
+  frame: Frame,
+  scrollTop: number,
+): { label: string; top: number } | null {
+  if (days.length === 0) return null;
+
+  let lo = 0;
+  let hi = days.length - 1;
+  let found = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (headerY(frame, mid) <= scrollTop) {
+      found = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return { label: days[found].label, top: headerY(frame, found) };
 }

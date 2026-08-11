@@ -46,6 +46,20 @@ func (s *Store) SetDerivedState(ctx context.Context, assetID, state string) erro
 	return nil
 }
 
+// SetLiveState records progress on a paired video's 256px motion rendition,
+// which the grid reads to decide whether a still can be hovered to life.
+//
+// It refuses to promote an asset that is not half of a Live Photo, so a
+// mis-queued job cannot make an ordinary video claim motion it does not have.
+func (s *Store) SetLiveState(ctx context.Context, assetID, state string) error {
+	if _, err := s.pool.Exec(ctx,
+		`update assets set live_state = $2
+		 where id = $1::uuid and live_parent_local_id <> ''`, assetID, state); err != nil {
+		return fmt.Errorf("set live state of %s: %w", assetID, err)
+	}
+	return nil
+}
+
 // SetPlaybackState records progress on the video transcode, which the viewer
 // reads to decide between showing a player and showing "still converting".
 func (s *Store) SetPlaybackState(ctx context.Context, assetID, state string) error {

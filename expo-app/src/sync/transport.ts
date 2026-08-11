@@ -141,6 +141,9 @@ export class HttpTransport implements Transport {
     if (capturedAt) headers['x-photo-captured-at'] = capturedAt;
     const modifiedAt = toIso(request.modifiedAt);
     if (modifiedAt) headers['x-photo-modified-at'] = modifiedAt;
+    if (request.liveParentLocalId) {
+      headers['x-photo-live-parent-local-id'] = request.liveParentLocalId;
+    }
 
     let response: { status: number; body: string };
     try {
@@ -261,6 +264,7 @@ export class HttpTransport implements Transport {
       size: request.size,
       capturedAt: toIso(request.createdAt),
       modifiedAt: toIso(request.modifiedAt),
+      liveParentLocalId: request.liveParentLocalId ?? undefined,
     });
 
     if (!response.ok) {

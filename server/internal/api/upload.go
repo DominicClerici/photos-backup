@@ -94,7 +94,11 @@ func (s *Server) finishUpload(
 			ModifiedAt:  meta.modifiedAt,
 			DeviceID:    meta.deviceID,
 			LocalID:     meta.localID,
-			StoredAt:    time.Now().UTC(),
+			// Recorded here so a database rebuilt from this log alone still
+			// knows which blobs are halves of a Live Photo. Without it a
+			// reindex would put every paired video back in the timeline.
+			LiveParentLocalID: meta.liveParentLocalID,
+			StoredAt:          time.Now().UTC(),
 		}
 		if err := s.Manifest.Append(entry); err != nil {
 			s.logger().Error("append manifest", "error", err, "sha256", res.SHA256)
@@ -115,6 +119,8 @@ func (s *Server) finishUpload(
 		ModifiedAt:       meta.modifiedAt,
 		DeviceID:         meta.deviceID,
 		LocalID:          meta.localID,
+
+		LiveParentLocalID: meta.liveParentLocalID,
 	})
 	if err != nil {
 		s.logger().Error("record asset", "error", err, "sha256", res.SHA256)
@@ -144,6 +150,11 @@ type uploadMeta struct {
 	modifiedAt *time.Time
 	deviceID   string
 	localID    string
+	// liveParentLocalID is set on a Live Photo's paired video, and names the
+	// local id of the still it belongs to. Only the phone can know this — the
+	// two files share nothing but a capture time — so it is declared rather
+	// than inferred, and everything downstream keys off it.
+	liveParentLocalID string
 }
 
 func parseUploadHeaders(r *http.Request) (uploadMeta, error) {
@@ -162,6 +173,12 @@ func parseUploadHeaders(r *http.Request) (uploadMeta, error) {
 	m.deviceID = strings.TrimSpace(r.Header.Get("X-Photo-Device-Id"))
 	if m.localID, err = requiredHeader(r, "X-Photo-Local-Id"); err != nil {
 		return m, err
+	}
+	m.liveParentLocalID = strings.TrimSpace(r.Header.Get("X-Photo-Live-Parent-Local-Id"))
+	if m.liveParentLocalID == m.localID {
+		// A video that is its own still is a client bug, and left alone it
+		// would hide the asset from the timeline and pair it with itself.
+		return m, fmt.Errorf("X-Photo-Live-Parent-Local-Id names this same asset: %q", m.localID)
 	}
 
 	rawSize, err := requiredHeader(r, "X-Photo-Size")

@@ -243,16 +243,35 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 	meta := metadataFrom(data)
 
 	decodable := true
-	if asset.MediaKind == db.MediaVideo {
+	switch {
+	case asset.IsLivePair():
+		if decodable, err = r.liveMetadata(ctx, asset, src, &meta); err != nil {
+			return err
+		}
+	case asset.MediaKind == db.MediaVideo:
 		if decodable, err = r.videoMetadata(ctx, asset, src, &meta); err != nil {
 			return err
 		}
-	} else if err := r.writeThumb(ctx, asset.SHA256, src); err != nil {
-		return err
+	default:
+		if err := r.writeThumb(ctx, asset.SHA256, src); err != nil {
+			return err
+		}
 	}
 
 	if err := r.Store.ApplyMetadata(ctx, assetID, meta); err != nil {
 		return err
+	}
+
+	if asset.IsLivePair() {
+		// No transcode is queued for these. The grid plays the 256px rendition
+		// just built, and the viewer renders its larger one per request — so a
+		// library where a third of the items are Live Photos does not put a
+		// third of itself through the transcode queue for three seconds each.
+		state := db.DerivedReady
+		if !decodable {
+			state = db.DerivedFailed
+		}
+		return r.Store.SetLiveState(ctx, assetID, state)
 	}
 
 	if asset.MediaKind == db.MediaVideo {
@@ -318,6 +337,47 @@ func (r *Runner) videoMetadata(ctx context.Context, asset db.Asset, src string, 
 	return true, r.writeThumb(ctx, asset.SHA256, poster)
 }
 
+// liveMetadata handles a Live Photo's paired video: what ffprobe knows about
+// it, and the 256px motion thumbnail the grid plays on hover.
+//
+// No poster frame and no still thumbnail, unlike an ordinary video. The tile
+// this asset appears in belongs to the still it is paired with, and that still
+// has its own thumbnail from its own original — a poster extracted here would
+// be a near-duplicate of it that nothing would ever draw.
+//
+// Like videoMetadata, it reports whether the file decoded rather than failing
+// on a container ffprobe can describe and ffmpeg cannot open. What was readable
+// is still worth recording; the cost is a photo that does not come to life.
+func (r *Runner) liveMetadata(ctx context.Context, asset db.Asset, src string, meta *db.Metadata) (bool, error) {
+	info, err := r.Video.Probe(ctx, src)
+	if err != nil {
+		return false, err
+	}
+	if w, h := info.DisplaySize(); w > 0 && h > 0 {
+		meta.Width, meta.Height = &w, &h
+	}
+	if info.DurationSeconds > 0 {
+		d := info.DurationSeconds
+		meta.DurationSeconds = &d
+	}
+
+	staged, cleanup, err := r.Derivatives.Stage("live-*" + derivstore.LiveThumb)
+	if err != nil {
+		return false, err
+	}
+	defer cleanup()
+
+	if err := r.Video.LiveThumb(ctx, src, staged, info); err != nil {
+		if errors.Is(err, video.ErrNotPlayable) {
+			r.log().Warn("no motion thumbnail; the still will not come to life",
+				"asset", asset.ID, "error", err)
+			return false, nil
+		}
+		return false, err
+	}
+	return true, r.Derivatives.Commit(asset.SHA256, derivstore.LiveThumb, staged)
+}
+
 func (r *Runner) writeThumb(ctx context.Context, sha, src string) error {
 	return r.Derivatives.Write(sha, derivstore.Thumb, func(w io.Writer) error {
 		return r.Images.Thumb(ctx, src, w)
@@ -366,6 +426,12 @@ func (r *Runner) markFailed(ctx context.Context, job jobs.Job) {
 	switch job.Kind {
 	case jobs.KindMetadata:
 		err = r.Store.SetDerivedState(ctx, job.AssetID, db.DerivedFailed)
+		// The motion thumbnail is built by this job too, so it went down with
+		// it. Saying so is what stops the grid waiting on a rendition that is
+		// never coming; the setter ignores assets that have no motion.
+		if liveErr := r.Store.SetLiveState(ctx, job.AssetID, db.DerivedFailed); liveErr != nil && err == nil {
+			err = liveErr
+		}
 	case jobs.KindPlayback:
 		err = r.Store.SetPlaybackState(ctx, job.AssetID, db.DerivedFailed)
 	}

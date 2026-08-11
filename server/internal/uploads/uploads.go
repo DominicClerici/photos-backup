@@ -46,7 +46,12 @@ type Declaration struct {
 	Size       int64      `json:"size"`
 	CapturedAt *time.Time `json:"captured_at,omitempty"`
 	ModifiedAt *time.Time `json:"modified_at,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
+	// LiveParentLocalID names the still this is the paired video of, when it is
+	// one. Deliberately not part of ID: it describes the relationship, not the
+	// bytes, and a session must resume under the same id whether or not the
+	// client repeats it.
+	LiveParentLocalID string    `json:"live_parent_local_id,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 // Session is a declaration plus how much of it has arrived.

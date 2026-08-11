@@ -5,6 +5,7 @@
 export type MediaKind = "image" | "video";
 export type DerivedState = "pending" | "ready" | "failed";
 export type PlaybackState = "none" | "pending" | "ready" | "failed";
+export type LiveState = "pending" | "ready" | "failed";
 
 export interface TimelineItem {
   id: string;
@@ -15,6 +16,12 @@ export interface TimelineItem {
   state: DerivedState;
   playback_state?: PlaybackState;
   duration?: number;
+  /**
+   * State of this still's Live Photo motion. Absent means there is none — the
+   * paired video is never an item of its own, so its whole presence in the
+   * gallery is this one field on the photo it belongs to.
+   */
+  live?: LiveState;
 }
 
 export interface TimelinePage {
@@ -123,6 +130,9 @@ export async function fetchStates(
 
 export const thumbUrl = (id: string) => `${MEDIA_BASE}/v1/assets/${id}/thumb`;
 export const previewUrl = (id: string) => `${MEDIA_BASE}/v1/assets/${id}/preview`;
+/** A Live Photo's motion, addressed by the still's id. */
+export const liveThumbUrl = (id: string) => `${MEDIA_BASE}/v1/assets/${id}/live/thumb`;
+export const livePreviewUrl = (id: string) => `${MEDIA_BASE}/v1/assets/${id}/live/preview`;
 export const playbackUrl = (id: string) => `${MEDIA_BASE}/v1/assets/${id}/playback`;
 export const originalUrl = (id: string) => `${MEDIA_BASE}/v1/assets/${id}/original`;
 

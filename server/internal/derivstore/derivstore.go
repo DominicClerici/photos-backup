@@ -16,11 +16,16 @@ import (
 	"path/filepath"
 )
 
-// Suffixes appended to the digest. Both are part of the on-disk contract, so
-// changing one orphans every derivative already generated.
+// Suffixes appended to the digest. All three are part of the on-disk contract,
+// so changing one orphans every derivative already generated.
 const (
 	Thumb    = ".thumb.webp"
 	Playback = ".mp4"
+	// LiveThumb is a Live Photo's three seconds at thumbnail size, cropped
+	// square to sit exactly where the still it replaces sat. It is the only
+	// rendition a paired video keeps: the viewer's larger one is rendered per
+	// request, the way a photo's 2048px preview is.
+	LiveThumb = ".live.mp4"
 )
 
 type Store struct {

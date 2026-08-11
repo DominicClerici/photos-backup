@@ -106,6 +106,13 @@ export type UploadRequest = {
   size: number;
   createdAt: number | null;
   modifiedAt: number | null;
+  /**
+   * For a Live Photo's paired video, the local id of the still it belongs to.
+   * The phone is the only party that can know this — the two files share
+   * nothing but a capture time — and without it the server archives the clip as
+   * a separate item and the gallery shows the same moment twice.
+   */
+  liveParentLocalId?: string | null;
 };
 
 export type UploadResponse = {

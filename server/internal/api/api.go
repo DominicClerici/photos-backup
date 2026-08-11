@@ -17,8 +17,10 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 	"github.com/dominicclerici/photos-backup/server/internal/devices"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
+	"github.com/dominicclerici/photos-backup/server/internal/livecache"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
+	"github.com/dominicclerici/photos-backup/server/internal/video"
 )
 
 type Server struct {
@@ -27,7 +29,15 @@ type Server struct {
 	Derivatives *derivstore.Store
 	Manifest    *manifest.Log
 	Converter   *derive.Converter
-	Queue       *jobs.Queue
+	// Video renders a Live Photo's playable rendition on demand. Optional: the
+	// live preview endpoint 404s without it, and the gallery falls back to the
+	// still, which is the same degradation a host with no ffmpeg already has.
+	Video *video.Tool
+	// LivePreviews holds those renditions for as long as a viewer is likely to
+	// ask for them again. Optional alongside Video, and required by nothing
+	// else.
+	LivePreviews *livecache.Cache
+	Queue        *jobs.Queue
 	// Devices authenticates the write path. Without it the write endpoints
 	// answer 503 rather than running unauthenticated, so forgetting to wire it
 	// takes the archive offline instead of opening it.
@@ -128,6 +138,11 @@ func (s *Server) readRoutes(mux *http.ServeMux, allow guard) {
 	mux.HandleFunc("GET /v1/assets/{id}/thumb", allow(s.handleThumb))
 	mux.HandleFunc("GET /v1/assets/{id}/preview", allow(s.handlePreview))
 	mux.HandleFunc("GET /v1/assets/{id}/playback", allow(s.handlePlayback))
+
+	// A Live Photo's motion, addressed by the still's id. Two sizes for the two
+	// places it plays: the grid's hover and the viewer's press-and-hold.
+	mux.HandleFunc("GET /v1/assets/{id}/live/thumb", allow(s.handleLiveThumb))
+	mux.HandleFunc("GET /v1/assets/{id}/live/preview", allow(s.handleLivePreview))
 
 	// Guarded with the rest: a failed job carries a filename and an error string,
 	// which is archive content by another name.

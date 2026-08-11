@@ -21,13 +21,14 @@ import (
 const maxDeclarationBody = 64 << 10
 
 type createSessionRequest struct {
-	DeviceID   string     `json:"deviceId"`
-	LocalID    string     `json:"localId"`
-	Filename   string     `json:"filename"`
-	MD5        string     `json:"md5"`
-	Size       int64      `json:"size"`
-	CapturedAt *time.Time `json:"capturedAt"`
-	ModifiedAt *time.Time `json:"modifiedAt"`
+	DeviceID          string     `json:"deviceId"`
+	LocalID           string     `json:"localId"`
+	Filename          string     `json:"filename"`
+	MD5               string     `json:"md5"`
+	Size              int64      `json:"size"`
+	CapturedAt        *time.Time `json:"capturedAt"`
+	ModifiedAt        *time.Time `json:"modifiedAt"`
+	LiveParentLocalID string     `json:"liveParentLocalId"`
 }
 
 type sessionResponse struct {
@@ -65,14 +66,20 @@ func (s *Server) handleCreateUpload(w http.ResponseWriter, r *http.Request, devi
 		return
 	}
 
+	if req.LiveParentLocalID != "" && req.LiveParentLocalID == req.LocalID {
+		writeError(w, http.StatusBadRequest, "liveParentLocalId names this same asset")
+		return
+	}
+
 	session, err := s.Uploads.Create(uploads.Declaration{
-		DeviceID:   deviceID,
-		LocalID:    req.LocalID,
-		Filename:   req.Filename,
-		MD5:        req.MD5,
-		Size:       req.Size,
-		CapturedAt: normalizeTime(req.CapturedAt),
-		ModifiedAt: normalizeTime(req.ModifiedAt),
+		DeviceID:          deviceID,
+		LocalID:           req.LocalID,
+		Filename:          req.Filename,
+		MD5:               req.MD5,
+		Size:              req.Size,
+		CapturedAt:        normalizeTime(req.CapturedAt),
+		ModifiedAt:        normalizeTime(req.ModifiedAt),
+		LiveParentLocalID: req.LiveParentLocalID,
 	})
 	if err != nil {
 		if isDeclarationError(err) {
@@ -180,13 +187,14 @@ func (s *Server) handleCommitUpload(w http.ResponseWriter, r *http.Request, devi
 	}
 
 	s.finishUpload(w, r.Context(), res, ext, contentType, uploadMeta{
-		filename:   session.Decl.Filename,
-		md5:        res.MD5,
-		size:       res.Size,
-		capturedAt: session.Decl.CapturedAt,
-		modifiedAt: session.Decl.ModifiedAt,
-		deviceID:   session.Decl.DeviceID,
-		localID:    session.Decl.LocalID,
+		filename:          session.Decl.Filename,
+		md5:               res.MD5,
+		size:              res.Size,
+		capturedAt:        session.Decl.CapturedAt,
+		modifiedAt:        session.Decl.ModifiedAt,
+		deviceID:          session.Decl.DeviceID,
+		localID:           session.Decl.LocalID,
+		liveParentLocalID: session.Decl.LiveParentLocalID,
 	})
 }
 

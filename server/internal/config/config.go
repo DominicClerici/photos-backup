@@ -59,6 +59,13 @@ type Config struct {
 	// PreviewConcurrency caps simultaneous on-demand preview conversions, so a
 	// fast scroll cannot fork an ImageMagick per request.
 	PreviewConcurrency int
+	// LivePreviewConcurrency is the same cap for Live Photo renditions, and
+	// lower: an ffmpeg costs considerably more than an ImageMagick.
+	LivePreviewConcurrency int
+	// LivePreviewCacheBytes bounds the memory those renditions are held in
+	// between requests. They are stored nowhere else, so this is the only place
+	// a repeated view is cheaper than the first.
+	LivePreviewCacheBytes int64
 	// WorkerDisabled runs photod as a pure API server. The queue still fills;
 	// nothing drains it. Useful when the derivative tooling is missing or being
 	// upgraded, and it is what a separate photo-worker process would need.
@@ -101,6 +108,9 @@ func FromEnv() Config {
 		TranscodeConcurrency: positive(os.Getenv("TRANSCODE_CONCURRENCY"), 1),
 		PreviewConcurrency:   positive(os.Getenv("PREVIEW_CONCURRENCY"), 4),
 		WorkerDisabled:       truthy(os.Getenv("WORKER_DISABLED")),
+
+		LivePreviewConcurrency: positive(os.Getenv("LIVE_PREVIEW_CONCURRENCY"), 2),
+		LivePreviewCacheBytes:  int64(positive(os.Getenv("LIVE_PREVIEW_CACHE_MB"), 64)) << 20,
 
 		VideoEncoder: or(os.Getenv("VIDEO_ENCODER"), "libx264"),
 

@@ -420,6 +420,10 @@ export class SyncEngine {
         size: item.size,
         createdAt: item.createdAt,
         modifiedAt: item.modifiedAt,
+        // Only a paired video carries this, and it is exactly what stops the
+        // gallery drawing a Live Photo as a photo and a silent three-second
+        // clip side by side.
+        liveParentLocalId: item.kind === 'live_video' ? item.parentLocalId : null,
       };
 
       // A big video is minutes of silence on the single-shot path. The

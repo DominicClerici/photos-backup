@@ -35,7 +35,12 @@ type Entry struct {
 	ModifiedAt *time.Time `json:"modified_at,omitempty"`
 	DeviceID   string     `json:"device_id"`
 	LocalID    string     `json:"local_id"`
-	StoredAt   time.Time  `json:"stored_at"`
+	// LiveParentLocalID marks this blob as a Live Photo's paired video and
+	// names the still it belongs to. Only the phone knows the two are related,
+	// so nothing in the bytes could recover it — which is exactly why it has to
+	// be written down here rather than re-derived on a rebuild.
+	LiveParentLocalID string    `json:"live_parent_local_id,omitempty"`
+	StoredAt          time.Time `json:"stored_at"`
 }
 
 type Log struct {
