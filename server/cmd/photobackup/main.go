@@ -4,9 +4,10 @@
 // It reads the same environment photod does, so pointing it at an archive is
 // exactly as involved as running the server against one.
 //
-//	photobackup verify [--deep] [--fix]
+//	photobackup verify [--deep] [--fix] [--retry-failed]
 //	photobackup export --to DIR [--from DATE] [--until DATE] [--copy]
 //	photobackup reindex [--adopt-orphans] [--dry-run]
+//	photobackup reset [--dry-run] [--yes] [--force]
 //	photobackup pair [--ttl 10m]
 //	photobackup devices [--revoke ID]
 //	photobackup ca [--serve] [--export PATH]
@@ -32,9 +33,10 @@ import (
 
 const usage = `photobackup — maintenance for the photo archive
 
-  verify [--deep] [--fix]              audit the archive against itself
+  verify [--deep] [--fix] [--retry-failed]  audit the archive against itself
   export --to DIR [--copy]             materialize a date tree of hardlinks
   reindex [--adopt-orphans]            rebuild the database from manifest.jsonl
+  reset [--dry-run] [--yes]            erase the archive, keep paired devices
 
   pair [--ttl 10m]                     mint a single-use code to pair a device
   devices [--revoke ID]                list paired devices, or unpair one
@@ -75,6 +77,8 @@ func main() {
 		code, err = runExport(ctx, os.Args[2:])
 	case "reindex":
 		code, err = runReindex(ctx, os.Args[2:])
+	case "reset":
+		code, err = runReset(ctx, os.Args[2:])
 	case "pair":
 		code, err = runPair(ctx, os.Args[2:])
 	case "devices":

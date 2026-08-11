@@ -64,7 +64,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/uploads/{id}/commit", s.requireDevice(s.handleCommitUpload))
 	mux.HandleFunc("DELETE /v1/uploads/{id}", s.requireDevice(s.handleAbortUpload))
 
-	s.readRoutes(mux)
+	// Reads are authenticated here and open on the plaintext listener. Which
+	// listener a request arrived on is the whole of the difference, so it is
+	// settled once, at the routing table, rather than sampled inside handlers.
+	s.readRoutes(mux, s.requireToken)
 	return mux
 }
 
@@ -77,8 +80,11 @@ func (s *Server) Handler() http.Handler {
 // handler, which is why widening PLAINTEXT_ADDR to the LAN — a thing the gallery
 // may legitimately want — cannot accidentally expose a credential.
 //
-// What it does expose is the archive, to anyone who can reach it. That is the
-// deliberate Phase 5 scope: the write path is closed, the read path is not yet.
+// What it does expose is the archive, unauthenticated, to anyone who can reach
+// it. Since Phase 6 that is the only place the archive is readable without a
+// token, which is why PLAINTEXT_ADDR stays on loopback: the browser gallery
+// reaches it through the Next.js rewrite from the same machine, and nothing else
+// should.
 func (s *Server) PlaintextHandler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -95,26 +101,37 @@ func (s *Server) PlaintextHandler() http.Handler {
 		mux.HandleFunc(route, refuseInsecure)
 	}
 
-	s.readRoutes(mux)
+	s.readRoutes(mux, openToAnyone)
 	return mux
 }
 
-// readRoutes are the endpoints the gallery is built on, plus health. None of
-// them authenticates anything, on either listener.
-func (s *Server) readRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /v1/timeline", s.handleTimeline)
-	mux.HandleFunc("POST /v1/timeline/states", s.handleTimelineStates)
+// guard decides who may call a read route. There are two: a device token, or
+// nobody in particular.
+type guard func(http.HandlerFunc) http.HandlerFunc
 
-	mux.HandleFunc("GET /v1/assets/{id}", s.handleAssetDetail)
-	mux.HandleFunc("GET /v1/assets/{id}/original", s.handleOriginal)
-	mux.HandleFunc("GET /v1/assets/{id}/thumb", s.handleThumb)
-	mux.HandleFunc("GET /v1/assets/{id}/preview", s.handlePreview)
-	mux.HandleFunc("GET /v1/assets/{id}/playback", s.handlePlayback)
+// openToAnyone is the plaintext listener's guard. Named rather than passed as a
+// bare identity function so the call site reads as a decision.
+func openToAnyone(next http.HandlerFunc) http.HandlerFunc { return next }
 
-	mux.HandleFunc("GET /v1/jobs", s.handleJobs)
-	// Unauthenticated on purpose: the app pings this to decide whether a
-	// remembered address still answers, which it has to be able to do before it
-	// holds a token at all.
+// readRoutes are the endpoints the gallery is built on, plus health.
+//
+// Every one of them is behind the caller's guard except /health, which is
+// unauthenticated on both listeners on purpose: the app pings it to decide
+// whether a remembered address still answers, and it has to be able to do that
+// before it holds a token at all.
+func (s *Server) readRoutes(mux *http.ServeMux, allow guard) {
+	mux.HandleFunc("GET /v1/timeline", allow(s.handleTimeline))
+	mux.HandleFunc("POST /v1/timeline/states", allow(s.handleTimelineStates))
+
+	mux.HandleFunc("GET /v1/assets/{id}", allow(s.handleAssetDetail))
+	mux.HandleFunc("GET /v1/assets/{id}/original", allow(s.handleOriginal))
+	mux.HandleFunc("GET /v1/assets/{id}/thumb", allow(s.handleThumb))
+	mux.HandleFunc("GET /v1/assets/{id}/preview", allow(s.handlePreview))
+	mux.HandleFunc("GET /v1/assets/{id}/playback", allow(s.handlePlayback))
+
+	// Guarded with the rest: a failed job carries a filename and an error string,
+	// which is archive content by another name.
+	mux.HandleFunc("GET /v1/jobs", allow(s.handleJobs))
 	mux.HandleFunc("GET /health", s.handleHealth)
 }
 

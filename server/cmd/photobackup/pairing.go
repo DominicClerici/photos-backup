@@ -89,8 +89,9 @@ func runDevices(ctx context.Context, args []string) (int, error) {
 			return fail(err)
 		}
 		fmt.Printf("unpaired %s (%s)\n", d.Name, d.ID)
-		fmt.Printf("\nThe photos it already delivered are untouched — revoking a token\n")
-		fmt.Printf("removes write access, never anything from the archive.\n")
+		fmt.Printf("\nThat device can no longer upload or read the gallery. The photos it\n")
+		fmt.Printf("already delivered are untouched — revoking a token withdraws access,\n")
+		fmt.Printf("never anything from the archive.\n")
 		return exitOK, nil
 	}
 

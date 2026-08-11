@@ -2,6 +2,7 @@ package video
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -103,6 +104,146 @@ func TestPosterFrameHandlesAClipShorterThanTheSeek(t *testing.T) {
 	stat, err := os.Stat(dst)
 	if err != nil || stat.Size() == 0 {
 		t.Fatalf("poster frame missing or empty: %v", err)
+	}
+}
+
+// The fixture is exactly 1.000s, so the old unconditional 1s seek landed past
+// its last frame. Probe reporting no duration at all is the case that used to
+// take that seek blindly.
+func TestPosterFrameSeeksFromTheStartWhenTheDurationIsUnknown(t *testing.T) {
+	tool := New()
+	dst := filepath.Join(t.TempDir(), "poster.jpg")
+
+	if err := tool.PosterFrame(context.Background(), fixture("clip.mov"), dst, Info{Width: 640, Height: 480}); err != nil {
+		t.Fatalf("PosterFrame with an unknown duration: %v", err)
+	}
+	if stat, err := os.Stat(dst); err != nil || stat.Size() == 0 {
+		t.Fatalf("poster frame missing or empty: %v", err)
+	}
+}
+
+// A duration that overstates the clip is what a container with stale metadata
+// looks like. The seek it produces overshoots, and the retry has to catch it.
+func TestPosterFrameFallsBackWhenTheSeekOvershoots(t *testing.T) {
+	tool := New()
+	dst := filepath.Join(t.TempDir(), "poster.jpg")
+
+	info := Info{Width: 640, Height: 480, DurationSeconds: 30}
+	if err := tool.PosterFrame(context.Background(), fixture("clip.mov"), dst, info); err != nil {
+		t.Fatalf("PosterFrame over an overstated duration: %v", err)
+	}
+	if stat, err := os.Stat(dst); err != nil || stat.Size() == 0 {
+		t.Fatalf("poster frame missing or empty: %v", err)
+	}
+}
+
+// The bug this replaced: ffmpeg exits 0 leaving an unusable file, and the first
+// thing to notice is ImageMagick, two subprocesses and one confusing error
+// message later.
+func TestCheckJPEGRejectsWhatImageMagickWouldChokeOn(t *testing.T) {
+	valid, err := os.ReadFile(fixture("photo.jpg"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"empty", nil, "empty"},
+		{"truncated", valid[:len(valid)/2], "end-of-image"},
+		{"not a jpeg at all", []byte("nowhere near a JPEG"), "do not start as a JPEG"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "poster.jpg")
+			if err := os.WriteFile(path, tc.data, 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			err := checkJPEG(path)
+			if err == nil {
+				t.Fatal("checkJPEG accepted a file ImageMagick cannot read")
+			}
+			if !errors.Is(err, ErrNoFrame) {
+				t.Errorf("error does not wrap ErrNoFrame, so the retry will not fire: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+
+	path := filepath.Join(t.TempDir(), "poster.jpg")
+	if err := os.WriteFile(path, valid, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := checkJPEG(path); err != nil {
+		t.Errorf("checkJPEG rejected a valid JPEG: %v", err)
+	}
+}
+
+// undecodable.mov is clip.mov remuxed with +faststart and cut off just after
+// its moov, so ffprobe reads a complete 640x480 h264 header and ffmpeg cannot
+// decode a single frame from it. That is the shape of the Live Photo that
+// started all this: describable, not decodable.
+func TestPosterFrameReportsNoFrameForAnUndecodableFile(t *testing.T) {
+	tool := New()
+	ctx := context.Background()
+
+	info, err := tool.Probe(ctx, fixture("undecodable.mov"))
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if info.Width != 640 || info.Height != 480 {
+		t.Fatalf("Probe read %dx%d; the fixture is meant to describe itself fine", info.Width, info.Height)
+	}
+
+	err = tool.PosterFrame(ctx, fixture("undecodable.mov"), filepath.Join(t.TempDir(), "poster.jpg"), info)
+	if err == nil {
+		t.Fatal("PosterFrame reported success on a file with no decodable frames")
+	}
+	// The worker degrades on this specific sentinel, so the wrapping matters as
+	// much as the failure.
+	if !errors.Is(err, ErrNoFrame) {
+		t.Errorf("error does not wrap ErrNoFrame, so the worker will fail the asset instead of degrading: %v", err)
+	}
+}
+
+// The bug this guards: ffmpeg exits 0 having encoded nothing, and the rendition
+// is marked ready and plays nothing.
+func TestTranscodeRejectsAnUnplayableResult(t *testing.T) {
+	tool := New()
+	tool.CRF = 30
+	ctx := context.Background()
+
+	info := Info{Width: 640, Height: 480, DurationSeconds: 1}
+	err := tool.Transcode(ctx, fixture("undecodable.mov"), filepath.Join(t.TempDir(), "playback.mp4"), info)
+	if err == nil {
+		t.Fatal("Transcode reported success on a file with no decodable frames")
+	}
+	if !errors.Is(err, ErrNotPlayable) {
+		t.Errorf("error does not wrap ErrNotPlayable: %v", err)
+	}
+}
+
+func TestCheckPlayableRejectsAnEmptyOrBogusFile(t *testing.T) {
+	tool := New()
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	empty := filepath.Join(dir, "empty.mp4")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := tool.checkPlayable(ctx, empty); err == nil || !errors.Is(err, ErrNotPlayable) {
+		t.Errorf("checkPlayable on an empty file = %v, want ErrNotPlayable", err)
+	}
+
+	if err := tool.checkPlayable(ctx, filepath.Join(dir, "absent.mp4")); err == nil || !errors.Is(err, ErrNotPlayable) {
+		t.Errorf("checkPlayable on a missing file = %v, want ErrNotPlayable", err)
 	}
 }
 

@@ -70,10 +70,10 @@ export function Gallery() {
   }, [index, items.length, hasMore, loading, loadMore]);
 
   return (
-    <div className="app">
-      <header className="appBar">
-        <h1>Photos</h1>
-        <span className="appCount">
+    <div className="flex h-dvh flex-col">
+      <header className="flex h-13 flex-none items-center gap-3 border-b bg-card px-4">
+        <h1 className="text-[15px] font-semibold tracking-[0.01em]">Photos</h1>
+        <span className="text-[13px] text-faint">
           {items.length.toLocaleString()}
           {timeline.hasMore ? "+" : ""} items
         </span>

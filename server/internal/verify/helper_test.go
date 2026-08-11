@@ -255,5 +255,8 @@ func truncate(t *testing.T, ctx context.Context, dbURL string) {
 		return
 	}
 	defer conn.Close(ctx)
-	_, _ = conn.Exec(ctx, "truncate table assets, device_assets, jobs")
+	// devices and pairing_codes go too. Reset's whole claim is about what
+	// survives it, and a device left behind by an earlier test would make that
+	// assertion pass for the wrong reason.
+	_, _ = conn.Exec(ctx, "truncate table assets, device_assets, jobs, devices, pairing_codes")
 }

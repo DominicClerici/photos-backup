@@ -58,18 +58,97 @@ func TestWritePathRefusesAnUnknownToken(t *testing.T) {
 	}
 }
 
-// The read path is deliberately open in Phase 5. If that ever changes this test
-// is the one that should fail and be rewritten, rather than the change happening
-// by accident.
-func TestReadPathNeedsNoToken(t *testing.T) {
+// readRoutes is every endpoint the gallery reads. Like writeRoutes, the table is
+// the test: a read route added without a guard has to be listed here to be
+// exercised, and one left off is the failure this catches.
+//
+// The asset id is a syntactically valid uuid that names nothing, because the
+// point is which answer comes back — 401 before the lookup, not 404 after it.
+// Answering 404 to an anonymous caller would confirm the id is unknown, which is
+// already more than an unpaired client should learn.
+var readRoutes = []struct {
+	method, path string
+}{
+	{http.MethodGet, "/v1/timeline"},
+	{http.MethodPost, "/v1/timeline/states"},
+	{http.MethodGet, "/v1/assets/1f0d3a94-0000-4000-8000-000000000000"},
+	{http.MethodGet, "/v1/assets/1f0d3a94-0000-4000-8000-000000000000/original"},
+	{http.MethodGet, "/v1/assets/1f0d3a94-0000-4000-8000-000000000000/thumb"},
+	{http.MethodGet, "/v1/assets/1f0d3a94-0000-4000-8000-000000000000/preview"},
+	{http.MethodGet, "/v1/assets/1f0d3a94-0000-4000-8000-000000000000/playback"},
+	{http.MethodGet, "/v1/jobs"},
+}
+
+// Phase 6 closed the read path on the listener the phone dials. The archive is
+// no longer readable by anything on the LAN that has not been paired.
+func TestReadPathRefusesWithoutAToken(t *testing.T) {
 	h := newHarness(t)
-	h.token = "" // so the helpers stop attaching one
+
+	for _, route := range readRoutes {
+		t.Run(route.method+" "+route.path, func(t *testing.T) {
+			resp := h.raw(t, route.method, route.path, "")
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", resp.StatusCode)
+			}
+			if got := resp.Header.Get("WWW-Authenticate"); !strings.Contains(got, "Bearer") {
+				t.Errorf("WWW-Authenticate = %q, want a Bearer challenge", got)
+			}
+		})
+	}
+}
+
+func TestReadPathRefusesARevokedToken(t *testing.T) {
+	h := newHarness(t)
+
+	if resp := h.get(t, "/v1/timeline"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("timeline before revoking = %d, want 200", resp.StatusCode)
+	}
+	if _, err := h.devices.Revoke(context.Background(), h.deviceID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	resp := h.get(t, "/v1/timeline")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("timeline after revoking = %d, want 401", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "unpaired") {
+		t.Errorf("body = %s, want it to say the device was unpaired", body)
+	}
+}
+
+// A paired device reads the whole gallery. There is one archive and every device
+// sees all of it — the token says "paired", not "paired and entitled to these
+// rows".
+func TestAPairedDeviceReadsTheGallery(t *testing.T) {
+	h := newHarness(t)
 
 	for _, path := range []string{"/health", "/v1/timeline", "/v1/jobs"} {
 		resp := h.get(t, path)
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("GET %s = %d, want 200", path, resp.StatusCode)
 		}
+	}
+}
+
+// /health is the exception, and it has to be: the app pings a remembered address
+// to see whether it still answers, which happens before pairing and after a
+// token has been revoked.
+func TestHealthNeedsNoTokenOnEitherListener(t *testing.T) {
+	h := newHarness(t)
+
+	if resp := h.raw(t, http.MethodGet, "/health", ""); resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /health on the TLS listener = %d, want 200", resp.StatusCode)
+	}
+
+	plain := h.plaintext(t)
+	resp, err := plain.Client().Get(plain.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /health on the plaintext listener = %d, want 200", resp.StatusCode)
 	}
 }
 
@@ -96,7 +175,7 @@ func TestUploadRefusesARevokedToken(t *testing.T) {
 	}
 }
 
-// Revoking removes write access and nothing else. An archive that dropped photos
+// Revoking withdraws access and nothing else. An archive that dropped photos
 // when a phone was unpaired would not be an archive.
 func TestRevokingKeepsWhatTheDeviceDelivered(t *testing.T) {
 	h := newHarness(t)
@@ -112,7 +191,17 @@ func TestRevokingKeepsWhatTheDeviceDelivered(t *testing.T) {
 	if after := h.blobFiles(t); len(after) != len(before) || len(after) == 0 {
 		t.Fatalf("blobs = %v, want the %d from before revoking", after, len(before))
 	}
-	if resp := h.get(t, "/v1/timeline"); resp.StatusCode != http.StatusOK {
+
+	// Read through the gallery's listener, because the revoked token can no
+	// longer read through the other one — the archive still holds what the device
+	// delivered, which is the property under test.
+	plain := h.plaintext(t)
+	resp, err := plain.Client().Get(plain.URL + "/v1/timeline")
+	if err != nil {
+		t.Fatalf("GET /v1/timeline: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
 		t.Errorf("timeline after revoking = %d, want 200", resp.StatusCode)
 	}
 }
@@ -262,8 +351,7 @@ func TestPairingRateLimitsAttempts(t *testing.T) {
 func TestPlaintextListenerServesNoCredentialPath(t *testing.T) {
 	h := newHarness(t)
 
-	plain := httptest.NewServer(h.srv.PlaintextHandler())
-	t.Cleanup(plain.Close)
+	plain := h.plaintext(t)
 
 	for _, route := range append(writeRoutes, struct{ method, path string }{http.MethodPost, "/v1/pair"}) {
 		t.Run(route.method+" "+route.path, func(t *testing.T) {
@@ -286,6 +374,10 @@ func TestPlaintextListenerServesNoCredentialPath(t *testing.T) {
 		})
 	}
 
+	// And the read path stays open here, which is the whole reason this listener
+	// exists: the browser gallery proxies to it from the same machine rather than
+	// teaching Node to trust a private CA. The other listener now wants a token
+	// for these same two paths.
 	for _, path := range []string{"/health", "/v1/timeline"} {
 		resp, err := plain.Client().Get(plain.URL + path)
 		if err != nil {

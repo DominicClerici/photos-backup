@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 
 import { fetchHealth, type Health } from "@/lib/api";
+import { Badge } from "@/components/ui/badge";
 
 const REFRESH_MS = 15_000;
 
@@ -39,20 +40,29 @@ export function JobStatus() {
     };
   }, []);
 
-  if (!reachable) return <span className="chip isError">server unreachable</span>;
+  if (!reachable)
+    return (
+      <Badge variant="outline" className="ml-auto border-destructive/40 text-destructive">
+        server unreachable
+      </Badge>
+    );
   if (!health) return null;
 
   return (
-    <span className="chipGroup">
+    <span className="ml-auto flex gap-2">
       {health.pending_jobs > 0 ? (
-        <span className="chip isWorking">
+        <Badge variant="outline" className="border-primary/40 text-primary">
           processing {health.pending_jobs.toLocaleString()}
-        </span>
+        </Badge>
       ) : null}
       {health.failed_jobs > 0 ? (
-        <span className="chip isError" title="See GET /v1/jobs for the failures">
+        <Badge
+          variant="outline"
+          className="border-destructive/40 text-destructive"
+          title="See GET /v1/jobs for the failures"
+        >
           {health.failed_jobs.toLocaleString()} failed
-        </span>
+        </Badge>
       ) : null}
     </span>
   );

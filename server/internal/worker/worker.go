@@ -242,8 +242,9 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 	}
 	meta := metadataFrom(data)
 
+	decodable := true
 	if asset.MediaKind == db.MediaVideo {
-		if err := r.videoMetadata(ctx, asset, src, &meta); err != nil {
+		if decodable, err = r.videoMetadata(ctx, asset, src, &meta); err != nil {
 			return err
 		}
 	} else if err := r.writeThumb(ctx, asset.SHA256, src); err != nil {
@@ -255,6 +256,12 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 	}
 
 	if asset.MediaKind == db.MediaVideo {
+		// A container ffprobe can describe but ffmpeg cannot decode will not
+		// transcode either, so queueing the work only buys five failing attempts
+		// and a parked job. The metadata that was readable is already stored.
+		if !decodable {
+			return r.Store.SetPlaybackState(ctx, assetID, db.PlaybackNone)
+		}
 		if err := r.Store.SetPlaybackState(ctx, assetID, db.DerivedPending); err != nil {
 			return err
 		}
@@ -273,10 +280,13 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 // use, rather than piping ffmpeg into ImageMagick. Two subprocesses joined by a
 // pipe fail in ways that are miserable to diagnose, and one square-thumbnail
 // path means video tiles and photo tiles cannot drift apart.
-func (r *Runner) videoMetadata(ctx context.Context, asset db.Asset, src string, meta *db.Metadata) error {
+// It reports whether the video decoded. A false with no error is the degraded
+// case: ffprobe described the file, ffmpeg could not get a frame out of it, and
+// what was readable has still been recorded.
+func (r *Runner) videoMetadata(ctx context.Context, asset db.Asset, src string, meta *db.Metadata) (bool, error) {
 	info, err := r.Video.Probe(ctx, src)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if w, h := info.DisplaySize(); w > 0 && h > 0 {
@@ -290,14 +300,22 @@ func (r *Runner) videoMetadata(ctx context.Context, asset db.Asset, src string, 
 	// The .jpg matters: ffmpeg picks its output format from the extension.
 	poster, cleanup, err := r.Derivatives.Stage("poster-*.jpg")
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer cleanup()
 
 	if err := r.Video.PosterFrame(ctx, src, poster, info); err != nil {
-		return err
+		// Losing a tile to a container ffmpeg cannot decode is a smaller loss
+		// than parking the asset: the original is archived and verified either
+		// way, and the gallery draws a placeholder for a thumbnail that 404s.
+		if errors.Is(err, video.ErrNoFrame) {
+			r.log().Warn("no poster frame; keeping what the probe read",
+				"asset", asset.ID, "error", err)
+			return false, nil
+		}
+		return false, err
 	}
-	return r.writeThumb(ctx, asset.SHA256, poster)
+	return true, r.writeThumb(ctx, asset.SHA256, poster)
 }
 
 func (r *Runner) writeThumb(ctx context.Context, sha, src string) error {

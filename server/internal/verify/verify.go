@@ -117,6 +117,12 @@ type Options struct {
 	Deep bool
 	// Fix applies the unambiguous repairs.
 	Fix bool
+	// RetryFailed puts jobs that gave up back in the queue. Deliberately not
+	// part of Fix: a job reaching this state has already failed every attempt
+	// it was given, so retrying it belongs to someone who knows what changed —
+	// a new binary, a newly installed codec. Folded into Fix it would run from
+	// the weekly timer and grind the same impossible file forever.
+	RetryFailed bool
 	// StaleAfter is how old an abandoned partial or temp file must be before it
 	// is reported. Anything younger could be an upload in flight right now.
 	StaleAfter time.Duration
@@ -193,7 +199,7 @@ func Run(ctx context.Context, d Deps, opt Options) (Report, error) {
 	if err := checkBlobTree(ctx, d, opt, r, indexed); err != nil {
 		return *r, err
 	}
-	if err := checkFailedJobs(ctx, d, r); err != nil {
+	if err := checkFailedJobs(ctx, d, opt, r); err != nil {
 		return *r, err
 	}
 	checkLitter(d, opt, r)
@@ -401,7 +407,7 @@ func checkBlobTree(ctx context.Context, d Deps, opt Options, r *Report, indexed 
 	})
 }
 
-func checkFailedJobs(ctx context.Context, d Deps, r *Report) error {
+func checkFailedJobs(ctx context.Context, d Deps, opt Options, r *Report) error {
 	if d.Queue == nil {
 		return nil
 	}
@@ -410,10 +416,14 @@ func checkFailedJobs(ctx context.Context, d Deps, r *Report) error {
 		return fmt.Errorf("list failed jobs: %w", err)
 	}
 	for _, j := range failed {
-		r.Findings = append(r.Findings, Finding{
+		finding := Finding{
 			Kind:   DerivativeFailed,
 			Detail: fmt.Sprintf("%s job for asset %s gave up: %s", j.Kind, j.AssetID, firstLine(j.Error)),
-		})
+		}
+		if opt.RetryFailed {
+			finding.Fixed = requeue(ctx, d, j.Kind, j.AssetID) == nil
+		}
+		r.Findings = append(r.Findings, finding)
 	}
 	return nil
 }

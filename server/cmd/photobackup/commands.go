@@ -14,6 +14,7 @@ func runVerify(ctx context.Context, args []string) (int, error) {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	deep := fs.Bool("deep", false, "re-hash every original; this is the bit-rot check and it reads the whole archive")
 	fix := fs.Bool("fix", false, "apply the unambiguous repairs: missing manifest lines, missing derivatives, stale temp files")
+	retryFailed := fs.Bool("retry-failed", false, "requeue derivative jobs that gave up; for after a new binary or a newly installed codec")
 	staleAfter := fs.Duration("stale-after", 24*time.Hour, "how old an abandoned partial upload must be to count as litter")
 	quiet := fs.Bool("quiet", false, "print only findings, for a cron job that mails its output")
 	if err := fs.Parse(args); err != nil {
@@ -38,7 +39,7 @@ func runVerify(ctx context.Context, args []string) (int, error) {
 		fmt.Printf("%s %d assets, %s\n\n", what, counts.Assets, byteCount(counts.Bytes))
 	}
 
-	opt := verify.Options{Deep: *deep, Fix: *fix, StaleAfter: *staleAfter}
+	opt := verify.Options{Deep: *deep, Fix: *fix, RetryFailed: *retryFailed, StaleAfter: *staleAfter}
 	if *deep && !*quiet {
 		opt.Progress = progressTicker()
 	}

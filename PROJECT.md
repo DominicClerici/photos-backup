@@ -1,8 +1,8 @@
 # photos-backup
 
 A self-hosted photo and video backup service. An iPhone app pushes originals to a
-Linux server at home, which stores them on a 6TB drive and serves them back
-through a web gallery.
+Linux server at home, which stores them on a dedicated partition of a 6TB drive
+and serves them back through a web gallery.
 
 Built from scratch deliberately. Immich already solves this problem well; the
 point here is to own the design and the code.
@@ -13,7 +13,7 @@ point here is to own the design and the code.
 
 **v1 succeeds when:**
 
-- Photos and videos taken on the iPhone reach the 6TB drive without manual effort.
+- Photos and videos taken on the iPhone reach the archive drive without manual effort.
 - A second backup run uploads zero bytes.
 - The entire archive is browsable in a web browser.
 - `photobackup verify` passes across the whole library.
@@ -70,6 +70,13 @@ of hardlinks on demand, costing no extra bytes.
 ## 3. Environment
 
 - **Server:** Fedora Workstation, 6TB external drive, NVIDIA GPU (for v2 ML).
+- **Archive partition:** the 6TB drive is split, and only part of it is the
+  archive. `/dev/sda1` is 500GB of ext4 mounted at `/mnt/photos`; `/dev/sda2`
+  holds the remaining 5TB as NTFS, mounted into the desktop session and untouched
+  by photod. Against a ~100GB library that is roughly 5x headroom, so v1 does not
+  need the rest — but "the 6TB drive" is shorthand for a 500GB slice of it
+  everywhere in these documents, and growing the archive later means resizing
+  across a partition boundary rather than just using free space.
 - **Phone:** iPhone. **iCloud Photos is not in use** — every original is physically
   on the device, so backup is a pure local-disk read with no cloud round-trip.
 - **Library:** ~100GB in real use. ~100 photos + ~10 videos as the test fixture.
@@ -116,7 +123,7 @@ of hardlinks on demand, costing no extra bytes.
               Postgres  (metadata, jobs, pgvector in v2)
                    |
                    v
-              /mnt/photos  (6TB drive)
+              /mnt/photos  (500GB ext4 partition, 6TB drive)
 ```
 
 Three server processes under systemd, plus the web app. The split is by process
@@ -125,7 +132,7 @@ boundary, not sprinkled through one codebase.
 The gallery is a separate Next.js app rather than pages served by photod. It
 costs a second process on the archive machine, and buys the ability to put the
 gallery on the public internet later without moving the upload endpoints or the
-6TB drive along with it. photod stays a private API; the web app is the only
+archive drive along with it. photod stays a private API; the web app is the only
 part that would ever face outward.
 
 The browser talks to one origin. Next rewrites `/api/*` to photod, so the JSON
@@ -158,8 +165,9 @@ $DERIVATIVES_ROOT/                  the SSD; defaults to /mnt/photos/derivatives
   3f/9a/3f9a77b2.mp4                H.264 playback rendition, video only
 ```
 
-Originals live on the 6TB drive. Postgres and derivatives should live on the
-workstation SSD for speed, which is what `DERIVATIVES_ROOT` is for.
+Originals live on the archive partition — 500GB of the 6TB drive, mounted at
+`/mnt/photos`. Postgres and derivatives should live on the workstation SSD for
+speed, which is what `DERIVATIVES_ROOT` is for.
 
 The 2048px preview is **not** stored. It is rendered per request from the blob
 and cached by the browser instead, since the bytes are content-addressed and can
@@ -205,7 +213,9 @@ determines that cheaply.
 
 The server prints a pairing code. The app submits it once and receives a
 long-lived device token, stored hashed server-side and kept in the iOS keychain
-on the phone. The server issues its own CA and server certificate on first run.
+on the phone. It is the phone's only credential: uploading and reading the
+gallery both use it, so revoking a device withdraws both at once. The server
+issues its own CA and server certificate on first run.
 
 **Trust is established out of band, not pinned at pairing.** The original plan was
 trust on first use — pin the self-signed certificate when the code is redeemed —
@@ -372,6 +382,43 @@ optimization or minting HMAC-signed media URLs into the timeline JSON. It is a
 real gap, in the same category as the single drive: accepted, known, and written
 down rather than discovered.
 
+*Closed on the phone's listener since Phase 6, below. The obstacle above is a
+browser's, and the phone is not one.*
+
+### Phase 6 — Authenticated reads, and a way into the archive from the app
+
+The read path on the TLS listener is behind `requireDevice`, exactly as the write
+path is; the plaintext loopback listener still serves it open, which is what the
+browser gallery reads through. `/health` is the one exception on both, because
+the app pings a remembered address before it holds a token and after one has been
+revoked.
+
+**The Phase 5 obstacle turned out to be a browser's, not the archive's.** Closing
+the read path was written up as a choice between losing the direct-to-photod media
+hop and minting signed URLs. Neither was needed here: React Native puts headers on
+image, video and download requests — `expo-image` and `expo-video` both take a
+`headers` field, and so does `File.downloadFileAsync` — so every rendition
+authenticates with the token already in the keychain. There is no second
+credential, no expiry to manage, and no URL that is itself a secret. The web
+gallery's version of this problem is untouched and still real; it simply was never
+the same problem.
+
+**Reads are guarded by the routing table, not by a check in a handler.**
+`readRoutes` takes the guard as an argument and each listener supplies its own,
+which keeps the property Phase 5 established: which listener a request arrived on
+settles what it may do, and that stays true when a route is added.
+
+**Revocation now covers reading too**, which is what makes it one lever rather
+than two. The cost is the one Phase 5 already named — authenticating means
+touching Postgres — and a scrolling gallery asks far more often than an upload
+does. Left unmeasured on purpose: it is an indexed lookup over loopback, and a
+read-path token cache is the answer if it ever shows up in a profile.
+
+Shipped in the app as a proof of connection rather than a gallery: `GalleryClient`
+and an access check that reads the timeline, fetches a thumbnail, and confirms the
+same read is refused without the token. The dashboard grows in the browser first
+and gets ported onto this.
+
 ### v2
 
 - **ML service.** Python, CLIP semantic search, then face detection and clustering.
@@ -409,13 +456,15 @@ Cheap to verify now, annoying to discover in Phase 3.
 **6. Battery and heat.** Pushing 100GB will heat the phone significantly. Bulk
 backfill should be gated on charging + Wi-Fi by default, with a manual override.
 
-**7. Unauthenticated gallery.** Phase 5 closed the write path and left the read
-path open. Anyone who can reach photod's plaintext listener can page the whole
-archive and download originals, which is why that listener is bound to loopback by
-default. A device token can never cross it — pairing and every authenticated
-route are absent from its routing table, so widening it exposes photos but never a
-credential. Accepted for now; it is what stands between this and putting the
-gallery on the internet, which §4 keeps as an option.
+**7. Unauthenticated gallery.** Closed on the TLS listener: the read path now
+takes the same device token the write path does, so nothing on the LAN reads the
+archive without having been paired. What remains is the plaintext listener, which
+stays open by design for the browser gallery and is bound to loopback — it is now
+the only unauthenticated way in, and widening `PLAINTEXT_ADDR` is the whole risk
+rather than one half of it. A device token still cannot cross it: pairing and
+every authenticated route are absent from its routing table, so widening it
+exposes photos but never a credential. Putting the gallery on the internet, which
+§4 keeps as an option, still needs an answer for the browser — see below.
 
 **8. Losing `ca.key`.** It is the one file whose loss means physically re-pairing
 every device, and the one whose disclosure lets somebody impersonate the archive

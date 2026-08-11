@@ -1,16 +1,18 @@
 # Deploying to the archive machine
 
 Written during Phase 4 and revised in Phase 5. The systemd units and the SELinux
-notes have been run on this Fedora box; the pairing and TLS steps below were
-verified against a photod on scratch ports and paths, not against the deployed
-service. Treat the install order as reliable and the exact paths as worth reading
-before pasting.
+notes have been run on this Fedora box. The TLS steps and every CLI invocation
+below have since been corrected against the deployed service — the first draft
+was written against a photod on scratch ports and paths, and inherited an
+environment from the shell that the real one does not get. The phone-side half of
+pairing still has not been run end to end. Treat the install order as reliable
+and the exact paths as worth reading before pasting.
 
 ## What runs where
 
 | | where | why |
 |---|---|---|
-| `blobs/`, `manifest.jsonl`, `incoming/` | `/mnt/photos`, the 6TB drive | irreplaceable, and large |
+| `blobs/`, `manifest.jsonl`, `incoming/` | `/mnt/photos`, the archive partition | irreplaceable, and large |
 | derivatives | `/var/lib/photod/derivatives`, the SSD | the gallery reads them constantly, and all of them can be rebuilt |
 | Postgres | the SSD | ordinary database reasons |
 | `ca.key`, `server.key` | `/var/lib/photod/tls`, the SSD | machine identity, not library — and losing `ca.key` means re-pairing every device |
@@ -18,6 +20,29 @@ before pasting.
 `incoming/` has to be on the same filesystem as `blobs/`, because a completed
 upload becomes a blob by rename. That is why it is under `PHOTOS_ROOT` and not
 configurable separately.
+
+### The archive partition
+
+The 6TB drive is split, and photod only gets part of it:
+
+```
+sda           5.5T
+├─sda1        500G  ext4   /mnt/photos                  the archive
+└─sda2          5T  ntfs   /run/media/dominic/storage   not photod's
+```
+
+500GB against a ~100GB library is about 5x headroom, so this is sized for v1 and
+then some. Two consequences worth knowing before they surprise you:
+
+- Free space on the drive is not free space for the archive. `df -h /mnt/photos`
+  is the number that matters; the 5TB next to it is a different filesystem.
+- The NTFS partition is mounted by the desktop session under `/run/media`, which
+  is outside `ReadWritePaths=` and blocked by `ProtectHome=yes` besides. photod
+  cannot read it even if asked. Importing anything from there means copying it
+  somewhere photod can see first.
+
+Growing the archive means resizing across a partition boundary, not extending
+into adjacent free space. Cheapest while `/mnt/photos` is still empty.
 
 ## Install
 
@@ -28,9 +53,11 @@ sudo install -d -o photod -g photod /var/lib/photod /var/lib/photod/derivatives
 sudo install -d -o photod -g photod -m 0700 /var/lib/photod/tls
 sudo chown -R photod:photod /mnt/photos
 
-go build -o /tmp/photod ./server/cmd/photod
-go build -o /tmp/photobackup ./server/cmd/photobackup
+# -C server because the module root is server/, not the repository root.
+go build -C server -o /tmp/photod ./cmd/photod
+go build -C server -o /tmp/photobackup ./cmd/photobackup
 sudo install -m 0755 /tmp/photod /tmp/photobackup /usr/local/bin/
+sudo install -m 0755 deploy/photobackup-admin /usr/local/bin/   # see "Running the CLI"
 
 sudo install -d -m 0755 /etc/photod
 sudo install -m 0640 -g photod deploy/photod.env.example /etc/photod/photod.env
@@ -55,14 +82,51 @@ sudo firewall-cmd --reload
 ```
 
 Port 8788 stays closed. That is the read-only plaintext listener, bound to
-127.0.0.1 for the Next app and the CLI — opening it would put the whole archive
-on the LAN unauthenticated, which is a decision, not a step (see "What is still
-open" below).
+127.0.0.1 for the Next app and the CLI — it is the one way into the archive that
+asks for nothing, so opening it would put the whole archive on the LAN
+unauthenticated, which is a decision, not a step (see "What is still open"
+below).
 
 `photobackup ca --serve` needs one port open for as long as the transfer takes:
 
 ```sh
 sudo firewall-cmd --add-port=8789/tcp                 # no --permanent: gone on reload
+```
+
+## Running the CLI
+
+`photobackup` reads its configuration from the environment, exactly as photod
+does, and `EnvironmentFile=` in the unit is the only thing that loads
+`/etc/photod/photod.env`. `sudo -u photod` starts from a clean environment, so a
+bare `sudo -u photod photobackup ...` gets every fallback in `config.FromEnv`:
+`./data/photos` relative to whatever directory you happen to be in, and the
+development database URL.
+
+`photobackup-admin` hands it the env file the way systemd does — installed
+alongside the binaries above, so it is on `PATH` in any shell:
+
+```sh
+sudo install -m 0755 deploy/photobackup-admin /usr/local/bin/
+```
+
+It wraps `systemd-run`, which reads the env file as root before dropping to the
+`photod` user, so the database password never lands on a command line or in `ps`.
+Every `photobackup` subcommand works through it.
+
+Not a nicety. Two of those fallbacks fail in ways that do not look like failure:
+
+- `photobackup ca` *creates* a CA when it finds none at `TLS_DIR`. Run without
+  the env somewhere writable and it mints a second, unrelated CA and serves that
+  to the phone, which then trusts a CA photod is not using — indistinguishable
+  from never having trusted it, and it costs an afternoon.
+- `photobackup verify` against an empty `./data/photos` finds nothing missing and
+  exits 0. An all-clear from an archive that is not yours.
+
+`ca` reads no database, so it can also be run without the password going
+anywhere:
+
+```sh
+sudo -u photod env TLS_DIR=/var/lib/photod/tls photobackup ca --serve --addr :8789
 ```
 
 ## Pairing the phone
@@ -75,11 +139,15 @@ be installed *and* trusted before the app can reach the upload path at all,
 because iOS will not let an app decide for itself which certificates to accept.
 
 ```sh
-sudo -u photod photobackup ca --serve --addr :8789
+photobackup-admin ca --serve --addr :8789
 ```
 
-That prints the SHA-256 fingerprint and a URL. Open the URL in **Safari** on the
-phone, then:
+That prints the SHA-256 fingerprint and a URL. Check the fingerprint against the
+one photod logged at startup (`TLS ready ... ca_sha256=`) before going near the
+phone — if they differ, the CLI found a different `TLS_DIR` than the daemon and
+is serving the wrong CA.
+
+Open the URL in **Safari** on the phone, then:
 
 - Settings › Profile Downloaded › Install
 - Settings › General › About › Certificate Trust Settings › switch photobackup on
@@ -95,7 +163,7 @@ The server stops serving after one download.
 **2. Pair.**
 
 ```sh
-sudo -u photod photobackup pair
+photobackup-admin pair
 ```
 
 Type the eight-character code into the app's Pairing section. It is good for ten
@@ -105,7 +173,7 @@ never expires.
 **3. Check.**
 
 ```sh
-sudo -u photod photobackup devices
+photobackup-admin devices
 ```
 
 ### When the app cannot connect
@@ -118,22 +186,65 @@ In order of likelihood:
 | everything times out | firewalld — port 8787 is not open |
 | pairing works, uploads 426 | the app is on an `http://` address; it reached the read-only listener |
 | worked at home, fails away | the Tailscale address is not in the certificate — `photobackup ca` lists what is |
+| the CA is installed *and* trusted, and pairing still fails as unreachable | the CA on the phone is not the one photod serves with; compare the fingerprint against `ca_sha256` in photod's startup log |
 
 iOS reports a rejected certificate and a dead host identically, which is why the
 first two look the same from the phone. Rule the firewall out from the server
 first: `curl -sk https://<lan-ip>:8787/health`.
 
+## Starting over
+
+`photobackup reset` erases the archive and leaves pairing intact:
+
+```sh
+sudo systemctl stop photod
+photobackup-admin reset --dry-run   # what would go
+photobackup-admin reset             # asks for confirmation
+sudo systemctl start photod
+```
+
+It empties `assets`, `device_assets` and `jobs`, then removes `blobs/`,
+`manifest.jsonl`, `incoming/` and everything under `DERIVATIVES_ROOT`. The
+`devices` and `pairing_codes` tables and the CA under `TLS_DIR` are untouched, so
+every paired phone keeps its token and does not have to be paired again.
+
+All four stores go together because any one of them left behind would undo the
+others: `reindex` rebuilds the database from `manifest.jsonl`, so emptying
+Postgres alone means the next reindex puts the entire library straight back.
+
+Two guards. It refuses to run while something is listening on `LISTEN_ADDR` or
+`PLAINTEXT_ADDR` — stop photod first, or pass `--force` if that socket is not
+this archive's daemon. And it refuses outright if `TLS_DIR` sits inside anything
+it would remove, which is the configuration where a reset would take `ca.key`
+with it and silently unpair every device.
+
+There is no undo. Once the manifest is gone, nothing can reconstruct what was
+archived — that is the point of the confirmation prompt, and `--yes` skips it
+only for a scripted rebuild.
+
+> **The phone will not re-upload on its own.** The app keeps its own queue in
+> `photobackup-queue.db` and marks finished items `done` permanently, so after a
+> server-side reset it reports a complete backup and sends nothing. Until the
+> server is the authority on what has been backed up, clearing that queue on the
+> phone is a separate step.
+
 ## What is still open
 
-The gallery's read endpoints have no authentication. Anyone who can reach
-photod's plaintext listener can page the whole archive and download originals,
-which is why `PLAINTEXT_ADDR` defaults to `127.0.0.1` and why 8788 stays out of
-the firewall. Phase 5 closed the write path; the read path is a known,
-deliberate gap.
+The read endpoints are authenticated on 8787 and open on 8788. A phone reads the
+gallery with the same device token it uploads with; the Next app reads without
+one, over loopback, which is what keeps a browser from having to trust a private
+CA to draw a thumbnail.
 
-A device token can never cross the network in the clear regardless — the
-plaintext listener does not serve pairing or any authenticated route, so widening
-it exposes the archive but never a credential.
+So 8788 is now the only unauthenticated way into the archive, and everything that
+protects it is the fact that it is bound to `127.0.0.1` and left out of the
+firewall. Widening `PLAINTEXT_ADDR` puts the whole archive on the LAN for anyone
+who asks. It still cannot leak a credential — the plaintext listener serves
+neither pairing nor any authenticated route — but it is no longer a gap shared
+with the port the phone dials.
+
+`/health` is unauthenticated on both, on purpose: the app pings a remembered
+address to see whether it still answers, which it has to be able to do before it
+has a token and after one has been revoked.
 
 ## Media tooling
 
@@ -191,10 +302,20 @@ journalctl -u photod -f
 curl -s localhost:8788/health                        # the plaintext read listener
 curl -s --cacert /var/lib/photod/tls/ca.crt https://localhost:8787/health
 
-sudo -u photod photobackup verify          # fast: stat only
-sudo -u photod photobackup verify --deep   # slow: re-hashes the whole archive
+# The gallery reads without a token only on 8788. On 8787 they answer 401.
+curl -s localhost:8788/v1/timeline?limit=1
+curl -si --cacert /var/lib/photod/tls/ca.crt https://localhost:8787/v1/timeline | head -1
+
+photobackup-admin verify                  # fast: stat only
+photobackup-admin verify --deep           # slow: re-hashes the whole archive
+photobackup-admin verify --retry-failed   # put jobs that gave up back in the queue
 systemctl list-timers photobackup-verify
 ```
+
+`--retry-failed` is deliberately not part of `--fix`, which the weekly timer
+runs: a job in this state has already spent every attempt it was given, so
+retrying it is a judgement about what changed — a new binary, a codec that was
+missing before. Automatic, it would regrind the same impossible file forever.
 
 `photobackup verify` exit codes, so the timer's failure means something:
 

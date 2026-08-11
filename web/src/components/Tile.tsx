@@ -4,6 +4,7 @@ import { useState } from "react";
 
 import { thumbUrl, type TimelineItem } from "@/lib/api";
 import { formatDuration } from "@/lib/format";
+import { cn } from "@/lib/utils";
 
 interface Props {
   item: TimelineItem;
@@ -32,14 +33,14 @@ export function Tile({ item, size, onOpen }: Props) {
   return (
     <button
       type="button"
-      className="tile"
+      className="group relative block flex-none overflow-hidden rounded-md bg-tile focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
       style={{ width: size, height: size }}
       onClick={() => onOpen(item.id)}
       aria-label={`${label} taken ${new Date(item.taken_at).toLocaleString()}`}
     >
       {attempt ? (
         <img
-          className="tileImage"
+          className="block size-full object-cover transition-[filter] group-hover:brightness-[1.08]"
           src={thumbUrl(item.id)}
           alt=""
           loading="lazy"
@@ -48,13 +49,20 @@ export function Tile({ item, size, onOpen }: Props) {
           onError={() => setBroken(true)}
         />
       ) : (
-        <span className={`tilePlaceholder ${broken ? "isBroken" : "isPending"}`}>
+        <span
+          className={cn(
+            "flex size-full items-center justify-center",
+            broken
+              ? "text-faint"
+              : "animate-shimmer bg-[linear-gradient(100deg,var(--tile)_30%,var(--tile-sheen)_50%,var(--tile)_70%)] bg-[length:200%_100%] motion-reduce:animate-none",
+          )}
+        >
           {broken ? <BrokenGlyph /> : null}
         </span>
       )}
 
       {item.kind === "video" ? (
-        <span className="tileVideo">
+        <span className="absolute right-1.5 bottom-[5px] flex items-center gap-[3px] text-[11px] tabular-nums text-white [text-shadow:0_1px_3px_rgb(0_0_0/0.7)]">
           <PlayGlyph />
           {item.duration ? <span>{formatDuration(item.duration)}</span> : null}
         </span>

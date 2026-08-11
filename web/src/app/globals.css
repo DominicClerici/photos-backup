@@ -1,510 +1,140 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* The app is dark-only, so the dark palette lives directly on :root and there is
+   no second light block to keep in sync. <html> still carries `class="dark"`
+   because the shadcn components ship `dark:` variants of their own — without the
+   class those never match and the components render their light-mode surfaces
+   against a dark background.
+
+   These are the gallery's original colours mapped onto shadcn's token names, so
+   an off-the-shelf Button or Badge lands in the same palette as the rest of the
+   UI rather than shadcn's neutral grey. */
 :root {
-  --bg: #0b0b0d;
-  --bg-raised: #16161a;
-  --bg-tile: #1c1c21;
-  --line: #26262d;
-  --text: #ececed;
-  --text-dim: #9a9aa4;
-  --text-faint: #6a6a74;
-  --accent: #6ea8fe;
-  --danger: #f0755f;
-  --radius: 6px;
   color-scheme: dark;
+  --radius: 0.625rem;
+
+  --background: #0b0b0d;
+  --foreground: #ececed;
+  --card: #16161a;
+  --card-foreground: #ececed;
+  --popover: #16161a;
+  --popover-foreground: #ececed;
+  --primary: #6ea8fe;
+  --primary-foreground: #0b0b0d;
+  --secondary: #1c1c21;
+  --secondary-foreground: #ececed;
+  --muted: #1c1c21;
+  --muted-foreground: #9a9aa4;
+  /* shadcn's --accent is the hover surface for menus and list rows, not a brand
+     colour. The gallery's blue is --primary/--ring; putting it here would tint
+     every dropdown hover. */
+  --accent: #1c1c21;
+  --accent-foreground: #ececed;
+  --destructive: #f0755f;
+  --border: #26262d;
+  --input: #26262d;
+  --ring: #6ea8fe;
+
+  --chart-1: #6ea8fe;
+  --chart-2: #9a9aa4;
+  --chart-3: #6a6a74;
+  --chart-4: #26262d;
+  --chart-5: #1c1c21;
+
+  --sidebar: #16161a;
+  --sidebar-foreground: #ececed;
+  --sidebar-primary: #6ea8fe;
+  --sidebar-primary-foreground: #0b0b0d;
+  --sidebar-accent: #1c1c21;
+  --sidebar-accent-foreground: #ececed;
+  --sidebar-border: #26262d;
+  --sidebar-ring: #6ea8fe;
+
+  /* App surfaces with no shadcn equivalent. */
+  --faint: #6a6a74;
+  --tile: #1c1c21;
+  --tile-sheen: #24242b;
+  --viewer: #08080a;
 }
 
-* {
-  box-sizing: border-box;
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: var(--font-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+
+  --color-faint: var(--faint);
+  --color-tile: var(--tile);
+  --color-tile-sheen: var(--tile-sheen);
+  --color-viewer: var(--viewer);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
 }
 
-html,
-body {
-  margin: 0;
-  padding: 0;
-  height: 100%;
-  background: var(--bg);
-  color: var(--text);
-  font-family:
-    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
-    sans-serif;
-  -webkit-font-smoothing: antialiased;
-}
+@theme {
+  --animate-shimmer: shimmer 1.4s linear infinite;
 
-button {
-  font: inherit;
-  color: inherit;
-  background: none;
-  border: 0;
-  padding: 0;
-  cursor: pointer;
-}
-
-a {
-  color: var(--accent);
-}
-
-/* ---------- shell ---------- */
-
-.app {
-  display: flex;
-  flex-direction: column;
-  height: 100dvh;
-}
-
-.appBar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 0 16px;
-  height: 52px;
-  flex: 0 0 auto;
-  border-bottom: 1px solid var(--line);
-  background: var(--bg-raised);
-}
-
-.appBar h1 {
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  margin: 0;
-}
-
-.appCount {
-  font-size: 13px;
-  color: var(--text-faint);
-}
-
-.chipGroup {
-  display: flex;
-  gap: 8px;
-  margin-left: auto;
-}
-
-.chip {
-  font-size: 12px;
-  padding: 3px 9px;
-  border-radius: 999px;
-  border: 1px solid var(--line);
-  color: var(--text-dim);
-  white-space: nowrap;
-}
-
-.chip.isWorking {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
-}
-
-.chip.isError {
-  margin-left: auto;
-  color: var(--danger);
-  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
-}
-
-/* ---------- timeline ---------- */
-
-.timeline {
-  position: relative;
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-.scroller {
-  height: 100%;
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding: 0 12px 64px;
-  overscroll-behavior-y: contain;
-}
-
-.canvas {
-  position: relative;
-  width: 100%;
-}
-
-/* Rows are positioned by transform rather than `top`: the browser can skip
-   layout entirely when only a transform changes, which matters when every
-   scroll frame repositions a screenful of them. */
-.dayHeader,
-.tileRow {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  will-change: transform;
-}
-
-.dayHeader {
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
-  padding-bottom: 10px;
-}
-
-.dayHeader h2 {
-  font-size: 15px;
-  font-weight: 600;
-  margin: 0;
-}
-
-.dayHeader span {
-  font-size: 12px;
-  color: var(--text-faint);
-}
-
-.tileRow {
-  display: flex;
-}
-
-.floatingDay {
-  position: absolute;
-  top: 10px;
-  left: 22px;
-  z-index: 5;
-  padding: 5px 12px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text);
-  background: color-mix(in srgb, var(--bg-raised) 88%, transparent);
-  border: 1px solid var(--line);
-  backdrop-filter: blur(8px);
-  pointer-events: none;
-}
-
-/* ---------- tiles ---------- */
-
-.tile {
-  position: relative;
-  display: block;
-  flex: 0 0 auto;
-  overflow: hidden;
-  border-radius: var(--radius);
-  background: var(--bg-tile);
-}
-
-.tile:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-.tileImage {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-.tile:hover .tileImage {
-  filter: brightness(1.08);
-}
-
-.tilePlaceholder {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-  height: 100%;
-}
-
-.tilePlaceholder.isPending {
-  background: linear-gradient(
-    100deg,
-    var(--bg-tile) 30%,
-    #24242b 50%,
-    var(--bg-tile) 70%
-  );
-  background-size: 200% 100%;
-  animation: shimmer 1.4s linear infinite;
-}
-
-.tilePlaceholder.isBroken {
-  color: var(--text-faint);
-}
-
-@keyframes shimmer {
-  to {
-    background-position: -200% 0;
+  @keyframes shimmer {
+    to {
+      background-position: -200% 0;
+    }
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .tilePlaceholder.isPending {
-    animation: none;
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
   }
-}
-
-.tileVideo {
-  position: absolute;
-  right: 6px;
-  bottom: 5px;
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  color: #fff;
-  text-shadow: 0 1px 3px rgb(0 0 0 / 0.7);
-}
-
-/* ---------- notices ---------- */
-
-.notice {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  padding: 28px 12px;
-  font-size: 14px;
-  color: var(--text-dim);
-}
-
-.notice.isQuiet {
-  color: var(--text-faint);
-  font-size: 13px;
-}
-
-.notice.isError {
-  color: var(--danger);
-}
-
-.notice button {
-  padding: 4px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  color: var(--text);
-}
-
-/* ---------- viewer ---------- */
-
-.viewer {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
-  display: flex;
-  flex-direction: column;
-  background: #08080a;
-}
-
-.viewerBar {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 0 14px;
-  height: 52px;
-  flex: 0 0 auto;
-  color: var(--text-dim);
-}
-
-.viewerBar button,
-.viewerBar a {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border-radius: var(--radius);
-  color: var(--text-dim);
-}
-
-.viewerBar button:hover,
-.viewerBar a:hover,
-.viewerBar button[aria-pressed="true"] {
-  background: var(--bg-raised);
-  color: var(--text);
-}
-
-.viewerCount {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  min-width: 0;
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
-}
-
-.viewerCount em {
-  font-style: normal;
-  color: var(--text-faint);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.viewerActions {
-  display: flex;
-  gap: 4px;
-  margin-left: auto;
-}
-
-.viewerStage {
-  position: relative;
-  flex: 1 1 auto;
-  min-height: 0;
-  display: flex;
-  /* Stretch, not center: the media wrapper needs a definite height for the
-     image's own max-height to resolve against. Centering it here would leave
-     the wrapper auto-height, percentages would resolve to nothing, and a tall
-     photo would render at full size and overflow the screen. */
-  align-items: stretch;
-  justify-content: center;
-  padding: 0 12px 16px;
-  transition: margin 140ms ease-out;
-}
-
-.viewerMedia {
-  position: relative;
-  flex: 1 1 auto;
-  min-width: 0;
-  min-height: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-/* The panel sits over the photo, so give the photo back the space it takes. */
-.viewer.hasPanel .viewerStage {
-  margin-right: 320px;
-}
-
-.viewerImage,
-.viewerVideo {
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-  transition: opacity 120ms ease-out;
-}
-
-.viewerNav {
-  position: absolute;
-  top: 50%;
-  translate: 0 -50%;
-  display: grid;
-  place-items: center;
-  width: 46px;
-  height: 46px;
-  border-radius: 999px;
-  color: var(--text-dim);
-  background: color-mix(in srgb, var(--bg-raised) 70%, transparent);
-}
-
-.viewerNav:hover {
-  color: var(--text);
-  background: var(--bg-raised);
-}
-
-.viewerNav.isPrev {
-  left: 14px;
-}
-
-.viewerNav.isNext {
-  right: 14px;
-  rotate: 180deg;
-}
-
-.viewerSpinner {
-  position: absolute;
-  width: 26px;
-  height: 26px;
-  border: 2px solid var(--line);
-  border-top-color: var(--text-dim);
-  border-radius: 50%;
-  animation: spin 700ms linear infinite;
-}
-
-@keyframes spin {
-  to {
-    rotate: 360deg;
+  html {
+    @apply h-full font-sans;
   }
-}
-
-.viewerFallback {
-  max-width: 420px;
-  text-align: center;
-  color: var(--text-dim);
-  font-size: 14px;
-  line-height: 1.5;
-}
-
-.viewerFallbackWhy {
-  color: var(--text-faint);
-  font-size: 13px;
-}
-
-/* ---------- metadata panel ---------- */
-
-.panel {
-  position: absolute;
-  top: 52px;
-  right: 0;
-  bottom: 0;
-  width: 320px;
-  padding: 18px 20px 28px;
-  overflow-y: auto;
-  background: var(--bg-raised);
-  border-left: 1px solid var(--line);
-}
-
-.panel h3 {
-  margin: 0 0 16px;
-  font-size: 14px;
-  font-weight: 600;
-  overflow-wrap: anywhere;
-}
-
-.panel dl {
-  margin: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.panelRow dt {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-faint);
-  margin-bottom: 3px;
-}
-
-.panelRow dd {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.4;
-  overflow-wrap: anywhere;
-}
-
-.panelHint {
-  display: block;
-  font-size: 11px;
-  color: var(--text-faint);
-  margin-top: 2px;
-}
-
-.panelEmpty {
-  font-size: 13px;
-  color: var(--text-faint);
-}
-
-.panel code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-  color: var(--text-dim);
-}
-
-@media (max-width: 700px) {
-  .panel {
-    top: auto;
-    left: 0;
-    width: 100%;
-    max-height: 55%;
-    border-left: 0;
-    border-top: 1px solid var(--line);
+  body {
+    @apply h-full bg-background text-foreground antialiased;
   }
-
-  .viewer.hasPanel .viewerStage {
-    margin-right: 0;
-    margin-bottom: 55%;
-  }
-
-  .viewerNav {
-    display: none;
+  /* Browsers default buttons to the arrow cursor and Tailwind's preflight keeps
+     that. shadcn offers this as its `--pointer` init option; the gallery has
+     always used the hand, so turn it on. */
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    @apply cursor-pointer;
   }
 }

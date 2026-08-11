@@ -18,6 +18,23 @@ import {
   formatDuration,
   mapLink,
 } from "@/lib/format";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+
+/** The bar's controls are 34px, between shadcn's icon (32px) and icon-lg (36px). */
+const BAR_BUTTON = "size-[34px] text-muted-foreground";
+
+const NAV_BUTTON =
+  "absolute top-1/2 grid size-[46px] -translate-y-1/2 place-items-center rounded-full bg-card/70 text-muted-foreground hover:bg-card hover:text-foreground max-[700px]:hidden";
+
+const MEDIA =
+  "max-h-full max-w-full object-contain transition-opacity duration-[120ms] ease-out";
+
+/** Sidebar on a wide screen, bottom sheet under 700px. */
+const PANEL =
+  "absolute top-13 right-0 bottom-0 w-80 overflow-y-auto border-l bg-card px-5 pt-[18px] pb-7 max-[700px]:top-auto max-[700px]:left-0 max-[700px]:max-h-[55%] max-[700px]:w-full max-[700px]:border-t max-[700px]:border-l-0";
+
+const PANEL_HINT = "mt-[2px] block text-[11px] text-faint";
 
 interface Props {
   items: TimelineItem[];
@@ -104,39 +121,75 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
 
   return (
     <div
-      className={`viewer${panelOpen ? " hasPanel" : ""}`}
+      className="fixed inset-0 z-50 flex flex-col bg-viewer"
       role="dialog"
       aria-modal="true"
       aria-label="Photo viewer"
     >
-      <div className="viewerBar">
-        <button type="button" onClick={onClose} aria-label="Close viewer">
+      <div className="flex h-13 flex-none items-center gap-3.5 px-3.5 text-muted-foreground">
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className={BAR_BUTTON}
+          onClick={onClose}
+          aria-label="Close viewer"
+        >
           <CloseGlyph />
-        </button>
-        <span className="viewerCount">
+        </Button>
+        <span className="flex min-w-0 items-baseline gap-3 text-[13px] tabular-nums">
           {index + 1} of {items.length}
-          {detail ? <em>{detail.filename}</em> : null}
+          {detail ? (
+            <em className="truncate not-italic text-faint">{detail.filename}</em>
+          ) : null}
         </span>
-        <span className="viewerActions">
-          <button
+        <span className="ml-auto flex gap-1">
+          <Button
             type="button"
+            variant="ghost"
+            size="icon"
+            className={cn(
+              BAR_BUTTON,
+              "aria-pressed:bg-muted aria-pressed:text-foreground",
+            )}
             onClick={() => setPanelOpen((open) => !open)}
             aria-pressed={panelOpen}
             aria-label="Toggle details"
           >
             <InfoGlyph />
-          </button>
-          <a href={originalUrl(item.id)} download aria-label="Download original">
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className={BAR_BUTTON}
+            aria-label="Download original"
+            // The download is a real link, so it must stay an <a>. Base UI warns
+            // unless it is told the rendered element is not a native button —
+            // same as shadcn's own PaginationLink.
+            nativeButton={false}
+            render={<a href={originalUrl(item.id)} download />}
+          >
             <DownloadGlyph />
-          </a>
+          </Button>
         </span>
       </div>
 
-      <div className="viewerStage" onClick={onClose}>
+      <div
+        // Stretch, not center: the media wrapper needs a definite height for the
+        // image's own max-height to resolve against. Centering it here would leave
+        // the wrapper auto-height, percentages would resolve to nothing, and a tall
+        // photo would render at full size and overflow the screen.
+        className={cn(
+          "relative flex min-h-0 flex-1 items-stretch justify-center px-3 pb-4 transition-[margin] duration-[140ms] ease-out",
+          // The panel sits over the photo, so give the photo back the space it takes.
+          panelOpen && "mr-80 max-[700px]:mr-0 max-[700px]:mb-[55%]",
+        )}
+        onClick={onClose}
+      >
         {hasPrev ? (
           <button
             type="button"
-            className="viewerNav isPrev"
+            className={cn(NAV_BUTTON, "left-3.5")}
             aria-label="Previous"
             onClick={(e) => {
               e.stopPropagation();
@@ -147,17 +200,22 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
           </button>
         ) : null}
 
-        <div className="viewerMedia" onClick={(e) => e.stopPropagation()}>
+        <div
+          className="relative flex min-h-0 min-w-0 flex-1 items-center justify-center"
+          onClick={(e) => e.stopPropagation()}
+        >
           {item.kind === "video" ? (
             <VideoStage item={item} />
           ) : (
             <>
-              {!loaded ? <span className="viewerSpinner" /> : null}
+              {!loaded ? (
+                <span className="absolute size-[26px] animate-spin rounded-full border-2 border-border border-t-muted-foreground [animation-duration:700ms]" />
+              ) : null}
               {/* The preview renders straight from the blob, so it works even
                   while the thumbnail job is still queued. */}
               <img
                 key={item.id}
-                className="viewerImage"
+                className={MEDIA}
                 src={previewUrl(item.id)}
                 alt={detail?.filename ?? ""}
                 onLoad={() => setLoaded(true)}
@@ -170,7 +228,7 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
         {hasNext ? (
           <button
             type="button"
-            className="viewerNav isNext"
+            className={cn(NAV_BUTTON, "right-3.5 rotate-180")}
             aria-label="Next"
             onClick={(e) => {
               e.stopPropagation();
@@ -192,7 +250,7 @@ function VideoStage({ item }: { item: TimelineItem }) {
     return (
       <video
         key={item.id}
-        className="viewerVideo"
+        className={MEDIA}
         src={playbackUrl(item.id)}
         poster={item.state === "ready" ? thumbUrl(item.id) : undefined}
         controls
@@ -204,16 +262,16 @@ function VideoStage({ item }: { item: TimelineItem }) {
 
   const failed = item.playback_state === "failed";
   return (
-    <div className="viewerFallback">
+    <div className="max-w-[420px] text-center text-sm leading-normal text-muted-foreground">
       <p>
         {failed
           ? "This video could not be converted for playback."
           : "Preparing a version this browser can play…"}
       </p>
-      <p className="viewerFallbackWhy">
+      <p className="text-[13px] text-faint">
         The original is stored untouched and can always be downloaded.
       </p>
-      <a href={originalUrl(item.id)} download>
+      <a className="text-primary" href={originalUrl(item.id)} download>
         Download original
       </a>
     </div>
@@ -223,8 +281,8 @@ function VideoStage({ item }: { item: TimelineItem }) {
 function MetadataPanel({ detail }: { detail: AssetDetail | null }) {
   if (!detail) {
     return (
-      <aside className="panel">
-        <p className="panelEmpty">Loading details…</p>
+      <aside className={PANEL}>
+        <p className="text-[13px] text-faint">Loading details…</p>
       </aside>
     );
   }
@@ -239,19 +297,21 @@ function MetadataPanel({ detail }: { detail: AssetDetail | null }) {
     reported != null && Math.abs(reported.getTime() - taken.getTime()) > 60_000;
 
   return (
-    <aside className="panel">
-      <h3>{detail.filename}</h3>
+    <aside className={PANEL}>
+      <h3 className="mb-4 text-sm font-semibold [overflow-wrap:anywhere]">
+        {detail.filename}
+      </h3>
 
-      <dl>
+      <dl className="flex flex-col gap-3.5">
         <Row label="Taken">
           {capture.text}
-          <span className="panelHint">{capture.zone}</span>
+          <span className={PANEL_HINT}>{capture.zone}</span>
         </Row>
 
         {disagrees && reported ? (
           <Row label="Phone reported">
             {reported.toLocaleString()}
-            <span className="panelHint">differs from the file&rsquo;s own time</span>
+            <span className={PANEL_HINT}>differs from the file&rsquo;s own time</span>
           </Row>
         ) : null}
 
@@ -271,6 +331,7 @@ function MetadataPanel({ detail }: { detail: AssetDetail | null }) {
         {detail.gps_lat != null && detail.gps_lon != null ? (
           <Row label="Location">
             <a
+              className="text-primary"
               href={mapLink(detail.gps_lat, detail.gps_lon)}
               target="_blank"
               rel="noreferrer"
@@ -283,7 +344,9 @@ function MetadataPanel({ detail }: { detail: AssetDetail | null }) {
         <Row label="Size">{formatBytes(detail.byte_size)}</Row>
         <Row label="Uploaded">{new Date(detail.uploaded_at).toLocaleString()}</Row>
         <Row label="SHA-256">
-          <code title={detail.sha256}>{detail.sha256.slice(0, 16)}…</code>
+          <code className="font-mono text-xs text-muted-foreground" title={detail.sha256}>
+            {detail.sha256.slice(0, 16)}…
+          </code>
         </Row>
       </dl>
     </aside>
@@ -292,9 +355,11 @@ function MetadataPanel({ detail }: { detail: AssetDetail | null }) {
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="panelRow">
-      <dt>{label}</dt>
-      <dd>{children}</dd>
+    <div>
+      <dt className="mb-[3px] text-[11px] tracking-[0.06em] text-faint uppercase">
+        {label}
+      </dt>
+      <dd className="text-[13px] leading-[1.4] [overflow-wrap:anywhere]">{children}</dd>
     </div>
   );
 }

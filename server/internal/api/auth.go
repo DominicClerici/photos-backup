@@ -66,6 +66,20 @@ func (s *Server) requireDevice(next deviceHandler) http.HandlerFunc {
 	}
 }
 
+// requireToken guards a route that needs the caller to be a paired device but
+// has no use for which one — the read path, where every device sees the same
+// archive.
+//
+// It is requireDevice with the identity dropped rather than a second
+// implementation, so revocation, an unrecognised token and a database outage all
+// answer identically on both paths, and so the rule that a device id only ever
+// reaches the database through a deviceHandler still holds.
+func (s *Server) requireToken(next http.HandlerFunc) http.HandlerFunc {
+	return s.requireDevice(func(w http.ResponseWriter, r *http.Request, _ devices.Device) {
+		next(w, r)
+	})
+}
+
 // handlePair exchanges a pairing code for a device token. It is served only on
 // the TLS listener, so the token it returns cannot be handed out in the clear.
 func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {

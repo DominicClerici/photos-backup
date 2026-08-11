@@ -1,0 +1,35 @@
+#!/bin/sh
+# photobackup, run as the photod user with the daemon's own environment.
+#
+# The CLI reads its configuration from the environment exactly as photod does,
+# and EnvironmentFile= in the unit is the only thing that loads photod.env. A
+# bare `sudo -u photod photobackup ...` therefore gets config.FromEnv's
+# fallbacks: ./data/photos relative to the current directory, and the
+# development database URL. Two of those fail without looking like failure —
+# `ca` mints a second, unrelated CA, and `verify` gives an all-clear from an
+# empty archive.
+#
+# systemd-run reads the env file as root before dropping to photod, so the
+# database password never reaches a command line or `ps`.
+#
+#   sudo install -m 0755 deploy/photobackup-admin /usr/local/bin/
+#
+# Usage: photobackup-admin <pair|devices|ca|verify|export|reindex|reset> [args...]
+
+set -eu
+
+ENV_FILE=${PHOTOD_ENV:-/etc/photod/photod.env}
+
+if [ ! -r "$ENV_FILE" ] && [ "$(id -u)" -ne 0 ]; then
+	# Readable only by root:photod, so this check is advisory when unprivileged.
+	sudo test -r "$ENV_FILE" || {
+		echo "photobackup-admin: cannot read $ENV_FILE — is photod installed?" >&2
+		exit 1
+	}
+fi
+
+exec sudo systemd-run --pty --quiet --collect \
+	--uid=photod --gid=photod \
+	--property="EnvironmentFile=$ENV_FILE" \
+	--property=WorkingDirectory=/ \
+	/usr/local/bin/photobackup "$@"

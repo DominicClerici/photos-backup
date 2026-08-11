@@ -212,14 +212,12 @@ func (h *harness) upload(t *testing.T, body []byte, overrides map[string]string)
 	return resp
 }
 
+// get reads through the TLS handler, carrying the device token — since Phase 6
+// the read path wants one there. Clearing h.token is how a test asks for an
+// anonymous read.
 func (h *harness) get(t *testing.T, path string) *http.Response {
 	t.Helper()
-	resp, err := h.server.Client().Get(h.server.URL + path)
-	if err != nil {
-		t.Fatalf("GET %s: %v", path, err)
-	}
-	t.Cleanup(func() { resp.Body.Close() })
-	return resp
+	return h.getWith(t, path, nil)
 }
 
 // blobFiles lists committed blobs, ignoring the staging directory.
@@ -274,7 +272,7 @@ func loadNamedFixture(t *testing.T, name string) []byte {
 }
 
 // getWith issues a GET carrying extra headers, for the conditional-request
-// tests.
+// tests, plus the device token.
 func (h *harness) getWith(t *testing.T, path string, headers map[string]string) *http.Response {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, h.server.URL+path, nil)
@@ -284,12 +282,22 @@ func (h *harness) getWith(t *testing.T, path string, headers map[string]string) 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	h.authorize(req)
 	resp, err := h.server.Client().Do(req)
 	if err != nil {
 		t.Fatalf("GET %s: %v", path, err)
 	}
 	t.Cleanup(func() { resp.Body.Close() })
 	return resp
+}
+
+// plaintext starts the read-only listener the browser gallery uses, so a test
+// can assert what is readable without a token.
+func (h *harness) plaintext(t *testing.T) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(h.srv.PlaintextHandler())
+	t.Cleanup(ts.Close)
+	return ts
 }
 
 func (h *harness) postJSON(t *testing.T, path, body string) *http.Response {

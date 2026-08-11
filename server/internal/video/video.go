@@ -13,7 +13,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -135,30 +138,124 @@ func (t *Tool) Probe(ctx context.Context, src string) (Info, error) {
 func (t *Tool) PosterFrame(ctx context.Context, src, dst string, info Info) error {
 	// Seek a little way in. The first frame of a phone video is often the
 	// shutter still rising, so it is darker and blurrier than anything after it.
-	seek := 1.0
-	if info.DurationSeconds > 0 && info.DurationSeconds < 2 {
+	//
+	// An unknown duration is precisely when that seek cannot be justified, so it
+	// is not attempted: Probe reports 0 when neither the stream nor the format
+	// carries one, and a blind 1s seek into a clip that might be shorter buys a
+	// marginally better frame at the risk of no frame at all.
+	seek := 0.0
+	switch {
+	case info.DurationSeconds >= 2:
+		seek = 1.0
+	case info.DurationSeconds > 0:
 		seek = info.DurationSeconds / 2
 	}
 
-	cmd := exec.CommandContext(ctx, t.ffmpeg(),
-		"-nostdin", "-y",
-		"-v", "error",
+	err := t.posterAt(ctx, src, dst, seek)
+	if err != nil && seek > 0 && errors.Is(err, ErrNoFrame) {
+		// The seek overshot a clip shorter than it claimed to be. A first frame
+		// that is slightly dark beats a gallery tile that never appears.
+		return t.posterAt(ctx, src, dst, 0)
+	}
+	return err
+}
+
+// ErrNoFrame marks the case where ffmpeg was run but no usable still came out
+// of it, which is recoverable by seeking differently. A failure to run at all is
+// not, and does not carry this.
+//
+// It is exported because the distinction matters to the caller too: a container
+// ffmpeg can describe but not decode should cost a thumbnail, not the asset.
+var ErrNoFrame = errors.New("no frame was written")
+
+// ErrNotPlayable is Transcode's equivalent — ffmpeg ran and left behind
+// something no browser will play.
+var ErrNotPlayable = errors.New("no playable video was written")
+
+func (t *Tool) posterAt(ctx context.Context, src, dst string, seek float64) error {
+	args := []string{"-nostdin", "-y", "-v", "error"}
+	if seek > 0 {
 		// Before -i, so ffmpeg seeks by keyframe instead of decoding forward to
 		// the timestamp. On a 3GB clip that is the difference between instant
 		// and minutes.
-		"-ss", strconv.FormatFloat(seek, 'f', 3, 64),
-		"-i", src,
-		"-frames:v", "1",
-		"-q:v", "2",
-		dst,
-	)
+		args = append(args, "-ss", strconv.FormatFloat(seek, 'f', 3, 64))
+	}
+	args = append(args, "-i", src, "-frames:v", "1", "-q:v", "2", dst)
+
+	cmd := exec.CommandContext(ctx, t.ffmpeg(), args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("extract poster frame from %s: %w: %s", src, err, bytes.TrimSpace(stderr.Bytes()))
+	runErr := cmd.Run()
+	// stderr is worth keeping even when ffmpeg claims success, because the
+	// interesting failures here are the ones where it does.
+	complaint := strings.TrimSpace(stderr.String())
+
+	// Whether the frame arrived matters more than what ffmpeg exited with, and
+	// the two disagree in both directions. A seek past the last frame exits 234
+	// on one build and 0 on another, and exiting 0 having written nothing
+	// usable is the case that surfaced as an ImageMagick parse error two
+	// subprocesses later, naming neither ffmpeg nor the offset that caused it.
+	if err := checkJPEG(dst); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("extract poster frame from %s at %.3fs: %w", src, seek, ctx.Err())
+		}
+		return fmt.Errorf("extract poster frame from %s at %.3fs: %w (ffmpeg %s; stderr: %s)",
+			src, seek, err, exitStatus(runErr), orNone(complaint))
+	}
+	if runErr != nil {
+		return fmt.Errorf("extract poster frame from %s at %.3fs: %w: %s", src, seek, runErr, complaint)
 	}
 	return nil
+}
+
+func exitStatus(err error) string {
+	if err == nil {
+		return "exited 0"
+	}
+	return err.Error()
+}
+
+// checkJPEG rejects the empty and truncated files ffmpeg leaves behind on the
+// failures it does not report. It is a shape check, not a decode: anything that
+// gets past it is ImageMagick's problem, and ImageMagick reports it well.
+func checkJPEG(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrNoFrame, err)
+	}
+	defer f.Close()
+
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrNoFrame, err)
+	}
+	if size == 0 {
+		return fmt.Errorf("%w: the file is empty", ErrNoFrame)
+	}
+
+	var head [2]byte
+	if _, err := f.ReadAt(head[:], 0); err != nil || head != [2]byte{0xFF, 0xD8} {
+		return fmt.Errorf("%w: %d bytes that do not start as a JPEG", ErrNoFrame, size)
+	}
+
+	// The end-of-image marker is what a truncated write loses, and losing it is
+	// exactly what ImageMagick calls "insufficient image data".
+	tail := make([]byte, min(size, 16))
+	if _, err := f.ReadAt(tail, size-int64(len(tail))); err != nil {
+		return fmt.Errorf("%w: %w", ErrNoFrame, err)
+	}
+	if !bytes.Contains(tail, []byte{0xFF, 0xD9}) {
+		return fmt.Errorf("%w: %d bytes ending without a JPEG end-of-image marker", ErrNoFrame, size)
+	}
+	return nil
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
 }
 
 // Transcode writes an H.264/AAC MP4 that any browser can play.
@@ -198,8 +295,43 @@ func (t *Tool) Transcode(ctx context.Context, src, dst string, info Info) error 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("transcode %s: %w: %s", src, err, bytes.TrimSpace(stderr.Bytes()))
+	runErr := cmd.Run()
+	complaint := strings.TrimSpace(stderr.String())
+
+	// Same reasoning as posterAt, and a worse outcome if skipped: an ffmpeg that
+	// exits 0 having encoded nothing leaves a rendition that is marked ready and
+	// plays nothing, which is a failure disguised as a success.
+	if err := t.checkPlayable(ctx, dst); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("transcode %s: %w", src, ctx.Err())
+		}
+		return fmt.Errorf("transcode %s: %w (ffmpeg %s; stderr: %s)", src, err, exitStatus(runErr), orNone(complaint))
+	}
+	if runErr != nil {
+		return fmt.Errorf("transcode %s: %w: %s", src, runErr, complaint)
+	}
+	return nil
+}
+
+// checkPlayable asks ffprobe what a browser would find in the transcode. A
+// shape check is not enough here: a container with a correct header and a track
+// carrying no samples is exactly what the failure looks like.
+func (t *Tool) checkPlayable(ctx context.Context, path string) error {
+	stat, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrNotPlayable, err)
+	}
+	if stat.Size() == 0 {
+		return fmt.Errorf("%w: the file is empty", ErrNotPlayable)
+	}
+
+	info, err := t.Probe(ctx, path)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrNotPlayable, err)
+	}
+	if info.Width == 0 || info.Height == 0 || info.DurationSeconds <= 0 {
+		return fmt.Errorf("%w: %d bytes describing a %dx%d track of %.3fs",
+			ErrNotPlayable, stat.Size(), info.Width, info.Height, info.DurationSeconds)
 	}
 	return nil
 }

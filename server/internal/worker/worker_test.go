@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -110,6 +111,35 @@ func TestMetadataJobPostersAVideoAndQueuesTheTranscode(t *testing.T) {
 	}
 	if job.AssetID != asset.ID {
 		t.Errorf("queued playback for %s, want %s", job.AssetID, asset.ID)
+	}
+}
+
+// A video ffprobe can describe but ffmpeg cannot decode keeps its metadata and
+// its place in the timeline. The original is archived and verified either way,
+// so the cost is a tile, not the asset — and no transcode is queued, because it
+// would only fail five times and park.
+func TestMetadataJobKeepsAVideoItCannotDecode(t *testing.T) {
+	h := newHarness(t)
+	asset := h.ingest(t, "undecodable.mov", db.MediaVideo)
+
+	h.claimAndRun(t, jobs.KindMetadata)
+
+	got := h.reload(t, asset.ID)
+	if got.DerivedState != db.DerivedReady {
+		t.Fatalf("DerivedState = %q, want ready — the metadata that was readable is still worth keeping", got.DerivedState)
+	}
+	if got.Width == nil || *got.Width != 640 {
+		t.Errorf("Width = %v, want the 640 ffprobe read from the header", got.Width)
+	}
+	if h.Derivatives.Exists(asset.SHA256, derivstore.Thumb) {
+		t.Error("a thumbnail exists for a file no frame could be decoded from")
+	}
+
+	if got.PlaybackState != db.PlaybackNone {
+		t.Errorf("PlaybackState = %q, want %q", got.PlaybackState, db.PlaybackNone)
+	}
+	if _, err := h.Queue.Claim(context.Background(), []jobs.Kind{jobs.KindPlayback}, "t"); !errors.Is(err, jobs.ErrNoJob) {
+		t.Errorf("Claim = %v, want ErrNoJob — nothing should be queued for a video with no decodable frames", err)
 	}
 }
 

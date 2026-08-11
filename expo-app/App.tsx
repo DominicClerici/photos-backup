@@ -14,6 +14,8 @@ import {
 
 import { DEFAULT_MAX_ITEMS, loadConfig, saveConfig, type Config } from './src/config';
 import { resolveServer, type ServerResolution } from './src/discovery';
+import { checkGalleryAccess, type CheckResult } from './src/gallery/check';
+import { GalleryClient } from './src/gallery/client';
 import { clearCredential, loadCredential, pair, type Credential } from './src/pairing';
 import { DEFAULT_GATE, NO_GATE, readConditions } from './src/sync/conditions';
 import { DEFAULT_ENGINE_CONFIG, SyncEngine } from './src/sync/engine';
@@ -57,12 +59,23 @@ export default function App() {
   const [deviceName, setDeviceName] = useState('iPhone');
   const [pairing, setPairing] = useState(false);
   const [pairError, setPairError] = useState<string | null>(null);
+  const [galleryCheck, setGalleryCheck] = useState<CheckResult | null>(null);
+  const [checkingGallery, setCheckingGallery] = useState(false);
 
   // The transport reads both of these on every request, so a re-resolved address
   // or a fresh pairing takes effect without rebuilding the engine mid-run.
   const serverUrl = useRef<string>(config.serverUrl);
   const deviceToken = useRef<string | null>(null);
   const engine = useRef<SyncEngine | null>(null);
+
+  // Built once and kept, for the same reason the transport is: it reads the
+  // address and the token per request, so it survives both changing under it.
+  const gallery = useRef(
+    new GalleryClient(
+      () => serverUrl.current,
+      () => deviceToken.current
+    )
+  );
 
   useEffect(() => {
     loadCredential()
@@ -156,6 +169,29 @@ export default function App() {
     await clearCredential();
     setCredential(null);
     deviceToken.current = null;
+    setGalleryCheck(null);
+  }, []);
+
+  /**
+   * Proves this phone can read the archive, and that an unpaired one cannot.
+   *
+   * Scaffolding for the in-app gallery rather than the gallery itself: the
+   * dashboard grows in the browser first and gets ported here, so what needs to
+   * exist now is the connection it will be ported onto, with evidence that it
+   * works and is closed to everyone else.
+   *
+   * Deliberately free of side effects, unlike the sync engine's handling of the
+   * same 401. A diagnostic that threw away the keychain entry when it did not
+   * like an answer would be a poor diagnostic; this reports and leaves the
+   * Forget button to the person reading it.
+   */
+  const runGalleryCheck = useCallback(async () => {
+    setCheckingGallery(true);
+    try {
+      setGalleryCheck(await checkGalleryAccess(gallery.current));
+    } finally {
+      setCheckingGallery(false);
+    }
   }, []);
 
   const start = useCallback(
@@ -337,6 +373,48 @@ export default function App() {
                 rejected certificate and a dead host identically.
               </Text>
             </>
+          )}
+        </Section>
+
+        <Section title="Gallery access">
+          <Text style={styles.muted}>
+            The archive's read path now wants the same device token uploads carry, so
+            browsing it from this phone needs no second credential. This checks that end
+            to end before any of the gallery is built on it.
+          </Text>
+          <Pressable
+            style={[styles.button, (!credential || checkingGallery) && styles.buttonDisabled]}
+            onPress={() => void runGalleryCheck()}
+            disabled={!credential || checkingGallery}
+          >
+            <Text style={styles.buttonText}>
+              {checkingGallery ? 'Checking…' : 'Check gallery access'}
+            </Text>
+          </Pressable>
+          {!credential && <Text style={styles.muted}>Pair this phone first.</Text>}
+
+          {galleryCheck?.steps.map((step) => (
+            <View key={step.label} style={styles.checkRow}>
+              <Text style={step.ok ? styles.good : styles.bad}>{step.ok ? '✓' : '✗'}</Text>
+              <View style={styles.grow}>
+                <Text style={styles.checkLabel}>{step.label}</Text>
+                <Text style={styles.muted}>{step.detail}</Text>
+              </View>
+            </View>
+          ))}
+
+          {galleryCheck?.unauthorized && (
+            <Text style={styles.warning}>
+              The server refused this phone's token. It has probably been revoked with{' '}
+              <Text style={styles.code}>photobackup devices --revoke</Text> — forget the
+              pairing above and pair again with a fresh code.
+            </Text>
+          )}
+          {galleryCheck && !galleryCheck.ok && !galleryCheck.unauthorized && (
+            <Text style={styles.warning}>
+              Something in the read path is not as it should be. A failure on the last step
+              in particular means photod is answering callers that hold no token.
+            </Text>
           )}
         </Section>
 
@@ -541,6 +619,8 @@ const styles = StyleSheet.create({
   count: { alignItems: 'center' },
   countValue: { color: '#eee', fontSize: 18, fontWeight: '600' },
   countLabel: { color: '#777', fontSize: 11 },
+  checkRow: { flexDirection: 'row', gap: 8, alignItems: 'flex-start' },
+  checkLabel: { color: '#ddd', fontSize: 13 },
   failedRow: { borderTopWidth: 1, borderTopColor: '#2a2a2a', paddingTop: 6 },
   failedName: { color: '#ddd', fontSize: 13 },
   logLine: { color: '#8a8a8a', fontSize: 11, fontFamily: 'Menlo' },

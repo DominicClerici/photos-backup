@@ -10,6 +10,7 @@ import (
 
 	"github.com/dominicclerici/photos-backup/server/internal/db"
 	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
+	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/verify"
 )
@@ -283,6 +284,39 @@ func TestStaleUploadsAreSweptAndFreshOnesAreLeft(t *testing.T) {
 	}
 	if _, err := os.Stat(fresh); err != nil {
 		t.Error("an upload that could still be in flight was swept")
+	}
+}
+
+// --fix reports a parked job and leaves it parked; --retry-failed is what puts
+// it back. The split exists because the weekly timer runs --fix, and a job that
+// already spent every attempt would otherwise be reground forever.
+func TestRetryFailedRequeuesAParkedJobAndFixDoesNot(t *testing.T) {
+	ctx := context.Background()
+	a := newArchive(t)
+	asset := a.add(t, "IMG_0002.MOV", fixture(t, "clip.mov"), time.Date(2025, 3, 1, 12, 0, 0, 0, time.UTC))
+
+	if err := jobs.Enqueue(ctx, a.deps.Store.Pool(), jobs.KindMetadata, asset.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	// Parked directly. How a job spends its attempts is the queue's business;
+	// what is under test is what verify does once one has.
+	if _, err := a.deps.Store.Pool().Exec(ctx,
+		`update jobs set state = 'failed', attempts = $1, last_error = $2 where asset_id = $3::uuid`,
+		jobs.DefaultMaxAttempts, "no frame was written", asset.ID); err != nil {
+		t.Fatalf("park the job: %v", err)
+	}
+
+	fixed := a.run(t, verify.Options{Fix: true})
+	if f := one(t, fixed, verify.DerivativeFailed); f.Fixed {
+		t.Error("--fix requeued a parked job; that belongs to --retry-failed")
+	}
+
+	retried := a.run(t, verify.Options{RetryFailed: true})
+	if f := one(t, retried, verify.DerivativeFailed); !f.Fixed {
+		t.Fatal("--retry-failed did not requeue the parked job")
+	}
+	if _, err := a.deps.Queue.Claim(ctx, []jobs.Kind{jobs.KindMetadata}, "t"); err != nil {
+		t.Errorf("the requeued job was not claimable: %v", err)
 	}
 }
 

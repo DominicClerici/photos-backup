@@ -55,6 +55,12 @@ photod and skip the proxy — worth doing when several thousand thumbnails would
 otherwise stream through Node. Leaving it unset uses the proxy, which always
 works.
 
+Point it at 8788, never 8787. Since Phase 6 the TLS listener authenticates its
+read path, and a browser cannot put a bearer token on an `<img>` — the tiles
+would all 401. That limit is the browser's alone: the phone puts the header on
+every rendition, which is why the app reads the archive over 8787 and needs no
+signed URLs.
+
 Next's `<Image>` is deliberately unused. It exists to resize arbitrary source
 images at the edge; photod already emits a thumbnail at exactly the size the
 grid wants, and routing it through the optimizer would add a hop to re-encode
