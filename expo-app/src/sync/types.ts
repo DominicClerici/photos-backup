@@ -162,8 +162,19 @@ export interface MediaSource {
  * mark a whole library failed. `server` is a 5xx, which counts against both.
  * `item` is this item's problem — a 4xx, a rejected digest, an original that
  * would not resolve.
+ *
+ * `unauthorized` is neither. The server is healthy and the item is fine; this
+ * phone is not allowed to write. Retrying cannot help and backoff would only
+ * delay saying so, so it ends the run instead of being charged to anything —
+ * without it, a revoked token would quietly walk the whole library into `failed`
+ * five attempts at a time.
  */
-export type FailureKind = 'unreachable' | 'server' | 'item';
+export type FailureKind = 'unreachable' | 'server' | 'item' | 'unauthorized';
+
+/** True when a failure means this device needs pairing again. */
+export function isUnauthorized(e: unknown): boolean {
+  return e instanceof SyncError && e.kind === 'unauthorized';
+}
 
 export class SyncError extends Error {
   constructor(

@@ -6,15 +6,29 @@ Next.js App Router, rendered entirely on the client.
 ## Running
 
 ```sh
-cd ../server && go run ./cmd/photod    # the API, on :8787
+cd ../server && go run ./cmd/photod    # HTTPS on :8787, read path on :8788
 pnpm install
 pnpm dev                               # http://localhost:3000
 ```
 
 | variable | default | meaning |
 |---|---|---|
-| `PHOTOD_URL` | `http://localhost:8787` | where `/api/*` is proxied |
+| `PHOTOD_URL` | `http://localhost:8788` | where `/api/*` is proxied |
 | `NEXT_PUBLIC_MEDIA_BASE` | unset — use the proxy | origin for thumbnails, previews, and video |
+
+Since Phase 5, photod serves `:8787` over **HTTPS** with a certificate it signs
+itself, and puts the gallery's read endpoints on a second plaintext listener at
+`127.0.0.1:8788`, which is what `PHOTOD_URL` now defaults to. Anything pointed at
+`:8787` needs the CA: every `/api/*` request fails its certificate check, and `<img>` tags
+pointed at `https://…:8787` show broken images in any browser that has not been
+taught to trust the CA. The plaintext listener exists precisely so the gallery
+does not have to be: it serves the read path and `/health` and nothing else, and
+photod refuses every credential-carrying endpoint on it.
+
+Reaching the gallery from another machine on the LAN means either installing
+photod's CA in that browser, or setting `PLAINTEXT_ADDR=:8788` on the server —
+which puts the whole archive within reach of anyone on the network, because the
+read path has no authentication yet. `deploy/README.md` spells out that trade.
 
 Both are read at **build** time, not at start time. `rewrites()` is evaluated by
 `next build` and frozen into `.next/routes-manifest.json`, so setting

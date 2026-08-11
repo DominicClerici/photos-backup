@@ -7,15 +7,19 @@
 // could not answer for, upload only what was asked for, and resume a large
 // video rather than restart it. If the two ever diverge, this one is wrong.
 //
-//	go run ./cmd/loadgen -root ../PHOTOS_TEST -server http://localhost:8787
+//	photobackup pair                       # take the code
+//	PHOTOBACKUP_TOKEN=pbk_... go run ./cmd/loadgen -root ../PHOTOS_TEST
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -26,6 +30,9 @@ import (
 type options struct {
 	root       string
 	server     string
+	token      string
+	caFile     string
+	insecure   bool
 	deviceID   string
 	workers    int
 	checkBatch int
@@ -41,8 +48,15 @@ func main() {
 	var opt options
 
 	flag.StringVar(&opt.root, "root", "../PHOTOS_TEST", "directory of originals to upload")
-	flag.StringVar(&opt.server, "server", "http://localhost:8787", "photod base URL")
-	flag.StringVar(&opt.deviceID, "device-id", "loadgen", "device id to upload as")
+	flag.StringVar(&opt.server, "server", "https://localhost:8787", "photod base URL")
+	flag.StringVar(&opt.token, "token", os.Getenv("PHOTOBACKUP_TOKEN"),
+		"device token from `photobackup pair` (or set PHOTOBACKUP_TOKEN)")
+	flag.StringVar(&opt.caFile, "ca", os.Getenv("PHOTOBACKUP_CA"),
+		"photod's CA certificate, so its self-signed TLS validates (or set PHOTOBACKUP_CA)")
+	flag.BoolVar(&opt.insecure, "insecure", false,
+		"skip TLS verification entirely; for a throwaway run against a server whose CA is not to hand")
+	flag.StringVar(&opt.deviceID, "device-id", "",
+		"device id to upload as; empty means whichever device the token names, which is what the phone does")
 	flag.IntVar(&opt.workers, "concurrency", 3, "simultaneous uploads, matching the app's default")
 	flag.IntVar(&opt.checkBatch, "check-batch", 200, "items per sync/check request")
 	flag.Int64Var(&opt.threshold, "chunk-threshold", 64<<20, "size at which an upload becomes resumable")
@@ -59,8 +73,17 @@ func main() {
 }
 
 func run(opt options) error {
+	if opt.token == "" {
+		return errors.New("a device token is required: run `photobackup pair`, then set -token or PHOTOBACKUP_TOKEN")
+	}
+	tlsConfig, err := clientTLS(opt)
+	if err != nil {
+		return err
+	}
+
 	c := &client{
-		base: strings.TrimRight(opt.server, "/"),
+		base:  strings.TrimRight(opt.server, "/"),
+		token: opt.token,
 		http: &http.Client{
 			Timeout: 0, // a 550MB upload on a slow link is not a stalled one
 			Transport: &http.Transport{
@@ -68,6 +91,7 @@ func run(opt options) error {
 				// A backfill is thousands of sequential requests to one host;
 				// letting connections lapse would mean a handshake per photo.
 				IdleConnTimeout: 90 * time.Second,
+				TLSClientConfig: tlsConfig,
 			},
 		},
 	}
@@ -316,4 +340,33 @@ func bytesOf(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTP"[exp])
+}
+
+// clientTLS builds the trust configuration for talking to photod.
+//
+// photod signs its own certificate, so a client either trusts that CA or does
+// not verify at all. The middle option — trusting the system roots and hoping —
+// is the one that does not exist, which is worth knowing before spending an
+// afternoon on an x509 error.
+func clientTLS(opt options) (*tls.Config, error) {
+	if opt.insecure {
+		fmt.Fprintln(os.Stderr, "warning: -insecure, so nothing is verifying which server these photos are going to")
+		return &tls.Config{InsecureSkipVerify: true}, nil
+	}
+	if opt.caFile == "" {
+		if strings.HasPrefix(opt.server, "https://") {
+			return nil, errors.New("https needs photod's CA: pass -ca (see `photobackup ca`), or -insecure to skip verification")
+		}
+		return nil, nil
+	}
+
+	pem, err := os.ReadFile(opt.caFile)
+	if err != nil {
+		return nil, fmt.Errorf("read CA %s: %w", opt.caFile, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("%s holds no PEM certificate", opt.caFile)
+	}
+	return &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}, nil
 }

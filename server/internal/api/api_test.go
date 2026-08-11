@@ -168,9 +168,16 @@ func TestGetMalformedAssetIDReturnsNotFound(t *testing.T) {
 	}
 }
 
-// The archive must outlive the index: if Postgres is gone the bytes are still
-// committed to disk, and the phone is told to retry rather than told success.
-func TestUploadWithDatabaseDownKeepsBlobAndReportsUnavailable(t *testing.T) {
+// With Postgres gone the write path closes, because authenticating a device
+// reads it.
+//
+// This is a deliberate change from Phase 4, where the same request stored its
+// blob and then failed to index it. Nothing is lost either way — the phone never
+// gets an ack, so the item stays queued and the bytes arrive when the database
+// does — and the alternative is caching tokens in memory, which would buy an
+// early blob write at the cost of a revoked device still being able to upload
+// for as long as the cache held it. Refusing is the cheaper answer.
+func TestUploadWithDatabaseDownIsRefused(t *testing.T) {
 	h := newHarness(t)
 	content := loadFixture(t)
 	h.store.Close()
@@ -180,11 +187,13 @@ func TestUploadWithDatabaseDownKeepsBlobAndReportsUnavailable(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
-	if blobs := h.blobFiles(t); len(blobs) != 1 {
-		t.Errorf("blob tree holds %d files, want the upload to be durable: %v", len(blobs), blobs)
+	// And it fails before touching the disk, so there is no half-committed
+	// upload to reconcile later.
+	if blobs := h.blobFiles(t); len(blobs) != 0 {
+		t.Errorf("blob tree holds %v, want nothing: the request never got past authentication", blobs)
 	}
-	if entries := h.manifestEntries(t); len(entries) != 1 {
-		t.Errorf("manifest holds %d lines, want 1 so the row is recoverable", len(entries))
+	if entries := h.manifestEntries(t); len(entries) != 0 {
+		t.Errorf("manifest holds %d lines, want none", len(entries))
 	}
 }
 

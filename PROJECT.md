@@ -204,8 +204,18 @@ determines that cheaply.
 ### Pairing and transport
 
 The server prints a pairing code. The app submits it once and receives a
-long-lived device token, stored hashed server-side. The server self-signs a TLS
-certificate on first run; the app pins it at pairing (trust on first use).
+long-lived device token, stored hashed server-side and kept in the iOS keychain
+on the phone. The server issues its own CA and server certificate on first run.
+
+**Trust is established out of band, not pinned at pairing.** The original plan was
+trust on first use — pin the self-signed certificate when the code is redeemed —
+and it cannot be built: iOS gives JavaScript no way to override TLS trust
+evaluation. `fetch` and `expo-file-system`'s `File.upload()` both run on
+NSURLSession, neither exposes a trust delegate to JS, and `NSAllowsLocalNetworking`
+permits plaintext HTTP without touching certificate validation. Pinning would
+mean reimplementing the upload path in Swift, including the streaming-from-PhotoKit
+call Phase 0 proved. So the CA is installed on the phone once instead, and every
+existing code path works unchanged. Phase 5 has the details.
 
 The app resolves the server via mDNS (`_photobackup._tcp`) on the LAN and falls
 back to the Tailscale address when away. No ports are exposed to the internet.
@@ -215,6 +225,8 @@ back to the Tailscale address when away. No ports are exposed to the internet.
 | Condition | Result |
 |---|---|
 | Server unreachable | Queue holds, retries with backoff, nothing lost |
+| Device token revoked | Run stops at once, nothing marked failed, app asks to pair |
+| Database down | Write path refuses; queue holds, bytes arrive when it returns |
 | ML service down | Search degrades to EXIF/date; backup unaffected |
 | Hash mismatch | Temp discarded, item retried |
 | Upload interrupted | Resumes from last acked offset |
@@ -306,6 +318,60 @@ lease is the only reason it counts for much.
 Deferred deliberately: pairing, device tokens, and TLS. §6 describes them and no
 phase owned them; they are their own phase now, after the pipe is proven.
 
+### Phase 5 — Pairing, device tokens, TLS
+
+The write path is closed. Everything that can change the archive requires a
+device token over TLS; the gallery's read path is deliberately left open.
+
+**The design changed on contact with iOS.** §6 planned trust on first use, and it
+is not buildable in JavaScript — see the note there. What replaced it is a mini-CA
+the server runs for itself: a ten-year CA installed on the phone once, signing a
+disposable leaf. Nothing native, no domain, no third party, and every existing
+request path works untouched.
+
+The split between the two certificates is what makes it maintainable. The leaf is
+reissued whenever the machine's set of addresses changes or its expiry comes into
+view, and swapped in through `GetCertificate` without a restart. That exists for a
+specific failure: a DHCP lease handing the machine a new address, or a Tailscale
+interface that comes up after photod started, would otherwise leave the phone
+dialling an address the certificate does not cover — and the away-from-home half
+of the setup is the half nobody tests. The CA never moves, so the phone is never
+touched again.
+
+Three things the phase settled that were not obvious going in:
+
+**A device id the client picks is a label, not an identity.** The app used to
+generate `ios-a3f9x2` and send it in a header. Every device id that reaches the
+database now comes from the token, and a header that disagrees is a 403 rather
+than a silent correction. Upload sessions inherit the same scoping: a session id
+is `sha256(deviceId, localId, md5, size)`, so a second paired device that knew
+what the first was uploading could otherwise resume, commit, or abort it.
+
+**A revoked token needed its own failure kind.** The sync engine blames a failure
+on the server, on the transport, or on the item. A 401 is none of those — the
+server is answering perfectly and the item is fine — and charged to items it would
+walk the entire library into `failed`, five attempts each, over something one
+pairing fixes. It ends the run instead, marks nothing, and the app drops the dead
+credential so the pairing form is what appears rather than a Start button that
+cannot work.
+
+**Closing the write path cost a Phase 4 property.** Authenticating reads Postgres,
+so a database outage now refuses uploads outright, where before the blob landed
+and only the indexing failed. Nothing is lost — the phone never gets an ack and
+retries — and the alternative was caching tokens in memory, which buys an early
+blob write in exchange for a revoked device that keeps working for as long as the
+cache holds. Refusing is the cheaper answer, and it is written down because it is
+a deliberate regression rather than an oversight.
+
+Deferred deliberately, and the reason it is worth naming: **the gallery has no
+authentication.** `/v1/timeline`, `/v1/assets/*` and `/v1/jobs` are open to
+anyone who can reach them. The obstacle is not the login form, it is that
+PROJECT.md points `<img>` and `<video>` straight at photod to skip the proxy hop,
+and a cookie is not sent cross-origin — so closing it means either giving up that
+optimization or minting HMAC-signed media URLs into the timeline JSON. It is a
+real gap, in the same category as the single drive: accepted, known, and written
+down rather than discovered.
+
 ### v2
 
 - **ML service.** Python, CLIP semantic search, then face detection and clustering.
@@ -343,7 +409,20 @@ Cheap to verify now, annoying to discover in Phase 3.
 **6. Battery and heat.** Pushing 100GB will heat the phone significantly. Bulk
 backfill should be gated on charging + Wi-Fi by default, with a manual override.
 
-**7. Single drive.** The archive lives in exactly one place. The blob layout is
+**7. Unauthenticated gallery.** Phase 5 closed the write path and left the read
+path open. Anyone who can reach photod's plaintext listener can page the whole
+archive and download originals, which is why that listener is bound to loopback by
+default. A device token can never cross it — pairing and every authenticated
+route are absent from its routing table, so widening it exposes photos but never a
+credential. Accepted for now; it is what stands between this and putting the
+gallery on the internet, which §4 keeps as an option.
+
+**8. Losing `ca.key`.** It is the one file whose loss means physically re-pairing
+every device, and the one whose disclosure lets somebody impersonate the archive
+to a phone that trusts it. Mode 0600 in a 0700 directory on the SSD, and
+deliberately not on the archive drive that gets rsynced elsewhere.
+
+**9. Single drive.** The archive lives in exactly one place. The blob layout is
 deliberately rsync-friendly and `photobackup verify` detects bit rot, so adding a
 second drive or an encrypted offsite target later requires no code changes. Until
 then, this is an accepted, known risk.

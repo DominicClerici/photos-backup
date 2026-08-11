@@ -47,7 +47,7 @@ func TestArchivedAssetNeedsNoDigestOnTheNextRun(t *testing.T) {
 
 			// Round one of the sync protocol: no digest, nothing hashed.
 			got := h.checkOK(t, syncCheckRequest{
-				DeviceID: "iphone-14-pro",
+				DeviceID: h.deviceID,
 				Items:    []syncCheckItem{{LocalID: localID, ModifiedAt: &modified}},
 			})
 			if got[localID].Status != statusHave {
@@ -75,7 +75,7 @@ func TestEditedAssetIsStillRecheckedByContent(t *testing.T) {
 
 	edited := original.Add(time.Hour)
 	got := h.checkOK(t, syncCheckRequest{
-		DeviceID: "iphone-14-pro",
+		DeviceID: h.deviceID,
 		Items:    []syncCheckItem{{LocalID: localID, ModifiedAt: &edited}},
 	})
 	if got[localID].Status != statusUnknown {
@@ -104,7 +104,7 @@ func TestCoarserTimestampIsADifferentInstant(t *testing.T) {
 	}
 
 	got := h.checkOK(t, syncCheckRequest{
-		DeviceID: "iphone-14-pro",
+		DeviceID: h.deviceID,
 		Items:    []syncCheckItem{{LocalID: localID, ModifiedAt: &precise}},
 	})
 	if got[localID].Status != statusUnknown {
@@ -130,7 +130,7 @@ func TestSubMillisecondDriftIsNotAnEdit(t *testing.T) {
 
 	jittered := stored.Add(999 * time.Nanosecond)
 	got := h.checkOK(t, syncCheckRequest{
-		DeviceID: "iphone-14-pro",
+		DeviceID: h.deviceID,
 		Items:    []syncCheckItem{{LocalID: localID, ModifiedAt: &jittered}},
 	})
 	if got[localID].Status != statusHave {

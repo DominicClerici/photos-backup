@@ -16,6 +16,32 @@ import (
 type client struct {
 	base string
 	http *http.Client
+	// token is a device token from `photobackup pair`, exactly as the phone
+	// holds one. It is not a test affordance: the write path has no
+	// unauthenticated entrance, and giving this client a private one would make
+	// it stop being a stand-in for the app.
+	token string
+}
+
+// post issues a JSON POST carrying the device token.
+func (c *client) post(path string, body []byte) (*http.Response, error) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(http.MethodPost, c.base+path, reader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.authorize(req)
+	return c.http.Do(req)
+}
+
+func (c *client) authorize(req *http.Request) {
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 }
 
 type checkItem struct {
@@ -37,7 +63,7 @@ func (c *client) check(deviceID string, items []checkItem) ([]checkResult, error
 		return nil, err
 	}
 
-	resp, err := c.http.Post(c.base+"/v1/sync/check", "application/json", bytes.NewReader(payload))
+	resp, err := c.post("/v1/sync/check", payload)
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +115,7 @@ func (c *client) uploadSingle(deviceID string, item *item) (outcome, error) {
 	req.Header.Set("X-Photo-Size", fmt.Sprint(item.size))
 	req.Header.Set("X-Photo-Device-Id", deviceID)
 	req.Header.Set("X-Photo-Local-Id", item.localID)
+	c.authorize(req)
 	if item.capturedAt != nil {
 		req.Header.Set("X-Photo-Captured-At", item.capturedAt.UTC().Format(time.RFC3339Nano))
 	}
@@ -178,7 +205,7 @@ func (c *client) beginSession(deviceID string, item *item) (session, error) {
 		return session{}, err
 	}
 
-	resp, err := c.http.Post(c.base+"/v1/uploads", "application/json", bytes.NewReader(payload))
+	resp, err := c.post("/v1/uploads", payload)
 	if err != nil {
 		return session{}, err
 	}
@@ -205,6 +232,7 @@ func (c *client) putChunk(s session, f *os.File, start, end, total int64) (sessi
 	req.ContentLength = end - start
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end-1, total))
+	c.authorize(req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -228,7 +256,7 @@ func (c *client) putChunk(s session, f *os.File, start, end, total int64) (sessi
 }
 
 func (c *client) commitSession(id string) (uploadResult, error) {
-	resp, err := c.http.Post(c.base+"/v1/uploads/"+id+"/commit", "application/json", nil)
+	resp, err := c.post("/v1/uploads/"+id+"/commit", nil)
 	if err != nil {
 		return uploadResult{}, err
 	}

@@ -11,7 +11,9 @@
       "bundleIdentifier": "com.dominicrumor.photobackup",
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "Connects to your photobackup server on the local network.",
-        "NSBonjourServices": ["_photobackup._tcp"],
+        "NSBonjourServices": [
+          "_photobackup._tcp"
+        ],
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
         }
@@ -33,7 +35,8 @@
           "isAccessMediaLocationEnabled": true
         }
       ],
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-secure-store"
     ],
     "experiments": {
       "reactCompiler": true

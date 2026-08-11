@@ -75,6 +75,10 @@ export async function scanForServer(timeoutMs: number = SCAN_MS): Promise<ScanOu
  * Prefers the IPv4 address over the advertised host name. The name resolves only
  * through mDNS, while the address is dialable immediately — and Phase 0 measured
  * the address as the faster of the two.
+ *
+ * https, because photod's upload path is TLS-only. Both the address and the
+ * advertised `.local` name are in the certificate photod issues itself, so
+ * either validates once the CA is installed.
  */
 function toDiscovered(service: ZeroconfService): Discovered | null {
   if (!service.port) return null;
@@ -82,7 +86,7 @@ function toDiscovered(service: ZeroconfService): Discovered | null {
   const host = addresses.find(isIPv4) ?? service.host;
   if (!host) return null;
   return {
-    url: `http://${host}:${service.port}`,
+    url: `https://${host}:${service.port}`,
     name: service.name,
     addresses,
   };
@@ -92,7 +96,15 @@ function isIPv4(address: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(address);
 }
 
-/** True when /health answers. Used to decide whether a remembered address still works. */
+/**
+ * True when /health answers. Used to decide whether a remembered address still
+ * works.
+ *
+ * /health needs no token, on purpose — this has to be answerable before the
+ * phone holds one. It does need TLS to validate, so a false here also covers "the
+ * CA is not installed", which is why the pairing screen says so rather than
+ * insisting the server is down.
+ */
 export async function isReachable(url: string, timeoutMs: number = HEALTH_TIMEOUT_MS): Promise<boolean> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);

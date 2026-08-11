@@ -13,6 +13,7 @@ import (
 
 	"github.com/dominicclerici/photos-backup/server/internal/blobstore"
 	"github.com/dominicclerici/photos-backup/server/internal/db"
+	"github.com/dominicclerici/photos-backup/server/internal/devices"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/mediatype"
 )
@@ -30,12 +31,17 @@ type uploadResponse struct {
 // Derivative work is queued inside the same transaction as the row, and this
 // handler returns without waiting for any of it. Upload throughput is never
 // behind ffmpeg.
-func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, device devices.Device) {
 	meta, err := parseUploadHeaders(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	deviceID, ok := s.deviceIDFor(w, meta.deviceID, device)
+	if !ok {
+		return
+	}
+	meta.deviceID = deviceID
 
 	// Classification has to happen before the blob is stored, because the
 	// content type decides the extension and the extension decides the path.
@@ -150,9 +156,10 @@ func parseUploadHeaders(r *http.Request) (uploadMeta, error) {
 	if m.md5, err = requiredHeader(r, "X-Photo-Md5"); err != nil {
 		return m, err
 	}
-	if m.deviceID, err = requiredHeader(r, "X-Photo-Device-Id"); err != nil {
-		return m, err
-	}
+	// Optional since Phase 5: the token names the device, and this header is
+	// only cross-checked against it. Still read, so a client that sends the
+	// wrong one is told rather than silently attributed correctly.
+	m.deviceID = strings.TrimSpace(r.Header.Get("X-Photo-Device-Id"))
 	if m.localID, err = requiredHeader(r, "X-Photo-Local-Id"); err != nil {
 		return m, err
 	}

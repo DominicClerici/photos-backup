@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dominicclerici/photos-backup/server/internal/blobstore"
+	"github.com/dominicclerici/photos-backup/server/internal/devices"
 	"github.com/dominicclerici/photos-backup/server/internal/mediatype"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
 )
@@ -45,7 +46,7 @@ type sessionResponse struct {
 // the declaration rather than allocated. A phone that was killed mid-video, and
 // therefore knows nothing about the transfer beyond the file it was sending,
 // asks this and is told how far it got.
-func (s *Server) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreateUpload(w http.ResponseWriter, r *http.Request, device devices.Device) {
 	if s.Uploads == nil {
 		writeError(w, http.StatusNotFound, "resumable uploads are not enabled on this server")
 		return
@@ -56,9 +57,16 @@ func (s *Server) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "malformed request body: "+err.Error())
 		return
 	}
+	// The authenticated id, not the declared one — it is part of what the
+	// session id is derived from, so this is also what scopes a session to the
+	// device that opened it.
+	deviceID, ok := s.deviceIDFor(w, req.DeviceID, device)
+	if !ok {
+		return
+	}
 
 	session, err := s.Uploads.Create(uploads.Declaration{
-		DeviceID:   req.DeviceID,
+		DeviceID:   deviceID,
 		LocalID:    req.LocalID,
 		Filename:   req.Filename,
 		MD5:        req.MD5,
@@ -79,8 +87,8 @@ func (s *Server) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sessionOf(session))
 }
 
-func (s *Server) handleUploadStatus(w http.ResponseWriter, r *http.Request) {
-	session, ok := s.session(w, r)
+func (s *Server) handleUploadStatus(w http.ResponseWriter, r *http.Request, device devices.Device) {
+	session, ok := s.session(w, r, device)
 	if !ok {
 		return
 	}
@@ -92,12 +100,14 @@ func (s *Server) handleUploadStatus(w http.ResponseWriter, r *http.Request) {
 // A chunk that starts anywhere other than the current offset is refused with
 // 409 and the real offset, so a client whose idea of progress has drifted
 // re-seeks instead of restarting a 550MB video.
-func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
-	if s.Uploads == nil {
-		writeError(w, http.StatusNotFound, "resumable uploads are not enabled on this server")
+func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request, device devices.Device) {
+	// Ownership is settled before a byte of the body is read, so a chunk aimed
+	// at another device's session is refused rather than absorbed.
+	existing, ok := s.session(w, r, device)
+	if !ok {
 		return
 	}
-	id := r.PathValue("id")
+	id := existing.ID
 
 	offset, err := chunkOffset(r)
 	if err != nil {
@@ -131,8 +141,8 @@ func (s *Server) handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 // handleCommitUpload turns a complete session into an archived asset. Past this
 // point the two upload paths are the same code: the blob is verified and
 // renamed into the tree, then finishUpload writes the manifest line and the row.
-func (s *Server) handleCommitUpload(w http.ResponseWriter, r *http.Request) {
-	session, ok := s.session(w, r)
+func (s *Server) handleCommitUpload(w http.ResponseWriter, r *http.Request, device devices.Device) {
+	session, ok := s.session(w, r, device)
 	if !ok {
 		return
 	}
@@ -180,12 +190,12 @@ func (s *Server) handleCommitUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleAbortUpload(w http.ResponseWriter, r *http.Request) {
-	if s.Uploads == nil {
-		writeError(w, http.StatusNotFound, "resumable uploads are not enabled on this server")
+func (s *Server) handleAbortUpload(w http.ResponseWriter, r *http.Request, device devices.Device) {
+	session, ok := s.session(w, r, device)
+	if !ok {
 		return
 	}
-	if err := s.Uploads.Discard(r.PathValue("id")); err != nil && !errors.Is(err, uploads.ErrNotFound) {
+	if err := s.Uploads.Discard(session.ID); err != nil && !errors.Is(err, uploads.ErrNotFound) {
 		s.logger().Error("discard upload session", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not discard the session")
 		return
@@ -193,7 +203,9 @@ func (s *Server) handleAbortUpload(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) session(w http.ResponseWriter, r *http.Request) (uploads.Session, bool) {
+// session loads the session named in the path, and only if the calling device is
+// the one that opened it.
+func (s *Server) session(w http.ResponseWriter, r *http.Request, device devices.Device) (uploads.Session, bool) {
 	if s.Uploads == nil {
 		writeError(w, http.StatusNotFound, "resumable uploads are not enabled on this server")
 		return uploads.Session{}, false
@@ -206,6 +218,9 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) (uploads.Sessio
 	case err != nil:
 		s.logger().Error("load upload session", "error", err)
 		writeError(w, http.StatusInternalServerError, "could not read the upload session")
+		return uploads.Session{}, false
+	}
+	if !s.ownedBy(w, session.Decl.DeviceID, device) {
 		return uploads.Session{}, false
 	}
 	return session, true

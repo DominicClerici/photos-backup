@@ -453,6 +453,7 @@ export class SyncEngine {
 
   private async blameBatch(items: QueueItem[], e: unknown): Promise<void> {
     const error = asSyncError(e, 'item');
+    this.abortIfUnauthorized(error);
     this.tripIfServerFault(error);
     if (error.kind === 'unreachable') return;
     for (const item of items) await this.penalize(item, error);
@@ -460,9 +461,26 @@ export class SyncEngine {
 
   private async blameItem(item: QueueItem, e: unknown): Promise<void> {
     const error = asSyncError(e, 'item');
+    this.abortIfUnauthorized(error);
     this.tripIfServerFault(error);
     if (error.kind === 'unreachable') return;
     await this.penalize(item, error);
+  }
+
+  /**
+   * Ends the run rather than charging anything for it.
+   *
+   * A revoked token fails every request identically. Backing off would waste an
+   * hour arriving at the same answer, and penalizing items would walk the entire
+   * library into `failed` — after which a re-pairing would fix the credential and
+   * leave forty thousand items parked, needing a manual retry to come back. So
+   * this throws: out of the item, out of drain(), out of run(), where the caller
+   * can say what actually happened and offer the one thing that helps.
+   */
+  private abortIfUnauthorized(error: SyncError): void {
+    if (error.kind !== 'unauthorized') return;
+    this.log(`the server refused this device: ${error.message}`);
+    throw error;
   }
 
   /**
@@ -471,6 +489,8 @@ export class SyncEngine {
    * a bad item.
    */
   private tripIfServerFault(error: SyncError): void {
+    // Deliberately not 'unauthorized': the server is answering perfectly well,
+    // and holding the breaker open would frame a pairing problem as an outage.
     if (error.kind !== 'unreachable' && error.kind !== 'server') return;
     const delay = this.breaker.trip();
     this.log(`server trouble (${error.message}) — holding for ${Math.round(delay / 1000)}s`);

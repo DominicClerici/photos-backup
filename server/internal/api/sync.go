@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/dominicclerici/photos-backup/server/internal/db"
+	"github.com/dominicclerici/photos-backup/server/internal/devices"
 )
 
 const (
@@ -49,10 +50,16 @@ type syncCheckResponse struct {
 	Results []syncCheckResult `json:"results"`
 }
 
-func (s *Server) handleSyncCheck(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSyncCheck(w http.ResponseWriter, r *http.Request, device devices.Device) {
 	var req syncCheckRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCheckBody)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "malformed request body: "+err.Error())
+		return
+	}
+	// The body's deviceId is no longer an identity claim, only a consistency
+	// check against the token that carried the request.
+	deviceID, ok := s.deviceIDFor(w, req.DeviceID, device)
+	if !ok {
 		return
 	}
 	if err := validateCheckRequest(req); err != nil {
@@ -64,9 +71,9 @@ func (s *Server) handleSyncCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := s.checkItems(r.Context(), req.DeviceID, req.Items)
+	results, err := s.checkItems(r.Context(), deviceID, req.Items)
 	if err != nil {
-		s.logger().Error("sync check", "error", err, "device_id", req.DeviceID)
+		s.logger().Error("sync check", "error", err, "device_id", deviceID)
 		writeError(w, http.StatusServiceUnavailable, "database unavailable")
 		return
 	}
@@ -74,9 +81,6 @@ func (s *Server) handleSyncCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateCheckRequest(req syncCheckRequest) error {
-	if strings.TrimSpace(req.DeviceID) == "" {
-		return fmt.Errorf("deviceId is required")
-	}
 	if len(req.Items) > maxCheckItems {
 		return fmt.Errorf("%d items exceeds the %d-item limit", len(req.Items), maxCheckItems)
 	}

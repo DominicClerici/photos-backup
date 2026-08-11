@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/db"
 	"github.com/dominicclerici/photos-backup/server/internal/derive"
 	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
+	"github.com/dominicclerici/photos-backup/server/internal/devices"
 	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
@@ -39,10 +42,17 @@ type harness struct {
 	server       *httptest.Server
 	store        *db.Store
 	srv          *Server
+	devices      *devices.Store
 	photosRoot   string
 	derivRoot    string
 	manifestPath string
-	nudges       atomic.Int64
+	// token and deviceID are a real pairing, redeemed through the real code
+	// path. The tests authenticate the way the phone does rather than through a
+	// door only they can use, so "does the write path require a token" is
+	// answered by every test in the package instead of by one of them.
+	token    string
+	deviceID string
+	nudges   atomic.Int64
 }
 
 // newHarness wires the real server against a real Postgres and a temp photos
@@ -79,6 +89,7 @@ func newHarness(t *testing.T) *harness {
 		derivRoot:    derivRoot,
 		manifestPath: manifestPath,
 	}
+	h.devices = devices.New(store.Pool())
 	h.srv = &Server{
 		Store:       store,
 		Blobs:       blobstore.New(root),
@@ -87,6 +98,7 @@ func newHarness(t *testing.T) *harness {
 		Converter:   derive.New(),
 		Queue:       jobs.NewQueue(store.Pool()),
 		Uploads:     uploads.New(filepath.Join(root, "incoming")),
+		Devices:     h.devices,
 		Nudge:       func() { h.nudges.Add(1) },
 		Log:         slog.New(slog.DiscardHandler),
 	}
@@ -95,7 +107,32 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(ts.Close)
 	h.server = ts
 
+	h.deviceID, h.token = h.pair(t, "test phone")
 	return h
+}
+
+// pair redeems a fresh code, returning the device id and its token.
+func (h *harness) pair(t *testing.T, name string) (deviceID, token string) {
+	t.Helper()
+	ctx := context.Background()
+
+	code, _, err := h.devices.CreateCode(ctx, time.Minute, "test")
+	if err != nil {
+		t.Fatalf("create pairing code: %v", err)
+	}
+	resp := h.postJSON(t, "/v1/pair", fmt.Sprintf(`{"code":%q,"name":%q,"platform":"test"}`, code, name))
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("pair returned %d: %s", resp.StatusCode, body)
+	}
+	var out struct{ DeviceID, Token string }
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode pair response: %v", err)
+	}
+	if out.Token == "" || out.DeviceID == "" {
+		t.Fatal("pairing returned no token or no device id")
+	}
+	return out.DeviceID, out.Token
 }
 
 // derive runs the real derivative pipeline for one asset, so the endpoints that
@@ -147,7 +184,7 @@ func (h *harness) upload(t *testing.T, body []byte, overrides map[string]string)
 		"X-Photo-Md5":         hex.EncodeToString(sum[:]),
 		"X-Photo-Size":        fmt.Sprint(len(body)),
 		"X-Photo-Captured-At": "2026-08-01T15:04:05Z",
-		"X-Photo-Device-Id":   "iphone-14-pro",
+		"X-Photo-Device-Id":   h.deviceID,
 		"X-Photo-Local-Id":    "B84E8479-475C-4727-A4A4-B77AA9980897/L0/001",
 	}
 	for k, v := range overrides {
@@ -162,6 +199,7 @@ func (h *harness) upload(t *testing.T, body []byte, overrides map[string]string)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
+	h.authorize(req)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -256,9 +294,28 @@ func (h *harness) getWith(t *testing.T, path string, headers map[string]string) 
 
 func (h *harness) postJSON(t *testing.T, path, body string) *http.Response {
 	t.Helper()
-	resp, err := h.server.Client().Post(h.server.URL+path, "application/json", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, h.server.URL+path, strings.NewReader(body))
 	if err != nil {
-		t.Fatalf("POST %s: %v", path, err)
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	h.authorize(req)
+	return h.do(t, req)
+}
+
+// authorize adds the harness's device token, unless the caller already set an
+// Authorization header — which is how the rejection tests send a bad one.
+func (h *harness) authorize(req *http.Request) {
+	if h.token != "" && req.Header.Get("Authorization") == "" {
+		req.Header.Set("Authorization", "Bearer "+h.token)
+	}
+}
+
+func (h *harness) do(t *testing.T, req *http.Request) *http.Response {
+	t.Helper()
+	resp, err := h.server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", req.Method, req.URL.Path, err)
 	}
 	t.Cleanup(func() { resp.Body.Close() })
 	return resp
@@ -306,5 +363,5 @@ func truncateAssets(t *testing.T, ctx context.Context, url string) {
 	defer conn.Close(ctx)
 	// Named rather than `cascade`, so a future table with a foreign key here has
 	// to be added deliberately instead of silently wiped.
-	_, _ = conn.Exec(ctx, "truncate table assets, device_assets, jobs")
+	_, _ = conn.Exec(ctx, "truncate table assets, device_assets, jobs, pairing_codes, devices")
 }

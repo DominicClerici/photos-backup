@@ -4,6 +4,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -21,6 +22,25 @@ type Config struct {
 	// rebuilt. On the archive machine they belong on different disks.
 	DerivativesRoot string
 	DatabaseURL     string
+
+	// TLSDir holds ca.crt, ca.key and the server certificate photod issues for
+	// itself. Empty means PhotosRoot/tls.
+	//
+	// Worth moving off the archive drive on a real deployment: ca.key is machine
+	// state, not part of the library, and it is the one file whose loss means
+	// re-pairing every device.
+	TLSDir string
+	// TLSExtraSANs are additional names or addresses to certify, beyond the ones
+	// photod can see from the inside. Comma-separated.
+	TLSExtraSANs []string
+	// TLSDisabled serves the API in the clear on ListenAddr, tokens and all.
+	// Development only, and photod says so loudly at startup.
+	TLSDisabled bool
+	// PlaintextAddr is a second, unencrypted listener carrying only the
+	// gallery's read endpoints and /health — no pairing, no upload path. It is
+	// how the Next app and a browser on this machine reach photod without having
+	// to trust a private CA. Empty disables it.
+	PlaintextAddr string
 
 	// MDNSInstance is the advertised service name. Empty means "derive it from
 	// the hostname".
@@ -67,6 +87,13 @@ func FromEnv() Config {
 		DerivativesRoot: os.Getenv("DERIVATIVES_ROOT"),
 		DatabaseURL:     or(os.Getenv("DATABASE_URL"), "postgres://photobackup:photobackup@localhost:5432/photobackup?sslmode=disable"),
 
+		TLSDir:       os.Getenv("TLS_DIR"),
+		TLSExtraSANs: list(os.Getenv("TLS_EXTRA_SANS")),
+		TLSDisabled:  truthy(os.Getenv("TLS_DISABLED")),
+		// Loopback by default. Widening it is a deliberate choice with a
+		// documented consequence: the read path has no authentication yet.
+		PlaintextAddr: or(os.Getenv("PLAINTEXT_ADDR"), "127.0.0.1:8788"),
+
 		MDNSInstance: os.Getenv("MDNS_INSTANCE"),
 		MDNSDisabled: truthy(os.Getenv("MDNS_DISABLED")),
 
@@ -112,6 +139,18 @@ func duration(v string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+// list splits a comma-separated setting, dropping blanks so a trailing comma is
+// not a configuration error.
+func list(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func or(v, fallback string) string {

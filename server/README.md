@@ -8,7 +8,8 @@ back as a browsable timeline.
 
 ```sh
 docker compose up -d                 # Postgres, from the repo root
-go run ./cmd/photod                  # migrations run at startup
+go run ./cmd/photod                  # migrations run at startup, TLS generates itself
+photobackup pair                     # a code to pair a device with
 ```
 
 photod serves no HTML. The gallery is the Next.js app in `../web`, which
@@ -16,7 +17,11 @@ proxies `/api/*` here; see its README to bring the browser side up.
 
 | variable | default | meaning |
 |---|---|---|
-| `LISTEN_ADDR` | `:8787` | bind address |
+| `LISTEN_ADDR` | `:8787` | bind address for the **HTTPS** listener |
+| `PLAINTEXT_ADDR` | `127.0.0.1:8788` | read-only listener, in the clear; empty disables it |
+| `TLS_DIR` | `$PHOTOS_ROOT/tls` | the CA and the server certificate |
+| `TLS_EXTRA_SANS` | unset | extra names or addresses to certify, comma-separated |
+| `TLS_DISABLED` | unset | serve everything in the clear; **development only** |
 | `PHOTOS_ROOT` | `./data/photos` | holds `blobs/` and `manifest.jsonl` |
 | `DERIVATIVES_ROOT` | `$PHOTOS_ROOT/derivatives` | thumbnails and playback files |
 | `DATABASE_URL` | local compose Postgres | Postgres connection string |
@@ -40,7 +45,13 @@ rebuilt from the blobs.
 
 ## Endpoints
 
+Everything under **auth** requires `Authorization: Bearer <device token>` and is
+served on the HTTPS listener only. Everything else is open, on both listeners.
+
 ```
+POST /v1/pair                    redeem a pairing code for a device token
+
+auth:
 POST /v1/sync/check              dedup pre-check
 POST /v1/assets                  raw body, metadata in X-Photo-* headers
 POST /v1/uploads                 open or resume a chunked upload
@@ -48,6 +59,8 @@ GET  /v1/uploads/{id}            how much of it the server holds
 PUT  /v1/uploads/{id}            one chunk, positioned by Content-Range
 POST /v1/uploads/{id}/commit     verify, store, index
 DELETE /v1/uploads/{id}          abandon
+
+open:
 GET  /v1/timeline                JSON page, newest first, keyset cursor
 POST /v1/timeline/states         re-read derivative state for specific ids
 GET  /v1/assets/{id}             JSON metadata for the viewer panel
@@ -59,13 +72,140 @@ GET  /v1/jobs                    queue depth and the failure list
 GET  /health                     also reports pending and failed job counts
 ```
 
-Upload headers: `X-Photo-Filename`, `X-Photo-Md5`, `X-Photo-Size`,
-`X-Photo-Device-Id`, `X-Photo-Local-Id` are required;
-`X-Photo-Captured-At` and `X-Photo-Modified-At` (RFC3339) are optional.
+Upload headers: `X-Photo-Filename`, `X-Photo-Md5`, `X-Photo-Size` and
+`X-Photo-Local-Id` are required; `X-Photo-Captured-At` and `X-Photo-Modified-At`
+(RFC3339) are optional. `X-Photo-Device-Id` is optional and no longer an identity
+claim — the token names the device, and a header that disagrees with it is a 403
+rather than a silent correction.
 
 Every media response is content-addressed, so it carries a strong `ETag` and
 `Cache-Control: immutable`. `/preview` checks `If-None-Match` *before*
 converting, which is what keeps paging back through a viewer free.
+
+## Authentication
+
+One credential per device, obtained once and used forever.
+
+```sh
+photobackup pair                          # prints ABCD-EFGH, ten minutes, one use
+photobackup devices                       # who is paired, and when they last wrote
+photobackup devices --revoke <id>         # that token stops working immediately
+```
+
+The code is eight Crockford base32 characters — no I, L, O or U, so nothing in it
+can be misread as a digit — and redeeming it is what mints the token. Both are
+stored as sha256 digests, so a dump of this database cannot be replayed to write
+into the archive.
+
+sha256 rather than a password hash, deliberately. A token is 256 bits of
+randomness with no dictionary behind it, so there is nothing for argon2 to slow
+down — and a 3GB video is around 375 authenticated chunk requests, which is 375
+verifications per upload that a password KDF would make expensive for no gain.
+
+`photobackup pair` writes to the database rather than asking photod for a code,
+so it works whether or not the daemon is up and there is no admin endpoint to
+protect. Being able to mint a credential is exactly the authority that write
+access to the database already carries.
+
+### What the token settles
+
+The device id used to be a random string the app made up for itself. It is now a
+uuid the server issues at pairing, and every device id that reaches the database
+comes from the authenticated identity — not from a header or a JSON field.
+`X-Photo-Device-Id` and the `deviceId` body field are still read, only to be
+checked against the token, so a stale install is told rather than quietly
+attributed to the right device anyway.
+
+Upload sessions are scoped by it too. A session id is `sha256(deviceId, localId,
+md5, size)`, so a second paired device that knew what the first was sending could
+otherwise resume, commit, or abort its transfer; every session endpoint checks
+ownership first and answers 404 when it fails, because confirming that a session
+exists is part of what is being withheld.
+
+### What it does not cover
+
+The gallery's read endpoints — `/v1/timeline`, `/v1/assets/*`, `/v1/jobs` — are
+**open to anyone who can reach them**. That is a deliberate Phase 5 scope: the
+write path is closed, the read path is not yet. Anyone on the LAN can page
+through the archive and download originals. It is an accepted, known gap, in the
+same category as the single drive, and `TestReadPathNeedsNoToken` exists so that
+changing it is a decision rather than an accident.
+
+### Two listeners
+
+| | serves | who reaches it |
+|---|---|---|
+| `LISTEN_ADDR` (HTTPS) | everything | the phone |
+| `PLAINTEXT_ADDR` (HTTP) | the read path and `/health` | the Next app, the browser, the CLI |
+
+The plaintext listener exists so the gallery does not have to trust a private CA
+to load a thumbnail. Pairing is absent from its routing table and every
+authenticated route answers `426 Upgrade Required`, so **a device token cannot
+travel unencrypted regardless of where that listener is bound**. That is a
+property of the routes rather than of a check inside a handler, which is what
+makes widening `PLAINTEXT_ADDR` to the LAN — something the gallery may
+legitimately want — safe for credentials, whatever it does for the read path.
+
+`TLS_DISABLED=1` collapses both onto one cleartext listener, tokens and all. It
+exists for development, it logs a warning saying exactly that, and it is the one
+switch here that gives something away.
+
+### When the database is down
+
+The write path closes, because authenticating a device reads it. That is a change
+from Phase 4, where the same request stored its blob and then failed to index it.
+
+Nothing is lost either way: the phone never gets an ack, so the item stays queued
+and the bytes arrive when Postgres does. The alternative is caching tokens in
+memory, which would buy an early blob write at the cost of a revoked device still
+uploading for as long as the cache held it. Refusing is the cheaper answer.
+
+## TLS
+
+photod issues its own certificates on first run. There is no certificate
+authority to buy from and no domain name involved.
+
+```sh
+photobackup ca                 # where it is, its fingerprints, what it covers
+photobackup ca --serve         # hand it to a phone once, then stop
+```
+
+Two certificates with very different jobs:
+
+| | lifetime | changes when |
+|---|---|---|
+| `ca.crt` / `ca.key` | 10 years | never, if it can be helped |
+| `server.crt` / `server.key` | 395 days | the machine's addresses change, or 30 days before expiry |
+
+The CA is the trust anchor and the only file that goes on the phone. The leaf is
+disposable, and that split is the point. A DHCP lease handing the archive machine
+a new address, or a Tailscale interface that only comes up after photod started,
+would otherwise leave a certificate whose SANs no longer cover the address the
+phone dials — a backup that stops working for a reason nothing on either screen
+would explain. photod re-checks its addresses every five minutes and reissues the
+leaf when they move, swapping it in through `GetCertificate` with no restart.
+Because the CA never moves, the phone never has to be touched again.
+
+The leaf certifies every non-loopback address on every interface that is up, plus
+the loopbacks, the hostname, `<hostname>.local`, `localhost`, and anything in
+`TLS_EXTRA_SANS`. **A phone dialling an address that is not on that list will
+refuse the connection**; `photobackup ca` prints the current list, which is the
+first thing to check when the app cannot connect.
+
+Address collection is deliberately not shared with `internal/discovery`. That one
+requires a multicast-capable interface, which is right for mDNS and wrong here: a
+Tailscale TUN device is not multicast-capable, so reusing it would leave the
+Tailscale address out of the certificate and break only the away-from-home path.
+
+A CA that is present but unreadable stops the daemon rather than being replaced.
+Minting a new one silently would leave every paired phone rejecting this server
+with nothing to explain it, and the choice between restoring the file and
+re-pairing every device belongs to a human.
+
+`TLS_DIR` defaults to `$PHOTOS_ROOT/tls` because that is the one directory photod
+is guaranteed to own, but it belongs on the SSD on a real deployment: `ca.key` is
+machine state rather than part of the library, and it is the only file here whose
+loss means re-pairing every device. `deploy/photod.env.example` moves it.
 
 ## Resumable uploads
 
@@ -211,6 +351,9 @@ The maintenance CLI. Reads the same environment photod does.
 photobackup verify [--deep] [--fix]     audit the archive against itself
 photobackup export --to DIR [--copy]    materialize a date tree of hardlinks
 photobackup reindex [--adopt-orphans]   rebuild the database from manifest.jsonl
+photobackup pair [--ttl 10m]            mint a single-use code to pair a device
+photobackup devices [--revoke ID]       list paired devices, or unpair one
+photobackup ca [--serve]                the CA to install on a device, and how
 ```
 
 **verify** runs five passes: assets against blobs, blobs against assets, the
@@ -299,14 +442,33 @@ docker compose up -d
 go test ./...
 ```
 
+On a machine that is also *running* photod, the compose Postgres cannot bind
+5432 — the deployed one already has it. Point the tests at a second server
+instead of stopping the archive:
+
+```sh
+docker run -d --name photobackup-test-pg -p 5433:5432 \
+  -e POSTGRES_USER=photobackup -e POSTGRES_PASSWORD=photobackup \
+  -e POSTGRES_DB=photobackup postgres:18-alpine
+export TEST_DATABASE_URL=postgres://photobackup:photobackup@localhost:5433/photobackup?sslmode=disable
+```
+
+The api tests pair a real device and send its token on every write, rather than
+reaching the handlers through a door only they can open. So "does the write path
+require a token" is answered by every test in the package instead of by one of
+them, and `internal/api/auth_test.go` covers the refusals: no token, an unknown
+token, a revoked one, a session belonging to another device, and a server wired up
+with no device store at all — which must serve no write path rather than an
+unauthenticated one.
+
 Fixtures live in `server/testdata/`, shared across the media packages:
 `iphone-portrait.heic` is a real original off the phone and is the one that
 exercises the combination that actually ships — HEIC, a rotated sensor read,
 sub-second timestamps carrying their own UTC offset, and GPS.
 
 Each package creates and migrates its own database (`photobackup_test_db`,
-`photobackup_test_api`, `photobackup_test_jobs`, `photobackup_test_worker`) on
-first run. They must stay separate: `go test ./...` runs packages concurrently,
+`photobackup_test_api`, `photobackup_test_jobs`, `photobackup_test_worker`,
+`photobackup_test_devices`) on first run. They must stay separate: `go test ./...` runs packages concurrently,
 and a shared database means one package truncates `assets` while another is
 mid-test.
 

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -21,12 +20,7 @@ func (h *harness) check(t *testing.T, req syncCheckRequest) *http.Response {
 	if err != nil {
 		t.Fatalf("marshal check request: %v", err)
 	}
-	resp, err := h.server.Client().Post(h.server.URL+"/v1/sync/check", "application/json", bytes.NewReader(raw))
-	if err != nil {
-		t.Fatalf("post sync check: %v", err)
-	}
-	t.Cleanup(func() { resp.Body.Close() })
-	return resp
+	return h.postJSON(t, "/v1/sync/check", string(raw))
 }
 
 // checkOK posts a request, insists on a 200, and returns the results keyed by
@@ -59,15 +53,13 @@ func size(n int) *int64 {
 	return &v
 }
 
-const testDevice = "iphone-14-pro"
-
 // Round one carries no digest, so an unrecognised local id can only be reported
 // as unknown. This is what stops the phone hashing its whole library up front.
 func TestSyncCheckReportsUnknownWithoutADigest(t *testing.T) {
 	h := newHarness(t)
 
 	got := h.checkOK(t, syncCheckRequest{
-		DeviceID: testDevice,
+		DeviceID: h.deviceID,
 		Items:    []syncCheckItem{{LocalID: "never-seen"}},
 	})
 
@@ -80,7 +72,7 @@ func TestSyncCheckWantsContentThatIsNotArchived(t *testing.T) {
 	h := newHarness(t)
 
 	got := h.checkOK(t, syncCheckRequest{
-		DeviceID: testDevice,
+		DeviceID: h.deviceID,
 		Items: []syncCheckItem{{
 			LocalID: "never-seen",
 			MD5:     md5Hex([]byte("not in the archive")),
@@ -100,7 +92,7 @@ func TestSyncCheckReportsHaveByLocalIDAfterUpload(t *testing.T) {
 	up := decodeUpload(t, h.upload(t, loadFixture(t), nil))
 
 	got := h.checkOK(t, syncCheckRequest{
-		DeviceID: testDevice,
+		DeviceID: h.deviceID,
 		Items:    []syncCheckItem{{LocalID: "B84E8479-475C-4727-A4A4-B77AA9980897/L0/001"}},
 	})
 
@@ -122,7 +114,7 @@ func TestSyncCheckLearnsMappingFromContentMatch(t *testing.T) {
 	up := decodeUpload(t, h.upload(t, content, nil))
 
 	byContent := h.checkOK(t, syncCheckRequest{
-		DeviceID: testDevice,
+		DeviceID: h.deviceID,
 		Items: []syncCheckItem{{
 			LocalID: "second-copy-of-the-same-photo",
 			MD5:     md5Hex(content),
@@ -137,7 +129,7 @@ func TestSyncCheckLearnsMappingFromContentMatch(t *testing.T) {
 	}
 
 	byLocalID := h.checkOK(t, syncCheckRequest{
-		DeviceID: testDevice,
+		DeviceID: h.deviceID,
 		Items:    []syncCheckItem{{LocalID: "second-copy-of-the-same-photo"}},
 	})
 	if byLocalID["second-copy-of-the-same-photo"].Status != statusHave {
@@ -160,7 +152,7 @@ func TestSyncCheckWantsAmbiguousContent(t *testing.T) {
 		OriginalFilename: "IMG_0001.HEIC",
 		Ext:              ".heic",
 		ContentType:      "image/heic",
-		DeviceID:         testDevice,
+		DeviceID:         h.deviceID,
 	}
 	for i, sha := range []string{
 		"1111111111111111111111111111111111111111111111111111111111111111",
@@ -175,7 +167,7 @@ func TestSyncCheckWantsAmbiguousContent(t *testing.T) {
 	}
 
 	got := h.checkOK(t, syncCheckRequest{
-		DeviceID: testDevice,
+		DeviceID: h.deviceID,
 		Items:    []syncCheckItem{{LocalID: "a-third-local-id", MD5: base.MD5, Size: size(989)}},
 	})
 
@@ -195,7 +187,7 @@ func TestSyncCheckReportsUnknownAfterModificationTimeChanges(t *testing.T) {
 	localID := "B84E8479-475C-4727-A4A4-B77AA9980897/L0/001"
 
 	unchanged := h.checkOK(t, syncCheckRequest{
-		DeviceID: testDevice,
+		DeviceID: h.deviceID,
 		Items:    []syncCheckItem{{LocalID: localID, ModifiedAt: &modified}},
 	})
 	if unchanged[localID].Status != statusHave {
@@ -204,7 +196,7 @@ func TestSyncCheckReportsUnknownAfterModificationTimeChanges(t *testing.T) {
 
 	edited := modified.Add(time.Hour)
 	after := h.checkOK(t, syncCheckRequest{
-		DeviceID: testDevice,
+		DeviceID: h.deviceID,
 		Items:    []syncCheckItem{{LocalID: localID, ModifiedAt: &edited}},
 	})
 	if after[localID].Status != statusUnknown {
@@ -222,7 +214,7 @@ func TestSyncCheckPreservesRequestOrder(t *testing.T) {
 		{LocalID: "B84E8479-475C-4727-A4A4-B77AA9980897/L0/001"},
 		{LocalID: "wanted-one", MD5: md5Hex([]byte("absent")), Size: size(6)},
 	}
-	resp := h.check(t, syncCheckRequest{DeviceID: testDevice, Items: items})
+	resp := h.check(t, syncCheckRequest{DeviceID: h.deviceID, Items: items})
 	var decoded syncCheckResponse
 	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -251,7 +243,7 @@ func TestSyncCheckToleratesARepeatedLocalID(t *testing.T) {
 	h.upload(t, content, nil)
 
 	item := syncCheckItem{LocalID: "repeated", MD5: md5Hex(content), Size: size(len(content))}
-	resp := h.check(t, syncCheckRequest{DeviceID: testDevice, Items: []syncCheckItem{item, item}})
+	resp := h.check(t, syncCheckRequest{DeviceID: h.deviceID, Items: []syncCheckItem{item, item}})
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -274,7 +266,7 @@ func TestSyncCheckToleratesARepeatedLocalID(t *testing.T) {
 func TestSyncCheckAcceptsAnEmptyBatch(t *testing.T) {
 	h := newHarness(t)
 
-	resp := h.check(t, syncCheckRequest{DeviceID: testDevice, Items: nil})
+	resp := h.check(t, syncCheckRequest{DeviceID: h.deviceID, Items: nil})
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -288,27 +280,49 @@ func TestSyncCheckRejectsOversizedBatch(t *testing.T) {
 		items[i] = syncCheckItem{LocalID: fmt.Sprintf("local-%d", i)}
 	}
 
-	resp := h.check(t, syncCheckRequest{DeviceID: testDevice, Items: items})
+	resp := h.check(t, syncCheckRequest{DeviceID: h.deviceID, Items: items})
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 }
 
-func TestSyncCheckRejectsMissingDeviceID(t *testing.T) {
+// Since Phase 5 the device id comes from the token, so a body that omits it is
+// answered normally rather than rejected.
+func TestSyncCheckTakesTheDeviceFromTheToken(t *testing.T) {
+	h := newHarness(t)
+	content := loadFixture(t)
+	h.upload(t, content, nil)
+	localID := "B84E8479-475C-4727-A4A4-B77AA9980897/L0/001"
+
+	got := h.checkOK(t, syncCheckRequest{Items: []syncCheckItem{{LocalID: localID}}})
+
+	if got[localID].Status != statusHave {
+		t.Errorf("status = %q, want %q — the mapping belongs to the token's device",
+			got[localID].Status, statusHave)
+	}
+}
+
+// A body naming a different device is refused rather than quietly attributed to
+// the authenticated one: it means a stale install or an attempt to write into
+// another device's mappings, and both are worth surfacing.
+func TestSyncCheckRejectsAMismatchedDeviceID(t *testing.T) {
 	h := newHarness(t)
 
-	resp := h.check(t, syncCheckRequest{Items: []syncCheckItem{{LocalID: "x"}}})
+	resp := h.check(t, syncCheckRequest{
+		DeviceID: "9f1c2e4a-0000-4000-8000-000000000000",
+		Items:    []syncCheckItem{{LocalID: "x"}},
+	})
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
 	}
 }
 
 func TestSyncCheckRejectsMissingLocalID(t *testing.T) {
 	h := newHarness(t)
 
-	resp := h.check(t, syncCheckRequest{DeviceID: testDevice, Items: []syncCheckItem{{LocalID: "  "}}})
+	resp := h.check(t, syncCheckRequest{DeviceID: h.deviceID, Items: []syncCheckItem{{LocalID: "  "}}})
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
@@ -321,7 +335,7 @@ func TestSyncCheckRejectsDigestWithoutSize(t *testing.T) {
 	h := newHarness(t)
 
 	resp := h.check(t, syncCheckRequest{
-		DeviceID: testDevice,
+		DeviceID: h.deviceID,
 		Items:    []syncCheckItem{{LocalID: "x", MD5: md5Hex([]byte("hi"))}},
 	})
 
@@ -333,11 +347,7 @@ func TestSyncCheckRejectsDigestWithoutSize(t *testing.T) {
 func TestSyncCheckRejectsMalformedBody(t *testing.T) {
 	h := newHarness(t)
 
-	resp, err := h.server.Client().Post(h.server.URL+"/v1/sync/check", "application/json", bytes.NewReader([]byte("{not json")))
-	if err != nil {
-		t.Fatalf("post: %v", err)
-	}
-	defer resp.Body.Close()
+	resp := h.postJSON(t, "/v1/sync/check", "{not json")
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
@@ -350,7 +360,7 @@ func TestSyncCheckWithDatabaseDownReportsUnavailable(t *testing.T) {
 	h := newHarness(t)
 	h.store.Close()
 
-	resp := h.check(t, syncCheckRequest{DeviceID: testDevice, Items: []syncCheckItem{{LocalID: "x"}}})
+	resp := h.check(t, syncCheckRequest{DeviceID: h.deviceID, Items: []syncCheckItem{{LocalID: "x"}}})
 
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", resp.StatusCode)

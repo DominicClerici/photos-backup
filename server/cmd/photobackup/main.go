@@ -7,6 +7,9 @@
 //	photobackup verify [--deep] [--fix]
 //	photobackup export --to DIR [--from DATE] [--until DATE] [--copy]
 //	photobackup reindex [--adopt-orphans] [--dry-run]
+//	photobackup pair [--ttl 10m]
+//	photobackup devices [--revoke ID]
+//	photobackup ca [--serve] [--export PATH]
 package main
 
 import (
@@ -33,8 +36,12 @@ const usage = `photobackup — maintenance for the photo archive
   export --to DIR [--copy]             materialize a date tree of hardlinks
   reindex [--adopt-orphans]            rebuild the database from manifest.jsonl
 
-Reads PHOTOS_ROOT, DERIVATIVES_ROOT and DATABASE_URL, the same as photod.
-Run a subcommand with --help for its own flags.
+  pair [--ttl 10m]                     mint a single-use code to pair a device
+  devices [--revoke ID]                list paired devices, or unpair one
+  ca [--serve] [--export PATH]         the CA to install on a device, and how
+
+Reads PHOTOS_ROOT, DERIVATIVES_ROOT, DATABASE_URL and TLS_DIR, the same as
+photod. Run a subcommand with --help for its own flags.
 `
 
 // Exit codes, so a timer or a cron job can tell the three outcomes apart
@@ -68,6 +75,12 @@ func main() {
 		code, err = runExport(ctx, os.Args[2:])
 	case "reindex":
 		code, err = runReindex(ctx, os.Args[2:])
+	case "pair":
+		code, err = runPair(ctx, os.Args[2:])
+	case "devices":
+		code, err = runDevices(ctx, os.Args[2:])
+	case "ca":
+		code, err = runCA(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,10 +21,12 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/db"
 	"github.com/dominicclerici/photos-backup/server/internal/derive"
 	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
+	"github.com/dominicclerici/photos-backup/server/internal/devices"
 	"github.com/dominicclerici/photos-backup/server/internal/discovery"
 	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
+	"github.com/dominicclerici/photos-backup/server/internal/tlsca"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
 	"github.com/dominicclerici/photos-backup/server/internal/worker"
@@ -81,6 +84,7 @@ func run(log *slog.Logger) error {
 	// Beside the blobs, not on the SSD: a committed session becomes a blob by
 	// rename, and a rename only works within one filesystem.
 	staging := uploads.New(filepath.Join(root, "incoming"))
+	paired := devices.New(store.Pool())
 
 	srv := &api.Server{
 		Store:       store,
@@ -90,10 +94,36 @@ func run(log *slog.Logger) error {
 		Converter:   converter,
 		Queue:       queue,
 		Uploads:     staging,
+		Devices:     paired,
 		Log:         log,
 	}
 
 	go sweepUploads(ctx, log, staging, cfg.UploadSessionTTL)
+
+	// Before the worker pools start, because unlike everything below this can
+	// fail: TLS is not optional the way the media tools are. A missing ffmpeg
+	// costs thumbnails, while serving the upload path in the clear would put a
+	// device token on the wire — so this stops the daemon instead of degrading,
+	// and it does so while returning early is still free.
+	var certs *tlsca.Manager
+	if !cfg.TLSDisabled {
+		tlsDir := cfg.TLSDir
+		if tlsDir == "" {
+			tlsDir = filepath.Join(root, "tls")
+		}
+		if certs, err = tlsca.Open(tlsDir, cfg.TLSExtraSANs, log); err != nil {
+			return err
+		}
+		fingerprint, _ := certs.Fingerprints()
+		log.Info("TLS ready",
+			"ca", certs.CACertPath(),
+			"ca_sha256", fingerprint,
+			"certifies", strings.Join(certs.SANs(), ","),
+			"expires", certs.NotAfter().Format(time.RFC3339))
+		go certs.Watch(ctx.Done(), 5*time.Minute)
+	} else {
+		log.Warn("TLS_DISABLED is set: the upload path is served in the clear and device tokens will cross the network unencrypted — development only")
+	}
 
 	// Missing tooling is reported, never fatal. An upload has to be able to
 	// reach the disk on a host where ffmpeg was never installed — the archive
@@ -153,21 +183,48 @@ func run(log *slog.Logger) error {
 		}
 	}
 
-	httpSrv := &http.Server{
+	// Buffered for every listener, so a goroutine reporting a failure after
+	// another already has cannot block forever on an unread channel.
+	errs := make(chan error, 2)
+	var servers []*http.Server
+
+	apiSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		// No write timeout: a large original on a slow phone connection is a
 		// normal upload, not a stalled one.
 	}
-
-	errs := make(chan error, 1)
+	servers = append(servers, apiSrv)
 	go func() {
-		log.Info("photod listening", "addr", cfg.ListenAddr, "photos_root", root)
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errs <- err
+		if certs == nil {
+			log.Info("photod listening (http, no TLS)", "addr", cfg.ListenAddr, "photos_root", root)
+			serveErr(errs, apiSrv.ListenAndServe())
+			return
 		}
+		apiSrv.TLSConfig = certs.TLSConfig()
+		log.Info("photod listening (https)", "addr", cfg.ListenAddr, "photos_root", root)
+		// Certificate and key are supplied by TLSConfig.GetCertificate, which is
+		// what lets a reissued leaf take effect without a restart.
+		serveErr(errs, apiSrv.ListenAndServeTLS("", ""))
 	}()
+
+	// The read-only plaintext listener. The gallery and the maintenance CLI live
+	// on this machine and would otherwise have to trust a private CA to read a
+	// thumbnail; the write path is not served here at all.
+	if cfg.PlaintextAddr != "" && !cfg.TLSDisabled {
+		plain := &http.Server{
+			Addr:              cfg.PlaintextAddr,
+			Handler:           srv.PlaintextHandler(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		servers = append(servers, plain)
+		go func() {
+			log.Info("serving the gallery read path in the clear", "addr", cfg.PlaintextAddr,
+				"note", "no pairing and no upload endpoints are reachable here")
+			serveErr(errs, plain.ListenAndServe())
+		}()
+	}
 
 	select {
 	case err := <-errs:
@@ -176,7 +233,19 @@ func run(log *slog.Logger) error {
 		log.Info("shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		return httpSrv.Shutdown(shutdownCtx)
+		var shutdownErr error
+		for _, server := range servers {
+			if err := server.Shutdown(shutdownCtx); err != nil && shutdownErr == nil {
+				shutdownErr = err
+			}
+		}
+		return shutdownErr
+	}
+}
+
+func serveErr(errs chan<- error, err error) {
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		errs <- err
 	}
 }
 

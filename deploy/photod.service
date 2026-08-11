@@ -30,7 +30,8 @@ RestartSec=5s
 TimeoutStopSec=30s
 KillSignal=SIGTERM
 
-# The daemon needs the archive, the derivatives, and nothing else on the disk.
+# The daemon needs the archive, the derivatives, the TLS directory under
+# /var/lib/photod, and nothing else on the disk.
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/mnt/photos /var/lib/photod

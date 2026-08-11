@@ -1,0 +1,20 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  Install to /etc/avahi/services/photobackup.service.
+
+  Fedora runs Avahi, which holds port 5353, so photod's own responder cannot
+  bind. Set MDNS_DISABLED=1 in photod.env and let Avahi advertise instead.
+
+    sudo install -m 0644 deploy/photobackup.avahi.service \
+                         /etc/avahi/services/photobackup.service
+
+  Avahi picks the file up without a restart.
+-->
+<service-group>
+  <name replace-wildcards="yes">photobackup on %h</name>
+  <service>
+    <type>_photobackup._tcp</type>
+    <port>8787</port>
+  </service>
+</service-group>

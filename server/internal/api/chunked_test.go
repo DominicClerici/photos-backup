@@ -40,7 +40,7 @@ func (c *chunkedUpload) md5() string {
 func (c *chunkedUpload) begin(t *testing.T) sessionResponse {
 	t.Helper()
 	payload, err := json.Marshal(createSessionRequest{
-		DeviceID: "iphone-14-pro",
+		DeviceID: c.h.deviceID,
 		LocalID:  c.localID,
 		Filename: c.filename,
 		MD5:      c.md5(),
@@ -67,6 +67,7 @@ func (c *chunkedUpload) put(t *testing.T, id string, start, end int) *http.Respo
 	}
 	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end-1, len(c.body)))
 
+	c.h.authorize(req)
 	resp, err := c.h.server.Client().Do(req)
 	if err != nil {
 		t.Fatalf("PUT chunk: %v", err)
@@ -300,7 +301,7 @@ func TestUnknownSessionIsNotFound(t *testing.T) {
 	h := newHarness(t)
 	const absent = "0123456789abcdef0123456789abcdef"
 
-	if resp := h.get(t, "/v1/uploads/"+absent); resp.StatusCode != http.StatusNotFound {
+	if resp := h.raw(t, http.MethodGet, "/v1/uploads/"+absent, h.token); resp.StatusCode != http.StatusNotFound {
 		t.Errorf("GET status = %d, want 404", resp.StatusCode)
 	}
 	if resp := h.postJSON(t, "/v1/uploads/"+absent+"/commit", ""); resp.StatusCode != http.StatusNotFound {
@@ -311,7 +312,8 @@ func TestUnknownSessionIsNotFound(t *testing.T) {
 func TestCreateSessionRejectsAnIncompleteDeclaration(t *testing.T) {
 	h := newHarness(t)
 
-	resp := h.postJSON(t, "/v1/uploads", `{"deviceId":"iphone","localId":"x","filename":"a.mov"}`)
+	// No deviceId: the token supplies it. What is missing is the md5 and size.
+	resp := h.postJSON(t, "/v1/uploads", `{"localId":"x","filename":"a.mov"}`)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
@@ -327,6 +329,7 @@ func TestChunkNeedsAnOffsetHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
+	h.authorize(req)
 	resp, err := h.server.Client().Do(req)
 	if err != nil {
 		t.Fatalf("PUT: %v", err)
@@ -350,6 +353,7 @@ func TestAbortDiscardsTheSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
+	h.authorize(req)
 	resp, err := h.server.Client().Do(req)
 	if err != nil {
 		t.Fatalf("DELETE: %v", err)

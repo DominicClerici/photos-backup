@@ -47,11 +47,30 @@ type SessionState = { uploadId: string; offset: number; complete: boolean };
 export class HttpTransport implements Transport {
   private readonly chunks: ChunkTransport;
 
+  /**
+   * Both the address and the token are read per request rather than captured.
+   * Discovery can move the address — LAN to Tailscale — and re-pairing can
+   * replace the token, neither of which should mean rebuilding the engine
+   * around a new transport mid-run.
+   */
   constructor(
     private readonly baseUrl: () => string,
+    private readonly deviceToken: () => string | null,
     onLog?: (line: string) => void
   ) {
     this.chunks = new ChunkTransport(onLog);
+  }
+
+  /**
+   * The headers every request to photod carries.
+   *
+   * A missing token is sent as a missing header rather than as an empty one, so
+   * the server answers "a device token is required" instead of rejecting a
+   * malformed credential — the two are a different message on the phone.
+   */
+  private headers(extra: Record<string, string> = {}): Record<string, string> {
+    const token = this.deviceToken();
+    return token ? { ...extra, authorization: `Bearer ${token}` } : extra;
   }
 
   /** Which chunk strategy ended up in use, for the diagnostics panel. */
@@ -67,7 +86,7 @@ export class HttpTransport implements Transport {
     try {
       response = await fetch(`${this.base()}/v1/sync/check`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: this.headers({ 'content-type': 'application/json' }),
         body: JSON.stringify({ deviceId, items }),
         signal: controller.signal,
       });
@@ -82,7 +101,7 @@ export class HttpTransport implements Transport {
     if (!response.ok) {
       throw new SyncError(
         `sync/check returned ${response.status}: ${await safeText(response)}`,
-        response.status >= 500 ? 'server' : 'item',
+        blameFor(response.status),
         response.status
       );
     }
@@ -110,14 +129,14 @@ export class HttpTransport implements Transport {
    * the device with no indication of why.
    */
   async upload(request: UploadRequest): Promise<UploadResponse> {
-    const headers: Record<string, string> = {
+    const headers: Record<string, string> = this.headers({
       'content-type': 'application/octet-stream',
       'x-photo-filename': request.filename,
       'x-photo-md5': request.md5,
       'x-photo-size': String(request.size),
       'x-photo-device-id': request.deviceId,
       'x-photo-local-id': request.localId,
-    };
+    });
     const capturedAt = toIso(request.createdAt);
     if (capturedAt) headers['x-photo-captured-at'] = capturedAt;
     const modifiedAt = toIso(request.modifiedAt);
@@ -137,7 +156,7 @@ export class HttpTransport implements Transport {
     if (response.status < 200 || response.status >= 300) {
       throw new SyncError(
         `upload returned ${response.status}: ${response.body}`,
-        response.status >= 500 ? 'server' : 'item',
+        blameFor(response.status),
         response.status
       );
     }
@@ -199,10 +218,10 @@ export class HttpTransport implements Transport {
     onProgress?: UploadProgress
   ): Promise<boolean> {
     for (const [start, end] of planChunks(request.size, session.offset, CHUNK_SIZE)) {
-      const headers = {
+      const headers = this.headers({
         'content-type': 'application/octet-stream',
         'content-range': `bytes ${start}-${end - 1}/${request.size}`,
-      };
+      });
 
       let response: Response;
       try {
@@ -221,7 +240,7 @@ export class HttpTransport implements Transport {
       if (!response.ok) {
         throw new SyncError(
           `chunk at ${start} returned ${response.status}: ${await safeText(response)}`,
-          response.status >= 500 ? 'server' : 'item',
+          blameFor(response.status),
           response.status
         );
       }
@@ -234,7 +253,7 @@ export class HttpTransport implements Transport {
   }
 
   private async beginSession(request: UploadRequest): Promise<SessionState> {
-    const response = await postJson(`${this.base()}/v1/uploads`, {
+    const response = await postJson(`${this.base()}/v1/uploads`, this.headers(), {
       deviceId: request.deviceId,
       localId: request.localId,
       filename: request.filename,
@@ -247,7 +266,7 @@ export class HttpTransport implements Transport {
     if (!response.ok) {
       throw new SyncError(
         `opening an upload session returned ${response.status}: ${await safeText(response)}`,
-        response.status >= 500 ? 'server' : 'item',
+        blameFor(response.status),
         response.status
       );
     }
@@ -255,12 +274,12 @@ export class HttpTransport implements Transport {
   }
 
   private async commitSession(uploadId: string): Promise<UploadResponse> {
-    const response = await postJson(`${this.base()}/v1/uploads/${uploadId}/commit`, undefined);
+    const response = await postJson(`${this.base()}/v1/uploads/${uploadId}/commit`, this.headers(), undefined);
 
     if (!response.ok) {
       throw new SyncError(
         `committing an upload returned ${response.status}: ${await safeText(response)}`,
-        response.status >= 500 ? 'server' : 'item',
+        blameFor(response.status),
         response.status
       );
     }
@@ -295,13 +314,31 @@ async function readSession(response: Response): Promise<SessionState> {
   return { uploadId: payload.uploadId, offset: payload.offset, complete: !!payload.complete };
 }
 
-async function postJson(url: string, body: unknown): Promise<Response> {
+/**
+ * Who to blame for a status code.
+ *
+ * 401 and 403 are this device's standing, not this item's: a revoked token or a
+ * pairing that no longer matches. Charging them to items would retire the whole
+ * library to `failed`, five attempts at a time, over something one pairing fixes.
+ * 426 lands here too — it means the address in use is photod's read-only
+ * listener, so no amount of retrying will get an upload accepted on it.
+ */
+function blameFor(status: number): 'unauthorized' | 'server' | 'item' {
+  if (status === 401 || status === 403 || status === 426) return 'unauthorized';
+  return status >= 500 ? 'server' : 'item';
+}
+
+async function postJson(
+  url: string,
+  headers: Record<string, string>,
+  body: unknown
+): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), SESSION_TIMEOUT_MS);
   try {
     return await fetch(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { ...headers, 'content-type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: controller.signal,
     });
