@@ -44,7 +44,7 @@ func testStore(t *testing.T) *Store {
 	}
 	// Every table by name rather than `cascade`, so a future table with a
 	// foreign key here has to be added deliberately instead of silently wiped.
-	if _, err := store.pool.Exec(ctx, "truncate table assets, device_assets, jobs"); err != nil {
+	if _, err := store.pool.Exec(ctx, "truncate table assets, device_assets, jobs cascade"); err != nil {
 		t.Fatalf("truncate assets: %v", err)
 	}
 	return store

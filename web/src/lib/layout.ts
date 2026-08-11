@@ -59,6 +59,25 @@ export function thumbSizeFor(level: number): ThumbSize {
   return THUMB_SIZES.find((size) => size >= cell) ?? THUMB_SIZES[THUMB_SIZES.length - 1];
 }
 
+/**
+ * The sizes to try for one rendition, best first, when the wanted one may not be
+ * stored: what was asked for, then everything else in the order it would be
+ * settled for.
+ *
+ * A library ingested before a size existed has only the base one until a backfill
+ * runs, so a 404 is a gap in what is stored rather than a missing asset, and the
+ * next-best file is a better answer than nothing. Larger before smaller, for the
+ * reason thumbSizeFor rounds up: downscaling costs nothing and upscaling shows.
+ */
+export function thumbSizeFallbacks(size: ThumbSize): ThumbSize[] {
+  const rest = THUMB_SIZES.filter((other) => other !== size);
+  return [
+    size,
+    ...rest.filter((other) => other > size),
+    ...rest.filter((other) => other < size).reverse(),
+  ];
+}
+
 export interface GridMetrics {
   columns: number;
   cellSize: number;

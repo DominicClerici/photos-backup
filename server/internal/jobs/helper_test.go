@@ -45,7 +45,7 @@ func testQueue(t *testing.T) (*jobs.Queue, *db.Store) {
 	if err := store.Migrate(); err != nil {
 		t.Fatalf("migrate test database: %v", err)
 	}
-	if _, err := store.Pool().Exec(ctx, "truncate table assets, device_assets, jobs"); err != nil {
+	if _, err := store.Pool().Exec(ctx, "truncate table assets, device_assets, jobs cascade"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	return jobs.NewQueue(store.Pool()), store

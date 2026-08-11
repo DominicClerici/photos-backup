@@ -65,6 +65,10 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("POST /v1/sync/check", s.requireDevice(s.handleSyncCheck))
 	mux.HandleFunc("POST /v1/assets", s.requireDevice(s.handleUpload))
+	// What an export knew that the file does not. A write, and one that names
+	// an asset rather than creating one, which is why it hangs off the asset
+	// rather than sitting beside the upload endpoints.
+	mux.HandleFunc("POST /v1/assets/{id}/import-metadata", s.requireDevice(s.handleImportMetadata))
 
 	// Resumable uploads. The id is derived from the declaration, so POST
 	// /v1/uploads is both "begin" and "where did I get to".
@@ -114,6 +118,7 @@ func (s *Server) PlaintextHandler() http.Handler {
 		"POST /v1/pair",
 		"POST /v1/sync/check",
 		"POST /v1/assets",
+		"POST /v1/assets/{id}/import-metadata",
 		"POST /v1/uploads",
 		"GET /v1/uploads/{id}",
 		"PUT /v1/uploads/{id}",

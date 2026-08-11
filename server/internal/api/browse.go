@@ -119,6 +119,14 @@ type assetDetail struct {
 	GPSLat *float64 `json:"gps_lat,omitempty"`
 	GPSLon *float64 `json:"gps_lon,omitempty"`
 
+	// What an import knew and the file did not. Absent on anything a device
+	// uploaded directly, which is why every one of these is omitempty.
+	Description string   `json:"description,omitempty"`
+	Favorite    bool     `json:"favorite,omitempty"`
+	Archived    bool     `json:"archived,omitempty"`
+	Albums      []string `json:"albums,omitempty"`
+	People      []string `json:"people,omitempty"`
+
 	State         string `json:"state"`
 	PlaybackState string `json:"playback_state,omitempty"`
 }
@@ -127,6 +135,16 @@ func (s *Server) handleAssetDetail(w http.ResponseWriter, r *http.Request) {
 	asset, ok := s.lookup(w, r)
 	if !ok {
 		return
+	}
+
+	// Two small queries rather than a join onto the asset load, because these
+	// tables are empty for most archives and the asset load is on every
+	// timeline page's critical path while this handler is not.
+	extras, err := s.Store.AssetExtras(r.Context(), asset.ID)
+	if err != nil {
+		// Not fatal. A viewer that cannot list albums is worth more than one
+		// that refuses to open the photo.
+		s.logger().Warn("load asset extras", "error", err, "asset", asset.ID)
 	}
 
 	writeJSON(w, http.StatusOK, assetDetail{
@@ -147,6 +165,11 @@ func (s *Server) handleAssetDetail(w http.ResponseWriter, r *http.Request) {
 		Lens:            asset.Lens,
 		GPSLat:          asset.GPSLat,
 		GPSLon:          asset.GPSLon,
+		Description:     asset.Description,
+		Favorite:        asset.Favorite,
+		Archived:        asset.Archived,
+		Albums:          extras.Albums,
+		People:          extras.People,
 		State:           asset.DerivedState,
 		PlaybackState:   asset.PlaybackState,
 	})

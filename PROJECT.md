@@ -200,26 +200,50 @@ nothing that `Cache-Control: immutable` does not.
 
 ### Live Photos
 
-A Live Photo is two files, and the phone is the only party that knows they
-belong together — the still and its ~3s video share nothing but a capture time,
-and pairing on that would marry a photo to whatever else was shot in the same
-second. So the app declares it, on the video's upload, and the server stores the
-declaration rather than trying to infer one.
+A Live Photo is two files, and there are two independent ways to know they
+belong together. The archive uses both, and writes both to the same two columns,
+so nothing downstream has to know which one did the work.
+
+**The declaration.** The app names the still on the video's upload. It is known
+before a byte is sent, so the pairing is complete the moment the second half
+commits — and it is unavailable to anything that is not the phone.
+
+**The content identifier.** Apple stamps a UUID into both halves at capture: the
+maker note on a HEIC or JPEG, `com.apple.quicktime.content.identifier` on a MOV
+or MP4. Google's export preserves both, so this is what pairs a Takeout, a
+restored backup, and anything copied off a Mac — everything the declaration
+cannot reach. It is not known until something has read the file, which for an
+upload is after the bytes are already committed, so the metadata worker records
+it (`assets.content_id`) and resolves from whichever half it reaches second.
+
+The first of these was Phase 7's whole design, on the reasoning that the two
+files "share nothing but a capture time". That was wrong, and expensively so: it
+made the feature reachable only by files the phone itself uploaded, which is the
+minority of this archive. What they share is a UUID, in the bytes, put there by
+the camera. A header is a convenience; the maker note is the fact, and the file
+overrules the header whenever they disagree.
 
 The declaration is separate from its resolution, because they become true at
 different moments. `live_parent_local_id` is what the phone said and is known
-the instant the bytes land; it is what makes an asset a paired video at all, so
-it decides which derivatives get built and what the timeline hides.
-`live_parent_asset_id` is the still it resolved to, and cannot be filled in
-until that still exists — the two halves share a capture time, the upload queue
-orders by capture time, and nothing decides which goes up first, so it resolves
-from whichever side arrives second.
+the instant the bytes land. `live_parent_asset_id` is the still it resolved to,
+and cannot be filled in until that still exists — the two halves share a capture
+time, the upload queue orders by capture time, and nothing decides which goes up
+first, so it resolves from whichever side arrives second.
 
 **The paired video is never an item of its own.** It is archived, verified, and
 downloadable like everything else; it simply is not a thing anyone took a
 picture of, so the timeline shows the still and carries the motion as one extra
-field on it. That is also why it is filtered on the declaration rather than the
-resolution: a video whose still has not arrived yet is still not a photograph.
+field on it.
+
+**A declared video is hidden immediately; a discovered one is hidden only once
+it resolves.** The phone only ever declares a pairing for a video whose still is
+already queued behind it, so there is nothing to wait for. An export has no such
+guarantee: it can hold a paired video whose still was deleted years ago, and 44
+of the 130 files in the sample export are exactly that. Hiding those on the
+strength of an identifier would archive them into invisibility — bytes on the
+drive that nothing could ever show. They import as ordinary videos and pair
+themselves the day their still turns up, at which point the still's own metadata
+job adopts them, requeues their derivatives, and they leave the timeline.
 
 What it gets built is deliberately lopsided against what an ordinary video gets:
 
@@ -245,8 +269,17 @@ without it the same three seconds would go through ffmpeg two or three times for
 a single press-and-hold.
 
 `manifest.jsonl` records one line per stored blob: hash, original filename,
-capture time, source device, byte size. It is the disaster-recovery path when the
-database is gone.
+capture time, source device, byte size, and the content identifier that pairs a
+Live Photo. It is the disaster-recovery path when the database is gone.
+
+It carries a second kind of line too. An import learns things about a blob after
+the bytes have landed — the sidecar beside it in the export — and those are
+appended as their own `{"type":"metadata"}` lines rather than folded into the
+asset line, which is append-only and already written by then. The sidecar is
+stored raw, so a rebuild re-reads it with the current parser instead of
+replaying an older parser's conclusions: understanding more about an export
+later is then a `reindex`, not a re-import of files that have since been
+deleted.
 
 ---
 
@@ -518,6 +551,55 @@ not a photograph — the archive still holds it, verifies it, and serves the
 original. The one case it costs something is a still that never uploads, whose
 video is then hidden with nothing to hang it on. Deliberate: three seconds of
 soundless video is not what anyone lost.
+
+*(The first of those three is half wrong, and Phase 8 corrects it. The pairing
+did not have to be declared; the declaration was simply the only evidence Phase 7
+looked for.)*
+
+### Phase 8 — Google Photos import
+
+The majority of this library is not on the phone. It is a Google Photos export,
+and Phase 7's pairing could not touch it: a Takeout declares nothing, so every
+Live Photo in it landed as a photograph and a silent clip filed beside it —
+exactly the bug Phase 7 was supposed to have fixed. §5 has the design. What the
+phase settled:
+
+**The evidence was in the files all along.** Apple's content identifier is in
+both halves, Google preserves it, and one `exiftool` tag reads it from the maker
+note on a still and the QuickTime keys atom on a video. In the 130-file sample
+export it pairs 20 Live Photos that nothing else could have paired. The lesson
+is narrower than "read the file": Phase 7 reasoned from what the *phone* knew and
+never asked what the *bytes* knew, and the answer had been sitting in the sample
+data the whole time.
+
+**Hiding on discovery is not the same as hiding on declaration.** A third of the
+sample export's videos carry an identifier whose still is not in the export.
+Under Phase 7's rule they would all have vanished. The timeline predicate is now
+"declared *or* resolved", which costs a duplicate-looking tile for as long as it
+takes a still to arrive and never costs an asset.
+
+**An importer is a client, not a second server.** `photobackup import` walks the
+export and uploads over HTTPS to photod like the phone does, even though it runs
+on the archive machine and could write the blob tree directly. That buys one
+commit ordering instead of two, one manifest writer instead of a race, and free
+resumability from the sync protocol that already exists. It costs a loopback
+copy of 100GB, once.
+
+**Metadata Google kept and the file did not.** A screenshot has no EXIF at all;
+its sidecar's `photoTakenTime` is the only capture time it has. Album membership
+exists nowhere but the directory layout, and people tags nowhere but the JSON.
+All of it is normalized into columns *and* stored verbatim, because the export
+gets deleted and no amount of care today anticipates which field matters in a
+year. Sidecar filenames are their own small horror — truncated to a length cap,
+collision counters migrated to the end, absent entirely for a Live Photo's video
+half — and `internal/takeout` exists to keep that in one testable place.
+
+**Sidecar coordinates needed a column of their own.** The metadata worker
+rewrites `gps_lat`/`gps_lon` from the file on every run, so a sidecar's
+coordinates merged into them would survive exactly until the next reindex. They
+live in `import_gps_lat`/`import_gps_lon` and feed the canonical pair only where
+the file itself carried nothing — which makes the precedence hold in both
+directions and under any order of arrival.
 
 ### v2
 

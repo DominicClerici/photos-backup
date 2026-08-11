@@ -29,6 +29,7 @@ type createSessionRequest struct {
 	CapturedAt        *time.Time `json:"capturedAt"`
 	ModifiedAt        *time.Time `json:"modifiedAt"`
 	LiveParentLocalID string     `json:"liveParentLocalId"`
+	ContentID         string     `json:"contentId"`
 }
 
 type sessionResponse struct {
@@ -80,6 +81,7 @@ func (s *Server) handleCreateUpload(w http.ResponseWriter, r *http.Request, devi
 		CapturedAt:        normalizeTime(req.CapturedAt),
 		ModifiedAt:        normalizeTime(req.ModifiedAt),
 		LiveParentLocalID: req.LiveParentLocalID,
+		ContentID:         req.ContentID,
 	})
 	if err != nil {
 		if isDeclarationError(err) {
@@ -195,6 +197,7 @@ func (s *Server) handleCommitUpload(w http.ResponseWriter, r *http.Request, devi
 		deviceID:          session.Decl.DeviceID,
 		localID:           session.Decl.LocalID,
 		liveParentLocalID: session.Decl.LiveParentLocalID,
+		contentID:         session.Decl.ContentID,
 	})
 }
 

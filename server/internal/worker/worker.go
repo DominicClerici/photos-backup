@@ -241,6 +241,17 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 	}
 	meta := metadataFrom(data)
 
+	// Pairing, before anything is built, because it decides what to build. An
+	// imported Live Photo declares nothing on upload — the export it came from
+	// had nothing to declare with — so this read is the first moment anything
+	// knows the file is half of one, and the branch below is the first
+	// consequence.
+	if data.ContentID != asset.ContentID {
+		if asset, err = r.applyContentID(ctx, assetID, data.ContentID); err != nil {
+			return err
+		}
+	}
+
 	decodable := true
 	switch {
 	case asset.IsLivePair():
@@ -271,7 +282,14 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 		if !decodable {
 			state = db.DerivedFailed
 		}
-		return r.Store.SetLiveState(ctx, assetID, state)
+		if err := r.Store.SetLiveState(ctx, assetID, state); err != nil {
+			return err
+		}
+		// An imported video can reach here on its second run, having been an
+		// ordinary video on its first: it was archived before the still that
+		// claims it, so nothing knew it was a pair until that still arrived.
+		// Its playback rendition is now something no page will ever request.
+		return r.Store.SetPlaybackState(ctx, assetID, db.PlaybackNone)
 	}
 
 	if asset.MediaKind == db.MediaVideo {
@@ -290,6 +308,27 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 		r.Nudge()
 	}
 	return nil
+}
+
+// applyContentID records the Apple content identifier this file actually
+// carries and returns the asset as pairing left it.
+//
+// The file overrules whatever a client declared, which is what makes an import
+// pair at all: the declaration is a hint an importer offers to save a second
+// pass, and the maker note is the fact. Resolving can also adopt videos that
+// were already archived as ordinary ones — this still is the half that was
+// missing — and those come back needing their motion renditions built.
+func (r *Runner) applyContentID(ctx context.Context, assetID, contentID string) (db.Asset, error) {
+	asset, requeued, err := r.Store.SetContentID(ctx, assetID, contentID)
+	if err != nil {
+		return db.Asset{}, err
+	}
+	if len(requeued) > 0 {
+		r.log().Info("paired archived videos to a still that arrived after them",
+			"still", assetID, "content_id", contentID, "videos", len(requeued))
+		r.Nudge()
+	}
+	return asset, nil
 }
 
 // videoMetadata fills in what ffprobe knows better than exiftool and builds the
@@ -425,6 +464,13 @@ func (r *Runner) runPlayback(ctx context.Context, assetID string) error {
 	if asset.MediaKind != db.MediaVideo {
 		// Nothing to transcode. Not an error — reaching here means someone
 		// queued the wrong kind, and failing would retry it four more times.
+		return r.Store.SetPlaybackState(ctx, assetID, db.PlaybackNone)
+	}
+	if asset.IsLivePair() {
+		// It was an ordinary video when this job was queued and it is a Live
+		// Photo's motion now, because the still it belongs to was archived in
+		// between. Nothing will ever open a player on it, so spending a
+		// transcode here would be spending it on a rendition with no reader.
 		return r.Store.SetPlaybackState(ctx, assetID, db.PlaybackNone)
 	}
 

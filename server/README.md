@@ -61,6 +61,7 @@ GET  /v1/uploads/{id}            how much of it the server holds
 PUT  /v1/uploads/{id}            one chunk, positioned by Content-Range
 POST /v1/uploads/{id}/commit     verify, store, index
 DELETE /v1/uploads/{id}          abandon
+POST /v1/assets/{id}/import-metadata   an export's sidecar for an archived asset
 
 open:
 GET  /v1/timeline                JSON page, newest first, keyset cursor
@@ -79,7 +80,9 @@ GET  /health                     also reports pending and failed job counts
 
 Upload headers: `X-Photo-Filename`, `X-Photo-Md5`, `X-Photo-Size` and
 `X-Photo-Local-Id` are required; `X-Photo-Captured-At` and `X-Photo-Modified-At`
-(RFC3339) are optional. `X-Photo-Device-Id` is optional and no longer an identity
+(RFC3339) are optional, as are `X-Photo-Live-Parent-Local-Id` and
+`X-Photo-Content-Id`, the two ways an upload can declare it is half of a Live
+Photo. `X-Photo-Device-Id` is optional and no longer an identity
 claim — the token names the device, and a header that disagrees with it is a 403
 rather than a silent correction.
 
@@ -348,6 +351,97 @@ file a photo under the day it was taken instead of the day it falls on in
 whatever timezone the browser happens to be in. A photo shot at 23:50 in Vermont
 belongs under that day for a viewer in Berlin too.
 
+## Pairing a Live Photo
+
+A Live Photo is two files, and there are two independent ways to know they are
+two halves of one thing. The archive uses both, and writes both to the same two
+columns, so nothing downstream has to know which one did the work.
+
+**The declaration.** The phone names the still's local id on the video's upload
+(`X-Photo-Live-Parent-Local-Id`). It is known before a byte is sent, so the
+pairing is complete the moment the second half commits. It is also unavailable
+to anything that is not the phone.
+
+**The content identifier.** Apple stamps a UUID into both halves at capture: the
+maker note on a HEIC or JPEG, `com.apple.quicktime.content.identifier` on a MOV
+or MP4. Google's export preserves both, so this is what pairs a Takeout, a
+restored backup, and anything copied off a Mac. It is not known until something
+has read the file, which for an upload is after the bytes are already committed
+— so the metadata worker records it (`assets.content_id`) and resolves the
+pairing from whichever half it reaches second. An importer that has already read
+it can send `X-Photo-Content-Id` to have the pairing resolve in the same
+transaction as the insert, which saves building a poster and a transcode for a
+file that turns out to be three seconds of a Live Photo.
+
+The file always wins over the header. A client that declares an identifier the
+bytes do not carry costs a pairing until the worker looks, and nothing after:
+the resolution is undone and the asset it hid comes back.
+
+**A declared video is hidden from the timeline immediately; a discovered one is
+hidden only once it resolves.** The phone only declares a pairing for a video
+whose still is already queued behind it, so there is nothing to wait for. An
+export has no such guarantee — it can hold a paired video whose still was
+deleted years ago, and 44 of the 130 files in the sample export are exactly
+that. Those import as ordinary videos, with a poster and a playback rendition,
+and pair themselves the day their still turns up: the still's own metadata job
+adopts them, requeues their derivatives, and they leave the timeline.
+
+One identifier can name more than one still — an export can hold a HEIC and a
+JPEG re-export of the same capture — and the first one archived wins, ordered so
+the choice does not move under a reindex.
+
+## Importing a Google Photos export
+
+```sh
+photobackup import --from ~/Takeout/Google\ Photos [--dry-run]
+```
+
+It walks the export first and uploads second, because three decisions have to be
+made over the whole tree before anything is sent: which video belongs to which
+photo, which sidecar describes which file, and which directories are albums.
+Then it uploads every still before any video, so a paired video's row finds its
+still already archived.
+
+Uploads go over HTTPS to photod rather than straight into the blob tree, even
+though the command runs on the archive machine. That way an import commits in
+exactly the order an upload does, and two processes never append to
+`manifest.jsonl` at once. It mints itself a device credential from the database
+— the same authority `photobackup pair` already exercises — and reuses it across
+runs, which is what makes a re-run cost one request per two hundred files
+instead of re-reading the export. Re-running after a failure is the supported
+recovery, and uploads zero bytes for everything that landed.
+
+What it reads out of the export:
+
+| from | what |
+|---|---|
+| the file | the Apple content identifier, and everything exiftool reads |
+| `*.supplemental-metadata.json` | capture time, coordinates, caption, favourite, people, trash |
+| the directory | album membership, and the album's title from its `metadata.json` |
+
+The sidecars matter most for the files Google stripped: a screenshot or a saved
+image has no EXIF at all, and `photoTakenTime` is the only capture time it has.
+Coordinates from a sidecar are kept in `import_gps_lat`/`import_gps_lon` and
+feed `gps_lat`/`gps_lon` only where the file itself carried none — the metadata
+worker rewrites those two on every run, so a value merged straight into them
+would survive exactly until the next reindex.
+
+The whole sidecar is stored verbatim in `assets.import_metadata` as well. The
+export is usually deleted the week after the import, and that JSON is then the
+only copy of every field nobody has modelled yet.
+
+Sidecar naming is the fiddly part and `internal/takeout` owns all of it: Google
+caps the sidecar filename at 51 characters and truncates the
+`.supplemental-metadata` suffix to fit (`.supplemental-met.json`, `.s.json`),
+migrates a `(1)` collision counter to the end of the whole name, and writes no
+sidecar at all for a Live Photo's video half — which inherits the still's. A
+sidecar that matches no file is reported rather than dropped, because that is
+the signal the rules have changed again.
+
+`--dry-run` reports everything above and sends nothing. Trashed items are
+skipped unless `--include-trash`; `archived` and `favorited` are recorded and
+not acted on, because the gallery has nowhere to show them yet.
+
 ## Commit ordering
 
 An upload is committed blob first, then the manifest line, then the database
@@ -370,6 +464,7 @@ The maintenance CLI. Reads the same environment photod does.
 photobackup verify [--deep] [--fix]     audit the archive against itself
 photobackup export --to DIR [--copy]    materialize a date tree of hardlinks
 photobackup reindex [--adopt-orphans]   rebuild the database from manifest.jsonl
+photobackup import --from DIR           ingest a Google Photos export
 photobackup pair [--ttl 10m]            mint a single-use code to pair a device
 photobackup devices [--revoke ID]       list paired devices, or unpair one
 photobackup ca [--serve]                the CA to install on a device, and how

@@ -52,6 +52,14 @@ export interface AssetDetail {
   lens?: string;
   gps_lat?: number;
   gps_lon?: number;
+  // What an import knew and the file did not: a Google Takeout carries the
+  // caption, the star, and the album a photo was in in a JSON sidecar rather
+  // than in the photo. All absent on anything the phone delivered directly.
+  description?: string;
+  favorite?: boolean;
+  archived?: boolean;
+  albums?: string[];
+  people?: string[];
   state: DerivedState;
   playback_state?: PlaybackState;
 }

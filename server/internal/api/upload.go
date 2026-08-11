@@ -98,7 +98,12 @@ func (s *Server) finishUpload(
 			// knows which blobs are halves of a Live Photo. Without it a
 			// reindex would put every paired video back in the timeline.
 			LiveParentLocalID: meta.liveParentLocalID,
-			StoredAt:          time.Now().UTC(),
+			// Recorded for the same reason, and for one more: an import can
+			// pair from this alone, so a database rebuilt from the log knows
+			// which blobs are halves of a Live Photo without re-reading every
+			// original in the archive.
+			ContentID: meta.contentID,
+			StoredAt:  time.Now().UTC(),
 		}
 		if err := s.Manifest.Append(entry); err != nil {
 			s.logger().Error("append manifest", "error", err, "sha256", res.SHA256)
@@ -121,6 +126,7 @@ func (s *Server) finishUpload(
 		LocalID:          meta.localID,
 
 		LiveParentLocalID: meta.liveParentLocalID,
+		ContentID:         meta.contentID,
 	})
 	if err != nil {
 		s.logger().Error("record asset", "error", err, "sha256", res.SHA256)
@@ -155,6 +161,11 @@ type uploadMeta struct {
 	// two files share nothing but a capture time — so it is declared rather
 	// than inferred, and everything downstream keys off it.
 	liveParentLocalID string
+	// contentID is Apple's content identifier, when the client has already read
+	// it off the file. It is a hint that lets pairing resolve in the same
+	// transaction as the insert rather than a metadata job later; the worker
+	// replaces it with whatever the bytes say regardless.
+	contentID string
 }
 
 func parseUploadHeaders(r *http.Request) (uploadMeta, error) {
@@ -180,6 +191,8 @@ func parseUploadHeaders(r *http.Request) (uploadMeta, error) {
 		// would hide the asset from the timeline and pair it with itself.
 		return m, fmt.Errorf("X-Photo-Live-Parent-Local-Id names this same asset: %q", m.localID)
 	}
+
+	m.contentID = strings.TrimSpace(r.Header.Get("X-Photo-Content-Id"))
 
 	rawSize, err := requiredHeader(r, "X-Photo-Size")
 	if err != nil {

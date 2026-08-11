@@ -16,11 +16,13 @@ import {
   itemTop,
   layoutLevel,
   metricsFor,
+  thumbSizeFallbacks,
   thumbSizeFor,
   tileRect,
   visibleItems,
   DEFAULT_ZOOM,
   MAX_ZOOM,
+  THUMB_SIZES,
   ZOOM_LEVELS,
   type Day,
   type LevelLayout,
@@ -367,4 +369,21 @@ test("thumbSizeFor handles positions between and beyond the levels", () => {
   assert.equal(thumbSizeFor(1.6), 256);
   assert.equal(thumbSizeFor(-3), 96);
   assert.equal(thumbSizeFor(MAX_ZOOM + 3), 512);
+});
+
+test("thumbSizeFallbacks asks for what it wants, then settles downwards", () => {
+  assert.deepEqual(thumbSizeFallbacks(512), [512, 256, 96]);
+  assert.deepEqual(thumbSizeFallbacks(96), [96, 256, 512]);
+  // Bigger before smaller: 512 is further from 256 in pixels than 96 is, but it
+  // is the one that does not have to be stretched to fill the cell.
+  assert.deepEqual(thumbSizeFallbacks(256), [256, 512, 96]);
+});
+
+test("thumbSizeFallbacks offers every size exactly once", () => {
+  for (const size of THUMB_SIZES) {
+    const chain = thumbSizeFallbacks(size);
+    assert.equal(chain.length, THUMB_SIZES.length);
+    assert.equal(new Set(chain).size, THUMB_SIZES.length);
+    assert.equal(chain[0], size);
+  }
 });

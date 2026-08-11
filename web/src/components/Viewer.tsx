@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   fetchAsset,
@@ -20,6 +20,7 @@ import {
   mapLink,
 } from "@/lib/format";
 import { Button } from "@/components/ui/button";
+import { useLiveFade } from "@/hooks/useLiveFade";
 import { cn } from "@/lib/utils";
 
 /** The bar's controls are 34px, between shadcn's icon (32px) and icon-lg (36px). */
@@ -258,6 +259,10 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
  * the moment the viewer opens rather than when the press begins: the photo is
  * on screen immediately either way, and by the time anyone has decided to hold
  * down on it, ffmpeg has long since finished.
+ *
+ * The clip dissolves in over the photo once it is really playing and back out as
+ * it finishes, so the only thing a hold changes is that the picture starts
+ * moving — see useLiveFade.
  */
 function PhotoStage({
   item,
@@ -270,22 +275,30 @@ function PhotoStage({
   loaded: boolean;
   onLoad: () => void;
 }) {
-  const video = useRef<HTMLVideoElement>(null);
+  const fade = useLiveFade();
   const timer = useRef(0);
   const [playing, setPlaying] = useState(false);
   const live = item.live === "ready";
 
   useEffect(() => () => window.clearTimeout(timer.current), []);
 
-  const stop = useCallback(() => {
+  /**
+   * Ends the clip, whether it ran out or the press did.
+   *
+   * Pausing and rewinding wait for the fade to finish: doing either to a video
+   * that is still half on screen is the jump cut the fade is there to hide.
+   */
+  const stop = () => {
     window.clearTimeout(timer.current);
-    setPlaying(false);
-    const el = video.current;
-    if (el) {
-      el.pause();
-      el.currentTime = 0;
-    }
-  }, []);
+    fade.end(() => {
+      setPlaying(false);
+      const el = fade.ref.current;
+      if (el) {
+        el.pause();
+        el.currentTime = 0;
+      }
+    });
+  };
 
   const press = (e: React.PointerEvent) => {
     if (!live || e.button !== 0) return;
@@ -298,7 +311,7 @@ function PhotoStage({
 
     window.clearTimeout(timer.current);
     timer.current = window.setTimeout(async () => {
-      const el = video.current;
+      const el = fade.ref.current;
       if (!el) return;
       el.currentTime = 0;
       setPlaying(true);
@@ -308,7 +321,7 @@ function PhotoStage({
         // A press is a user gesture, so sound is allowed — but a browser that
         // disagrees should cost the audio, not the animation.
         el.muted = true;
-        await el.play().catch(() => setPlaying(false));
+        await el.play().catch(stop);
       }
     }, HOLD_MS);
   };
@@ -321,22 +334,27 @@ function PhotoStage({
       onPointerCancel={stop}
     >
       {/* The preview renders straight from the blob, so it works even while the
-          thumbnail job is still queued. */}
+          thumbnail job is still queued. It stays lit underneath the clip rather
+          than crossing over with it: two images dissolving into each other are
+          both part-transparent halfway through, and the backdrop showing between
+          them dims the photo just as the motion starts. */}
       <img
         className={MEDIA}
         src={previewUrl(item.id)}
         alt={alt}
         draggable={false}
         onLoad={onLoad}
-        style={{ opacity: loaded && !playing ? 1 : 0 }}
+        style={{ opacity: loaded ? 1 : 0 }}
       />
 
       {live ? (
         <>
           <video
-            ref={video}
+            // Dissolves in once the clip is really playing, and back out into
+            // the photo before its last frame. It brings its own transition, so
+            // MEDIA's 120ms is left to the still underneath.
+            {...fade.props}
             className={cn(MEDIA, "absolute")}
-            style={{ opacity: playing ? 1 : 0 }}
             src={livePreviewUrl(item.id)}
             preload="auto"
             playsInline

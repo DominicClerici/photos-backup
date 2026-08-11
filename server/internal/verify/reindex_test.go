@@ -13,7 +13,7 @@ import (
 func (a *archive) dropIndex(t *testing.T) {
 	t.Helper()
 	if _, err := a.store.Pool().Exec(context.Background(),
-		"truncate table assets, device_assets, jobs"); err != nil {
+		"truncate table assets, device_assets, jobs cascade"); err != nil {
 		t.Fatalf("drop index: %v", err)
 	}
 }

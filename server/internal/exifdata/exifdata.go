@@ -10,10 +10,13 @@
 package exifdata
 
 import (
+	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"time"
@@ -50,6 +53,16 @@ type Data struct {
 	OffsetMinutes *int
 
 	DurationSeconds *float64
+
+	// ContentID is Apple's content identifier: the UUID both halves of a Live
+	// Photo carry, uppercased. It is the only thing that ties a still to its
+	// video once they are two files on a disk — the phone's upload declaration
+	// is unavailable to anything the phone did not upload, and an export's
+	// filenames agree only by convention.
+	//
+	// Empty on anything an iPhone did not capture, and on plenty it did: a
+	// screenshot has none, and neither does an ordinary video.
+	ContentID string
 }
 
 // DisplaySize returns the dimensions as the image is meant to be seen, swapping
@@ -82,6 +95,12 @@ var tags = []string{
 	"-Make", "-Model", "-LensModel",
 	"-GPSLatitude", "-GPSLongitude",
 	"-Duration",
+	// One tag name, two entirely different places. exiftool resolves
+	// -ContentIdentifier to the Apple maker note on a HEIC or JPEG and to the
+	// QuickTime keys atom on a MOV or MP4, which is exactly the pair of
+	// locations a Live Photo's two halves keep it in. MediaGroupUUID is the
+	// same maker-note value under the name older exiftool builds used.
+	"-ContentIdentifier", "-MediaGroupUUID",
 }
 
 // raw mirrors exiftool's JSON. Numbers come back as numbers because of -n;
@@ -107,6 +126,9 @@ type raw struct {
 	GPSLongitude *float64 `json:"GPSLongitude"`
 
 	Duration *float64 `json:"Duration"`
+
+	ContentIdentifier string `json:"ContentIdentifier"`
+	MediaGroupUUID    string `json:"MediaGroupUUID"`
 }
 
 // Read runs exiftool over one file.
@@ -142,6 +164,109 @@ func (r *Reader) Read(ctx context.Context, path string) (Data, error) {
 	return parsed[0].toData(), nil
 }
 
+// Scanned is one file a tree scan could say something about.
+type Scanned struct {
+	Path string
+	// ContentID is the Apple content identifier, empty when the file has none.
+	ContentID string
+	// MIMEType is what exiftool made of the file, which is the same question
+	// mediatype asks of an upload and a more informed answer: it comes from
+	// parsing the container rather than from sniffing 512 bytes, and an export
+	// contains files whose extension lies about them — the sample has a PNG
+	// that is a JPEG.
+	MIMEType string
+}
+
+// IsVideo reports whether the file is a video, which is what decides which half
+// of a Live Photo it could be.
+func (s Scanned) IsVideo() bool { return strings.HasPrefix(strings.ToLower(s.MIMEType), "video/") }
+
+// ScanTree reads the pairing-relevant metadata off every file under root,
+// calling fn once per file exiftool could identify.
+//
+// One exiftool process for the whole tree rather than Read per file, which is
+// the difference between a few seconds and half an hour on a hundred-thousand
+// file export: almost all of Read's cost is process startup, and an import has
+// to know every identifier in the tree before it can upload the first file —
+// it decides which video belongs to which still, and that decision has to be
+// made before anything is sent.
+//
+// Errors exiftool reports about individual files are ignored. A tree that has
+// been through a phone, a cloud, and a zip contains files nothing can parse,
+// and none of them are a reason to refuse to import the rest.
+func (r *Reader) ScanTree(ctx context.Context, root string, fn func(Scanned) error) error {
+	cmd := exec.CommandContext(ctx, r.binary(),
+		"-json", "-n",
+		"-q", "-q", // suppress the per-file warnings and the trailing summary
+		"-r",
+		"-api", "LargeFileSupport=1",
+		"-charset", "filename=UTF8",
+		"-ContentIdentifier", "-MediaGroupUUID", "-MIMEType",
+		root,
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("pipe exiftool output: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start exiftool: %w", err)
+	}
+	// Decoded a record at a time. The whole-tree JSON for a large export is
+	// tens of megabytes, and there is no reason for any of it to be resident
+	// once the caller has been handed it.
+	scanErr := scanTree(bufio.NewReaderSize(stdout, 64*1024), fn)
+
+	// Drained either way: a decoder that stopped early leaves exiftool blocked
+	// on a write to a pipe nobody is reading, and Wait would never return.
+	_, _ = io.Copy(io.Discard, stdout)
+	if err := cmd.Wait(); err != nil && scanErr == nil {
+		// Exit status 1 with no output at all is "found nothing to read",
+		// which an empty or media-free directory legitimately produces.
+		return fmt.Errorf("exiftool %s: %w: %s", root, err, bytes.TrimSpace(stderr.Bytes()))
+	}
+	return scanErr
+}
+
+func scanTree(r io.Reader, fn func(Scanned) error) error {
+	dec := json.NewDecoder(r)
+
+	// The opening bracket. Absent when exiftool found nothing, which is not an
+	// error — it is an export directory holding no readable media.
+	if _, err := dec.Token(); err != nil {
+		if err == io.EOF {
+			return nil
+		}
+		return fmt.Errorf("read exiftool output: %w", err)
+	}
+
+	for dec.More() {
+		var entry struct {
+			SourceFile        string `json:"SourceFile"`
+			ContentIdentifier string `json:"ContentIdentifier"`
+			MediaGroupUUID    string `json:"MediaGroupUUID"`
+			MIMEType          string `json:"MIMEType"`
+		}
+		if err := dec.Decode(&entry); err != nil {
+			return fmt.Errorf("parse exiftool output: %w", err)
+		}
+		if entry.SourceFile == "" {
+			continue
+		}
+		err := fn(Scanned{
+			Path:      entry.SourceFile,
+			ContentID: NormalizeContentID(cmp.Or(entry.ContentIdentifier, entry.MediaGroupUUID)),
+			MIMEType:  entry.MIMEType,
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *Reader) binary() string {
 	if r.Binary == "" {
 		return "exiftool"
@@ -160,6 +285,7 @@ func (x raw) toData() Data {
 		GPSLat:          x.GPSLatitude,
 		GPSLon:          x.GPSLongitude,
 		DurationSeconds: x.Duration,
+		ContentID:       NormalizeContentID(cmp.Or(x.ContentIdentifier, x.MediaGroupUUID)),
 	}
 
 	// Preference order: the most specific tag that a file actually carries.
@@ -176,6 +302,49 @@ func (x raw) toData() Data {
 		}
 	}
 	return d
+}
+
+// NormalizeContentID puts an Apple content identifier into the one spelling the
+// archive compares, and rejects anything that is not one.
+//
+// Both halves of a pair must normalize identically or they will never meet, and
+// they arrive by different routes: read out of a maker note here, declared in an
+// upload header by a client that read it somewhere else, replayed from a
+// manifest line written by an older build. Uppercasing and unwrapping braces
+// settles the spellings that actually occur.
+//
+// The shape check is the part that matters. Pairing on this value hides one
+// asset behind another, so a tag holding something that is not a UUID — a
+// camera that reuses the name for a serial number, a file a tool rewrote — is
+// discarded rather than matched on. Two such files sharing a value would
+// otherwise hide one of them.
+func NormalizeContentID(raw string) string {
+	id := strings.ToUpper(strings.TrimSpace(raw))
+	id = strings.TrimSuffix(strings.TrimPrefix(id, "{"), "}")
+	if !isCanonicalUUID(id) {
+		return ""
+	}
+	return id
+}
+
+// isCanonicalUUID reports whether s is 8-4-4-4-12 hex.
+func isCanonicalUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if (c < '0' || c > '9') && (c < 'A' || c > 'F') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // parseCapture turns EXIF's "2026:04:30 18:12:00" into an instant.

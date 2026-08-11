@@ -12,12 +12,20 @@ import (
 // side by side so a disagreement stays visible, and the timeline's generated
 // sort_time column prefers the file's — which is what puts an old photo
 // imported into Photos last week in the right place rather than at the top.
+//
+// The coordinates are the one field with a third source. An import sidecar can
+// carry them for a file whose own EXIF has none — a screenshot, or anything a
+// messaging app stripped — and this job runs after the import wrote them and
+// would otherwise overwrite them with the null it read. Falling back rather
+// than merging keeps the precedence honest in both directions: the file's own
+// answer wins whenever it has one, and the sidecar fills the gap, on this run
+// and on every re-run.
 func (s *Store) ApplyMetadata(ctx context.Context, assetID string, m Metadata) error {
 	const update = `
 		update assets set
 			width = $2, height = $3, orientation = $4, duration_seconds = $5,
 			camera_make = nullif($6, ''), camera_model = nullif($7, ''), lens = nullif($8, ''),
-			gps_lat = $9, gps_lon = $10,
+			gps_lat = coalesce($9, import_gps_lat), gps_lon = coalesce($10, import_gps_lon),
 			exif_captured_at = $11, exif_offset_minutes = $12,
 			derived_state = 'ready'
 		where id = $1::uuid`
@@ -51,10 +59,13 @@ func (s *Store) SetDerivedState(ctx context.Context, assetID, state string) erro
 //
 // It refuses to promote an asset that is not half of a Live Photo, so a
 // mis-queued job cannot make an ordinary video claim motion it does not have.
+// Both kinds of pairing count, since an imported video is only ever the
+// resolved kind — see IsLivePair.
 func (s *Store) SetLiveState(ctx context.Context, assetID, state string) error {
 	if _, err := s.pool.Exec(ctx,
 		`update assets set live_state = $2
-		 where id = $1::uuid and live_parent_local_id <> ''`, assetID, state); err != nil {
+		 where id = $1::uuid
+		   and (live_parent_local_id <> '' or live_parent_asset_id is not null)`, assetID, state); err != nil {
 		return fmt.Errorf("set live state of %s: %w", assetID, err)
 	}
 	return nil

@@ -183,6 +183,9 @@ func runReindex(ctx context.Context, args []string) (int, error) {
 
 	fmt.Printf("%d inserted, %d already indexed, %d device mappings restored\n",
 		result.Inserted, result.Existing, result.Mappings)
+	if result.Described > 0 {
+		fmt.Printf("%d import sidecars replayed\n", result.Described)
+	}
 	if result.Adopted > 0 {
 		fmt.Printf("%d blobs adopted with no manifest line — their original filenames are gone\n", result.Adopted)
 	}

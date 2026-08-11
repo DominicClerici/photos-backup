@@ -129,6 +129,52 @@ anywhere:
 sudo -u photod env TLS_DIR=/var/lib/photod/tls photobackup ca --serve --addr :8789
 ```
 
+## Redeploying after a change
+
+The Install section above is the first deployment. Every one after it is:
+
+```sh
+photobackup-admin redeploy
+```
+
+It rebuilds `photod` and `photobackup` from the checkout, updates any of the
+installed unit files that have drifted from `deploy/`, restarts photod, and
+waits for `/health` to answer before reporting success. If it does not answer
+within fifteen seconds it prints the unit status and the last thirty journal
+lines and exits non-zero.
+
+```sh
+photobackup-admin redeploy --dry-run          # build and diff, change nothing
+photobackup-admin redeploy --src ~/src/photos-backup
+```
+
+Three things worth knowing:
+
+- **The build happens before the stop.** A tree that does not compile costs a
+  minute and leaves the running service untouched. Downtime is the install and
+  the restart, a second or two.
+- **It runs as you, not as photod.** The Go build cache belongs to the invoking
+  user, and photod has no shell and no read access to the repository. This is
+  why `redeploy` is handled inside the wrapper rather than being a `photobackup`
+  subcommand — it is the one thing here that is not about the archive.
+- **It finds the source tree by walking up from the current directory**, looking
+  for `server/go.mod` and `deploy/` together. Run it from anywhere inside the
+  checkout, or set `PHOTOBACKUP_SRC`, or pass `--src`.
+
+Unit files are only refreshed if they are already installed; `redeploy` will not
+perform a first install, and it refuses to run at all if `photod.service` is
+missing. `systemctl daemon-reload` runs only when something actually changed.
+
+Binaries are installed by writing beside the target and renaming, so nothing
+ever reads a half-written file — including `photobackup-admin`, which replaces
+itself from the same tree as the binaries it installs. That does mean the very
+first `redeploy` has to come from the checkout, since the installed copy predates
+the subcommand:
+
+```sh
+./deploy/photobackup-admin redeploy
+```
+
 ## Pairing the phone
 
 Three steps, in this order. The first two are once per phone; the last is once

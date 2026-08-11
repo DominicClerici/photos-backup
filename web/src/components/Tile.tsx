@@ -2,9 +2,10 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { useLiveFade } from "@/hooks/useLiveFade";
 import { liveThumbUrl, thumbUrl, type TimelineItem } from "@/lib/api";
 import { formatDuration } from "@/lib/format";
-import { BASE_THUMB_SIZE, type ThumbSize } from "@/lib/layout";
+import { BASE_THUMB_SIZE, thumbSizeFallbacks, type ThumbSize } from "@/lib/layout";
 import { cn } from "@/lib/utils";
 
 /**
@@ -15,6 +16,12 @@ import { cn } from "@/lib/utils";
  * animation nobody was going to see.
  */
 const HOVER_DELAY_MS = 120;
+
+/**
+ * `MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED`, which is what a 404 looks like from
+ * inside a <video>: the response arrived, and it was not something to play.
+ */
+const SRC_NOT_SUPPORTED = 4;
 
 interface Props {
   item: TimelineItem;
@@ -56,7 +63,7 @@ export function Tile({ item, size, thumbSize, transform, day, offset, onOpen }: 
   return (
     <button
       type="button"
-      className="group absolute top-0 left-0 block origin-top-left overflow-hidden rounded-md bg-tile focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+      className="absolute top-0 left-0 block origin-top-left overflow-hidden bg-tile focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
       style={{ width: size, height: size, transform }}
       data-day={day}
       data-tile={offset}
@@ -65,7 +72,7 @@ export function Tile({ item, size, thumbSize, transform, day, offset, onOpen }: 
     >
       {attempt ? (
         <img
-          className="block size-full object-cover transition-[filter] group-hover:brightness-[1.08]"
+          className="block size-full object-cover"
           src={src}
           alt=""
           loading="lazy"
@@ -186,56 +193,79 @@ function useThumb(
 /**
  * The three seconds a Live Photo carries, played over its own still.
  *
- * The still stays mounted underneath rather than being swapped out. The video
- * fades in only once it is actually playing, so a slow first frame shows the
- * photo rather than a black square, and the fade back out at the end lands on
- * the picture that was there all along.
+ * The still stays mounted underneath rather than being swapped out, so the
+ * dissolve is between two pictures of the same moment and never lets the tile
+ * show through. The video fades in only once it is actually playing, so a slow
+ * first frame shows the photo rather than a black square, and it has faded back
+ * out by the time the clip stops moving.
  *
  * Hover, not touch: pointerenter fires for a tap too, but pointerleave often
  * does not, which leaves a video playing under a finger that has moved on.
  */
 function Motion({ id, size }: { id: string; size: ThumbSize }) {
   const timer = useRef(0);
-  const [armed, setArmed] = useState(false);
-  const [visible, setVisible] = useState(false);
+  // Zero until a hover has rested long enough, then which hover it was: the
+  // number is the video's key, so arming again always mounts a fresh element
+  // rather than reusing one that is halfway through leaving.
+  const [armed, setArmed] = useState(0);
+  const [missing, setMissing] = useState<Set<ThumbSize>>(() => new Set());
+  const fade = useLiveFade();
 
   useEffect(() => () => window.clearTimeout(timer.current), []);
 
   const enter = () => {
     window.clearTimeout(timer.current);
-    timer.current = window.setTimeout(() => setArmed(true), HOVER_DELAY_MS);
+    timer.current = window.setTimeout(() => setArmed((take) => take + 1), HOVER_DELAY_MS);
   };
 
   const leave = () => {
     window.clearTimeout(timer.current);
-    setVisible(false);
-    setArmed(false);
+    const take = armed;
+    // Only the hover this was: a pointer that comes back before the fade is out
+    // arms a new one, and that clip must not be unmounted by an older leave.
+    fade.end(() => setArmed((current) => (current === take ? 0 : current)));
   };
+
+  const playable = thumbSizeFallbacks(size).find((option) => !missing.has(option));
 
   return (
     // Mounted on hover and unmounted on leave, which is what makes coming back
     // to a tile play the clip again rather than resume it three frames from the
-    // end.
+    // end. The unmount waits out the fade: pulling the element mid-dissolve is
+    // the cut all over again.
     <span className="absolute inset-0" onMouseEnter={enter} onMouseLeave={leave}>
-      {armed ? (
+      {armed && playable !== undefined ? (
         <video
-          className="block size-full object-cover transition-opacity duration-150"
-          style={{ opacity: visible ? 1 : 0 }}
-          // Matched to the still it plays over. Nothing to preload or fall back
-          // from: this is mounted on hover over an image that stays underneath,
-          // so a size that is not there yet simply never fades in.
-          src={liveThumbUrl(id, size)}
+          key={armed}
+          // Dissolves in once the clip is really playing, and back out into the
+          // still before its last frame.
+          {...fade.props}
+          className="block size-full object-cover"
+          // Matched to the still it plays over, and falling back the same way it
+          // does when that size was never rendered — a 404 here is a gap in what
+          // is stored, and the wrong size playing beats nothing playing. The
+          // still stays underneath throughout, so a size that is on its second
+          // or third try simply fades in later.
+          src={liveThumbUrl(id, playable)}
           // Muted is not a preference here: a hover is not a user gesture, and
           // every browser refuses to autoplay sound without one.
           muted
           autoPlay
           playsInline
           preload="auto"
-          onPlaying={() => setVisible(true)}
           // Once through, then back to the photo — the same as pressing a Live
-          // Photo on the phone and letting go.
-          onEnded={() => setVisible(false)}
-          onError={() => setVisible(false)}
+          // Photo on the phone and letting go. The fade has normally run itself
+          // out by now; this covers the clip whose duration never arrived.
+          onEnded={() => fade.end()}
+          onError={(e) => {
+            fade.end();
+            // Only a rendition that is not there: a clip that fails partway
+            // through has one, and asking a different size to start over under a
+            // pointer that has already seen it play is not a recovery.
+            if (e.currentTarget.error?.code === SRC_NOT_SUPPORTED) {
+              setMissing((prev) => new Set(prev).add(playable));
+            }
+          }}
         />
       ) : null}
     </span>

@@ -50,8 +50,12 @@ type Declaration struct {
 	// one. Deliberately not part of ID: it describes the relationship, not the
 	// bytes, and a session must resume under the same id whether or not the
 	// client repeats it.
-	LiveParentLocalID string    `json:"live_parent_local_id,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
+	LiveParentLocalID string `json:"live_parent_local_id,omitempty"`
+	// ContentID is Apple's content identifier if the client already knows it.
+	// Like LiveParentLocalID it describes the file rather than the bytes, and
+	// like it, it is deliberately not part of ID.
+	ContentID string    `json:"content_id,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Session is a declaration plus how much of it has arrived.

@@ -152,6 +152,65 @@ func (s *Store) Pair(ctx context.Context, rawCode, name, platform, from string) 
 	return d, token, nil
 }
 
+// Provision returns a device for a client running on this machine, minting it a
+// fresh token. It creates the device the first time and reuses it afterwards,
+// keyed by name.
+//
+// No pairing code, on the same reasoning that lets `photobackup pair` write one
+// straight into the database: the authority a code exists to transfer is
+// filesystem access to this database, and a caller of this function already has
+// it. A code would only be a ceremony a local import performed against itself.
+//
+// Reusing the row rather than creating one per run is what makes an import
+// resumable. The device id is half of every mapping sync/check consults, so a
+// second run under a new id would re-offer a library the archive already holds
+// and re-hash all of it to find that out.
+//
+// The token is rotated on every call because only its digest is kept, so the
+// old one cannot be handed back. Rotating also revives a device that was
+// revoked, which is the honest reading of running the command again.
+func (s *Store) Provision(ctx context.Context, name, platform string) (Device, string, error) {
+	token, digest, err := newToken()
+	if err != nil {
+		return Device{}, "", err
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Device{}, "", fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	const adopt = `
+		update devices
+		set token_sha256 = $3, revoked_at = null, last_seen_at = now()
+		where id = (
+			select id from devices
+			where name = $1 and platform = $2
+			order by created_at
+			limit 1
+		)
+		returning id::text, name, platform, created_at, last_seen_at, revoked_at, paired_from`
+
+	d, err := scanDevice(tx.QueryRow(ctx, adopt, name, platform, digest))
+	if errors.Is(err, pgx.ErrNoRows) {
+		const insert = `
+			insert into devices (name, platform, token_sha256, paired_from)
+			values ($1, $2, $3, 'local')
+			returning id::text, name, platform, created_at, last_seen_at, revoked_at, paired_from`
+		if d, err = scanDevice(tx.QueryRow(ctx, insert, name, platform, digest)); err != nil {
+			return Device{}, "", fmt.Errorf("create local device: %w", err)
+		}
+	} else if err != nil {
+		return Device{}, "", fmt.Errorf("provision local device: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Device{}, "", fmt.Errorf("commit transaction: %w", err)
+	}
+	return d, token, nil
+}
+
 // Authenticate resolves a bearer token to the device holding it.
 //
 // The lookup is by digest, so no secret-dependent comparison happens in this

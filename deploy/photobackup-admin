@@ -14,11 +14,237 @@
 #
 #   sudo install -m 0755 deploy/photobackup-admin /usr/local/bin/
 #
-# Usage: photobackup-admin <pair|devices|ca|verify|export|reindex|reset> [args...]
+# Usage: photobackup-admin <pair|devices|ca|verify|export|reindex|import|reset> [args...]
+#        photobackup-admin redeploy [--src DIR] [--dry-run]
+#
+# `redeploy` is the one subcommand that is not a photobackup subcommand. It
+# rebuilds photod and photobackup from a source tree and swaps them in, so it
+# runs as the invoking user — the Go build cache belongs to that user, and
+# photod has no shell, no toolchain and no read access to the repository.
 
 set -eu
 
 ENV_FILE=${PHOTOD_ENV:-/etc/photod/photod.env}
+BIN_DIR=/usr/local/bin
+UNIT_DIR=/etc/systemd/system
+AVAHI_SERVICE=/etc/avahi/services/photobackup.service
+
+die() {
+	echo "photobackup-admin: $*" >&2
+	exit 1
+}
+
+# ---------------------------------------------------------------- redeploy ---
+
+DRY=
+UNITS_CHANGED=
+
+redeploy_usage() {
+	cat >&2 <<'EOF'
+usage: photobackup-admin redeploy [--src DIR] [--dry-run]
+
+Rebuild photod and photobackup from the source tree, sync the systemd units,
+and restart photod. Everything is built before anything is stopped, so a tree
+that does not compile leaves the running service exactly where it was.
+
+  --src DIR   repository to build from. Defaults to $PHOTOBACKUP_SRC, then to
+              the repository containing the current directory.
+  --dry-run   print what would happen and change nothing.
+EOF
+}
+
+run() {
+	if [ -n "$DRY" ]; then
+		printf '  would: %s\n' "$*"
+	else
+		"$@"
+	fi
+}
+
+step() {
+	printf '==> %s\n' "$*"
+}
+
+# repo_root walks up from a directory looking for the module root and the
+# deploy tree together, so a stray go.mod elsewhere cannot be mistaken for it.
+repo_root() {
+	dir=$(cd "$1" 2>/dev/null && pwd) || return 1
+	while :; do
+		if [ -f "$dir/server/go.mod" ] && [ -d "$dir/deploy" ]; then
+			printf '%s\n' "$dir"
+			return 0
+		fi
+		if [ "$dir" = "/" ]; then
+			return 1
+		fi
+		dir=$(dirname "$dir")
+	done
+}
+
+# An installed unit that has drifted from the repository is the common case
+# here: the file under /etc is a copy, and nothing else updates it. Files that
+# were never installed are reported rather than created — redeploy replaces a
+# deployment, it does not perform the first one.
+sync_unit() {
+	# Prefixed because sh has no locals and redeploy holds a $src of its own.
+	_src=$1
+	_dest=$2
+	if [ ! -e "$_dest" ]; then
+		echo "  skip    $_dest (never installed)"
+		return 0
+	fi
+	if cmp -s "$_src" "$_dest"; then
+		return 0
+	fi
+	echo "  update  $_dest"
+	run sudo install -m 0644 "$_src" "$_dest"
+	UNITS_CHANGED=yes
+}
+
+# Replacing a file in place truncates the inode that a running process — or
+# this very script — is still reading from. Write beside it and rename, which
+# is atomic and leaves anything holding the old file holding a whole one.
+install_atomic() {
+	_src=$1
+	_dest=$2
+	_mode=$3
+	run sudo install -m "$_mode" "$_src" "$_dest.new"
+	run sudo mv -f "$_dest.new" "$_dest"
+}
+
+# The read-only listener answers /health without a token, which makes it the
+# one check that proves photod came back up rather than merely started.
+health_addr() {
+	addr=$(sudo awk -F= '/^[[:space:]]*PLAINTEXT_ADDR[[:space:]]*=/ {
+		gsub(/[[:space:]]/, "", $2); print $2; exit }' "$ENV_FILE" 2>/dev/null || true)
+	[ -n "$addr" ] || addr=127.0.0.1:8788
+	case $addr in
+	:*) addr=127.0.0.1$addr ;;
+	esac
+	printf '%s\n' "$addr"
+}
+
+wait_healthy() {
+	i=0
+	while [ "$i" -lt 30 ]; do
+		if curl -sf --max-time 2 "http://$1/health" >/dev/null 2>&1; then
+			return 0
+		fi
+		i=$((i + 1))
+		sleep 0.5
+	done
+	return 1
+}
+
+redeploy() {
+	src=${PHOTOBACKUP_SRC:-}
+
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--src)
+			[ $# -ge 2 ] || die "redeploy: --src needs a directory"
+			src=$2
+			shift 2
+			;;
+		--src=*)
+			src=${1#--src=}
+			shift
+			;;
+		--dry-run)
+			DRY=yes
+			shift
+			;;
+		-h | --help)
+			redeploy_usage
+			return 0
+			;;
+		*)
+			redeploy_usage
+			die "redeploy: unknown argument $1"
+			;;
+		esac
+	done
+
+	if [ -n "$src" ]; then
+		src=$(repo_root "$src") || die "redeploy: $src is not a photos-backup checkout"
+	else
+		src=$(repo_root .) || die "redeploy: run this from the repository, or pass --src DIR"
+	fi
+
+	command -v go >/dev/null 2>&1 || die "redeploy: go is not on PATH"
+	[ -e "$UNIT_DIR/photod.service" ] ||
+		die "redeploy: photod.service is not installed — see deploy/README.md"
+
+	rev=$(git -C "$src" describe --always --dirty --tags 2>/dev/null || echo unknown)
+	step "redeploying from $src ($rev)"
+
+	# Ask for the password now. The alternative is a sudo prompt appearing
+	# between the stop and the start, with the service down while it waits.
+	[ -n "$DRY" ] || sudo -v
+
+	stage=$(mktemp -d) || die "redeploy: cannot create a build directory"
+	trap 'rm -rf "$stage"' EXIT INT TERM
+
+	# Before the stop, deliberately: a failed build must cost nothing but time.
+	step "building"
+	go build -C "$src/server" -o "$stage/photod" ./cmd/photod
+	go build -C "$src/server" -o "$stage/photobackup" ./cmd/photobackup
+
+	step "syncing units"
+	sync_unit "$src/deploy/photod.service" "$UNIT_DIR/photod.service"
+	sync_unit "$src/deploy/photobackup-verify.service" "$UNIT_DIR/photobackup-verify.service"
+	sync_unit "$src/deploy/photobackup-verify.timer" "$UNIT_DIR/photobackup-verify.timer"
+	sync_unit "$src/deploy/photobackup.avahi.service" "$AVAHI_SERVICE"
+
+	step "stopping photod"
+	run sudo systemctl stop photod
+
+	step "installing binaries"
+	install_atomic "$stage/photod" "$BIN_DIR/photod" 0755
+	install_atomic "$stage/photobackup" "$BIN_DIR/photobackup" 0755
+	# This script, replacing itself, from the same tree as the binaries.
+	if ! cmp -s "$src/deploy/photobackup-admin" "$BIN_DIR/photobackup-admin"; then
+		echo "  update  $BIN_DIR/photobackup-admin"
+		install_atomic "$src/deploy/photobackup-admin" "$BIN_DIR/photobackup-admin" 0755
+	fi
+
+	if [ -n "$UNITS_CHANGED" ]; then
+		run sudo systemctl daemon-reload
+	fi
+
+	step "starting photod"
+	run sudo systemctl start photod
+
+	if [ -n "$DRY" ]; then
+		step "dry run: nothing changed"
+		return 0
+	fi
+
+	addr=$(health_addr)
+	if command -v curl >/dev/null 2>&1; then
+		if wait_healthy "$addr"; then
+			step "photod is up on $addr ($rev)"
+			return 0
+		fi
+		echo >&2
+		echo "photobackup-admin: photod did not answer http://$addr/health" >&2
+		sudo systemctl --no-pager --lines=0 status photod >&2 || true
+		sudo journalctl -u photod --no-pager --lines=30 >&2 || true
+		return 1
+	fi
+
+	sudo systemctl is-active --quiet photod ||
+		die "redeploy: photod is not running — journalctl -u photod -n 30"
+	step "photod is running ($rev; curl not found, health not checked)"
+}
+
+# ---------------------------------------------------------------- dispatch ---
+
+if [ "${1:-}" = "redeploy" ]; then
+	shift
+	redeploy "$@"
+	exit
+fi
 
 if [ ! -r "$ENV_FILE" ] && [ "$(id -u)" -ne 0 ]; then
 	# Readable only by root:photod, so this check is advisory when unprivileged.

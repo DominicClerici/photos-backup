@@ -35,10 +35,18 @@ type TimelineItem struct {
 // paired videos, which are shown as their still's motion rather than as items
 // of their own.
 //
-// It filters on the declaration, not on the resolution. A video whose still has
-// not arrived yet is still a Live Photo's video and still not a thing anyone
-// took, so hiding it does not wait on the pairing being complete.
-const visibleAssets = `live_parent_local_id = ''`
+// A phone's declaration is enough on its own: it is only ever made about a
+// video whose still is already queued behind it, so hiding does not have to
+// wait for the pairing to complete.
+//
+// An identifier read off an imported file is not enough on its own, which is
+// why the resolution is checked too rather than instead. An export can hold a
+// paired video whose still was deleted years ago — a third of the sample export
+// is exactly that — and those are ordinary videos as far as anyone looking at
+// this archive is concerned. Hiding one would archive it into invisibility;
+// showing it costs a duplicate-looking tile for as long as it takes the still
+// to turn up, and it disappears by itself when one does.
+const visibleAssets = `live_parent_local_id = '' and live_parent_asset_id is null`
 
 // liveJoin attaches a still's motion state. Lateral with a limit rather than a
 // plain join: the same still can be reached by two devices' copies of the same

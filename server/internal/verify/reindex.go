@@ -36,7 +36,9 @@ type ReindexResult struct {
 	Adopted  int64
 	Missing  int64
 	Mappings int64
-	Elapsed  time.Duration
+	// Described counts import sidecars replayed onto assets.
+	Described int64
+	Elapsed   time.Duration
 }
 
 // Reindex rebuilds the database from manifest.jsonl and the blob tree.
@@ -55,6 +57,7 @@ func Reindex(ctx context.Context, d Deps, opt ReindexOptions) (ReindexResult, er
 	var result ReindexResult
 
 	seen := make(map[string]struct{})
+	var pending []manifest.Entry
 	path := filepath.Join(d.PhotosRoot, "manifest.jsonl")
 
 	err := manifest.Scan(path, func(e manifest.Entry) error {
@@ -63,6 +66,15 @@ func Reindex(ctx context.Context, d Deps, opt ReindexOptions) (ReindexResult, er
 			opt.Progress(result.Lines)
 		}
 		if e.SHA256 == "" {
+			return nil
+		}
+		if !e.IsAsset() {
+			// A line describing an asset rather than recording one. Held back
+			// and applied at the end, because the asset it names may be
+			// several thousand lines further down this same log — the import
+			// uploads a file and describes it, but a rebuild replays both in
+			// the order they were written, not the order they resolve in.
+			pending = append(pending, e)
 			return nil
 		}
 		seen[e.SHA256] = struct{}{}
@@ -92,6 +104,14 @@ func Reindex(ctx context.Context, d Deps, opt ReindexOptions) (ReindexResult, er
 		if err := adoptOrphans(ctx, d, opt, seen, &result); err != nil {
 			return result, err
 		}
+	}
+
+	if !opt.DryRun {
+		if err := replayImports(ctx, d, pending, &result); err != nil {
+			return result, err
+		}
+	} else {
+		result.Described = int64(len(pending))
 	}
 
 	result.Elapsed = time.Since(started)
@@ -134,6 +154,11 @@ func assetFromEntry(d Deps, e manifest.Entry) (db.Asset, bool, error) {
 		LocalID:          e.LocalID,
 
 		LiveParentLocalID: e.LiveParentLocalID,
+		// Without this a rebuild would restore every imported Live Photo as two
+		// separate items and only get them back together once the metadata
+		// worker had re-read all of them — which is the entire archive through
+		// exiftool to recover 36 bytes a line already holds.
+		ContentID: e.ContentID,
 	}, true, nil
 }
 
@@ -218,6 +243,45 @@ func adoptOrphans(ctx context.Context, d Deps, opt ReindexOptions, seen map[stri
 		}
 		return record(ctx, d, asset, result)
 	})
+}
+
+// replayImports re-applies the sidecars an import recorded, which is how a
+// rebuilt database gets back its captions, albums, people, and the capture
+// times of every file whose own metadata was stripped before it ever reached
+// Google.
+//
+// The sidecars are re-parsed rather than replayed as stored conclusions, so a
+// rebuild understands an export exactly as well as the current build does —
+// which is the point of keeping them raw. A line naming a blob that is not in
+// the archive is skipped rather than failing the rebuild: the asset lines are
+// the ones that must be complete, and a description of something that is not
+// there describes nothing.
+func replayImports(ctx context.Context, d Deps, entries []manifest.Entry, result *ReindexResult) error {
+	for _, e := range entries {
+		asset, err := d.Store.AssetBySHA256(ctx, e.SHA256)
+		if errors.Is(err, db.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("look up %s: %w", e.SHA256[:16], err)
+		}
+
+		albums := make([]db.AlbumRef, 0, len(e.ImportAlbums))
+		for _, album := range e.ImportAlbums {
+			albums = append(albums, db.AlbumRef{Title: album.Title, Description: album.Description})
+		}
+		meta, err := db.ImportMetadataFrom(e.ImportSource, e.ImportSidecar, albums)
+		if err != nil {
+			// A format this build cannot read is not a reason to abandon a
+			// rebuild. The line stays in the log for a build that can.
+			continue
+		}
+		if err := d.Store.ApplyImportMetadata(ctx, asset.ID, meta); err != nil {
+			return fmt.Errorf("apply import metadata for %s: %w", e.SHA256[:16], err)
+		}
+		result.Described++
+	}
+	return nil
 }
 
 // record inserts an asset and restores its device mapping.

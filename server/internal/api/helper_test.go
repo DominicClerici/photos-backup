@@ -390,5 +390,5 @@ func truncateAssets(t *testing.T, ctx context.Context, url string) {
 	defer conn.Close(ctx)
 	// Named rather than `cascade`, so a future table with a foreign key here has
 	// to be added deliberately instead of silently wiped.
-	_, _ = conn.Exec(ctx, "truncate table assets, device_assets, jobs, pairing_codes, devices")
+	_, _ = conn.Exec(ctx, "truncate table assets, device_assets, jobs, pairing_codes, devices cascade")
 }

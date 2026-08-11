@@ -57,7 +57,7 @@ func newHarness(t *testing.T) *harness {
 	if err := store.Migrate(); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	if _, err := store.Pool().Exec(ctx, "truncate table assets, device_assets, jobs"); err != nil {
+	if _, err := store.Pool().Exec(ctx, "truncate table assets, device_assets, jobs cascade"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 

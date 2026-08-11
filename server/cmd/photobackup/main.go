@@ -7,6 +7,7 @@
 //	photobackup verify [--deep] [--fix] [--retry-failed]
 //	photobackup export --to DIR [--from DATE] [--until DATE] [--copy]
 //	photobackup reindex [--adopt-orphans] [--dry-run]
+//	photobackup import --from DIR [--dry-run]
 //	photobackup reset [--dry-run] [--yes] [--force]
 //	photobackup pair [--ttl 10m]
 //	photobackup devices [--revoke ID]
@@ -36,6 +37,7 @@ const usage = `photobackup — maintenance for the photo archive
   verify [--deep] [--fix] [--retry-failed]  audit the archive against itself
   export --to DIR [--copy]             materialize a date tree of hardlinks
   reindex [--adopt-orphans]            rebuild the database from manifest.jsonl
+  import --from DIR [--dry-run]        ingest a Google Photos export
   reset [--dry-run] [--yes]            erase the archive, keep paired devices
 
   pair [--ttl 10m]                     mint a single-use code to pair a device
@@ -77,6 +79,8 @@ func main() {
 		code, err = runExport(ctx, os.Args[2:])
 	case "reindex":
 		code, err = runReindex(ctx, os.Args[2:])
+	case "import":
+		code, err = runImport(ctx, os.Args[2:])
 	case "reset":
 		code, err = runReset(ctx, os.Args[2:])
 	case "pair":

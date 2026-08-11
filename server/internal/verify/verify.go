@@ -366,6 +366,13 @@ func checkManifest(ctx context.Context, d Deps, opt Options, r *Report, indexed 
 	logged := make(map[string]struct{}, len(indexed))
 
 	err := manifest.Scan(path, func(e manifest.Entry) error {
+		// A metadata line names a digest but records no bytes. Counting it as
+		// a logged blob would satisfy the second check below with a line a
+		// rebuild could not restore the asset from, and looking for its blob
+		// would report an orphan for a file that is present and fine.
+		if !e.IsAsset() {
+			return nil
+		}
 		logged[e.SHA256] = struct{}{}
 
 		blob := d.Blobs.Path(e.SHA256, e.Ext)
@@ -416,6 +423,7 @@ func appendMissingLine(ctx context.Context, d Deps, log *manifest.Log, sha strin
 		ModifiedAt:  a.ModifiedAt,
 		DeviceID:    a.DeviceID,
 		LocalID:     a.LocalID,
+		ContentID:   a.ContentID,
 		// Not the original storage time, which is gone. The row's arrival time
 		// is the closest true thing available.
 		StoredAt: a.UploadedAt,

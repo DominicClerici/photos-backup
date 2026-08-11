@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 
+	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 )
 
@@ -59,6 +60,23 @@ type Asset struct {
 	// LiveState tracks the 256px motion rendition. "none" unless this is a
 	// paired video.
 	LiveState string
+	// ContentID is Apple's content identifier, shared by both halves of a Live
+	// Photo and carried in the file itself. It is what pairs an import, where
+	// there is no phone to declare anything: see resolveByContentID.
+	ContentID string
+
+	// Everything below comes from an import sidecar rather than from the file.
+	// See ApplyImportMetadata.
+
+	// Description is the caption the source held, if any.
+	Description string
+	Favorite    bool
+	// Archived is the source's "hidden from the main grid" flag. Recorded, and
+	// deliberately not acted on: the gallery shows these like anything else.
+	Archived bool
+	// ImportSource names the importer that supplied the sidecar, e.g.
+	// "google-takeout". Empty on anything a device uploaded directly.
+	ImportSource string
 
 	// SortTime is the generated column the timeline orders on:
 	// exif capture time, else the phone's, else arrival.
@@ -71,11 +89,17 @@ type Asset struct {
 	PlaybackState string
 }
 
-// IsLivePair reports whether this asset is a Live Photo's paired video. It
-// reads the declaration rather than the resolution on purpose: an asset is one
-// half of a Live Photo from the moment it lands, whether or not the other half
-// is here yet.
-func (a Asset) IsLivePair() bool { return a.LiveParentLocalID != "" }
+// IsLivePair reports whether this asset is a Live Photo's paired video.
+//
+// Either kind of evidence counts, because the two arrive by different routes and
+// at different moments. A phone declares the pairing before the bytes are sent,
+// so its videos are pairs from the instant they land, resolved or not. An import
+// declares nothing: its videos become pairs only when a still carrying the same
+// content identifier turns out to be in the archive, which may be a moment later
+// or a month later.
+func (a Asset) IsLivePair() bool {
+	return a.LiveParentLocalID != "" || a.LiveParentAssetID != nil
+}
 
 // Metadata is what the worker reads out of an original. Every field is optional
 // because plenty of real files carry none of it: a screenshot has no camera, a
@@ -186,7 +210,8 @@ const assetColumns = `id, sha256, md5, byte_size, original_filename, ext,
 	width, height, orientation, duration_seconds,
 	coalesce(camera_make, ''), coalesce(camera_model, ''), coalesce(lens, ''),
 	gps_lat, gps_lon, exif_captured_at, exif_offset_minutes,
-	live_parent_local_id, live_parent_asset_id::text, live_state,
+	live_parent_local_id, live_parent_asset_id::text, live_state, content_id,
+	coalesce(description, ''), favorite, archived, import_source,
 	sort_time, derived_state, playback_state`
 
 // RecordAsset stores an asset and the mapping from the local asset that
@@ -208,9 +233,9 @@ func (s *Store) RecordAsset(ctx context.Context, a Asset) (id string, inserted b
 	const insert = `
 		insert into assets (sha256, md5, byte_size, original_filename, ext,
 		                    content_type, media_kind, captured_at, device_id, local_id,
-		                    live_parent_local_id, live_state)
+		                    live_parent_local_id, live_state, content_id)
 		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-		        case when $11 = '' then 'none' else 'pending' end)
+		        case when $11 = '' then 'none' else 'pending' end, $12)
 		on conflict (sha256) do nothing
 		returning id`
 
@@ -228,9 +253,15 @@ func (s *Store) RecordAsset(ctx context.Context, a Asset) (id string, inserted b
 		liveParent = ""
 	}
 
+	// A client's content id is a hint that saves a round of work, not a fact.
+	// Whatever the file itself says replaces it when the metadata job reads it,
+	// so a client that declares the wrong one costs a pairing until then and
+	// nothing after.
+	contentID := exifdata.NormalizeContentID(a.ContentID)
+
 	err = tx.QueryRow(ctx, insert,
 		a.SHA256, a.MD5, a.ByteSize, a.OriginalFilename, a.Ext,
-		a.ContentType, mediaKind, a.CapturedAt, a.DeviceID, a.LocalID, liveParent,
+		a.ContentType, mediaKind, a.CapturedAt, a.DeviceID, a.LocalID, liveParent, contentID,
 	).Scan(&id)
 	switch {
 	case err == nil:
@@ -259,6 +290,13 @@ func (s *Store) RecordAsset(ctx context.Context, a Asset) (id string, inserted b
 	if err := linkLivePair(ctx, tx, a, id, liveParent); err != nil {
 		return "", false, err
 	}
+	// The other half of pairing, and the only half an import has. Runs on a
+	// duplicate too: the same bytes arriving under a second local id do not need
+	// re-archiving, but a still that arrives after its video does need to adopt
+	// it, and on that path the insert did nothing.
+	if _, err := resolveByContentID(ctx, tx, id, contentID, mediaKind); err != nil {
+		return "", false, err
+	}
 
 	// The metadata job is committed with the asset row, not after it. Enqueuing
 	// separately would leave a window where a crash lands an asset that no
@@ -277,67 +315,6 @@ func (s *Store) RecordAsset(ctx context.Context, a Asset) (id string, inserted b
 		return "", false, fmt.Errorf("commit transaction: %w", err)
 	}
 	return id, inserted, nil
-}
-
-// linkLivePair joins a Live Photo's two halves, from whichever of them just
-// landed.
-//
-// Both directions are needed because either can arrive first. The phone queues
-// the still and its paired video with the same capture time, and the queue
-// orders by capture time, so which of the two goes up first is not decided
-// anywhere — and a run interrupted between them can deliver them minutes apart.
-//
-// Nothing here fails a commit. A pairing that does not resolve costs a hover
-// animation; refusing the upload over it would cost the photo.
-func linkLivePair(ctx context.Context, tx pgx.Tx, a Asset, id, liveParent string) error {
-	if liveParent != "" {
-		// The video: find the still, if the archive has it.
-		const link = `
-			update assets set live_parent_asset_id = d.asset_id
-			from device_assets d
-			where assets.id = $1::uuid
-			  and assets.live_parent_asset_id is null
-			  and d.device_id = $2 and d.local_id = $3`
-		if _, err := tx.Exec(ctx, link, id, a.DeviceID, liveParent); err != nil {
-			return fmt.Errorf("link paired video to its still: %w", err)
-		}
-		return nil
-	}
-
-	if a.DeviceID == "" || a.LocalID == "" {
-		return nil
-	}
-
-	// The still: adopt any video that was already waiting for it.
-	const adopt = `
-		update assets set live_parent_asset_id = $1::uuid
-		where device_id = $2
-		  and live_parent_local_id = $3
-		  and live_parent_asset_id is null`
-	if _, err := tx.Exec(ctx, adopt, id, a.DeviceID, a.LocalID); err != nil {
-		return fmt.Errorf("link still to its paired video: %w", err)
-	}
-	return nil
-}
-
-// LiveVideoFor returns the paired video belonging to a still, which is what the
-// gallery's hover animation and the viewer's press-and-hold play.
-func (s *Store) LiveVideoFor(ctx context.Context, stillID string) (Asset, error) {
-	// Ordered and limited because two devices delivering the same still resolve
-	// to one asset and can each attach their own copy of the video to it. Both
-	// show the same three seconds; the first one archived is as good an answer
-	// as the question has.
-	row := s.pool.QueryRow(ctx, `select `+assetColumns+`
-		from assets where live_parent_asset_id = $1::uuid
-		order by uploaded_at, id limit 1`, stillID)
-	a, err := scanAsset(row)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Asset{}, ErrNotFound
-	}
-	if err != nil {
-		return Asset{}, fmt.Errorf("load paired video: %w", err)
-	}
-	return a, nil
 }
 
 // KnownMappings returns, for the refs asked about, the local ids this device has
@@ -478,7 +455,8 @@ func scanAsset(s scanner) (Asset, error) {
 		&a.Width, &a.Height, &a.Orientation, &a.DurationSeconds,
 		&a.CameraMake, &a.CameraModel, &a.Lens,
 		&a.GPSLat, &a.GPSLon, &a.ExifCapturedAt, &a.ExifOffsetMinutes,
-		&a.LiveParentLocalID, &a.LiveParentAssetID, &a.LiveState,
+		&a.LiveParentLocalID, &a.LiveParentAssetID, &a.LiveState, &a.ContentID,
+		&a.Description, &a.Favorite, &a.Archived, &a.ImportSource,
 		&a.SortTime, &a.DerivedState, &a.PlaybackState)
 	return a, err
 }
