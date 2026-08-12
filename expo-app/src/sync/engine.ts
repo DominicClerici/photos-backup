@@ -32,9 +32,12 @@ export type EngineConfig = {
   maxItems: number;
   checkBatchSize: number;
   /**
-   * Deliberately smaller than the check batch. Hashing freezes the JS thread per
-   * item, so a big hash batch means a long stretch with nothing on the wire and
-   * no repaints.
+   * Deliberately smaller than the check batch, and now for a different reason
+   * than it once was: hashing no longer freezes the JS thread, so this is not
+   * about repaints. It is the unit of interleaving. Hashing runs alongside a
+   * batch of uploads and the loop only re-plans when both halves are done, so
+   * the batch bounds how long uploading can sit idle after it has drained its
+   * own batch, waiting for the hasher to finish.
    */
   hashBatchSize: number;
   uploadConcurrency: number;
@@ -196,9 +199,17 @@ export class SyncEngine {
    * Advances the queue by one unit of work, returning false when nothing is due.
    *
    * The order is not the state order. Checks come first because they are cheap
-   * and settle the most items; uploads come before hashing so that once the
-   * server has asked for bytes, they start moving instead of waiting behind a
-   * stretch of frozen-thread hashing.
+   * and settle the most items, and they settle them in bulk: a round that turns
+   * two hundred items into `have` is worth more than any one upload.
+   *
+   * Uploading and hashing then run together rather than in turn. They used to
+   * alternate, and the cost of that was structural: hashing is disk and CPU,
+   * uploading is the network, and taking turns meant each waited out the other —
+   * a stretch with nothing on the wire, then a stretch with nothing being
+   * prepared. They can overlap now that the hash is off the JS thread, and they
+   * are safe to overlap because they own disjoint states: the uploader takes
+   * `want`, the hasher takes `unknown`, and neither can be handed the other's
+   * row until a later pass picks it up.
    */
   private async step(): Promise<boolean> {
     const { store } = this.deps;
@@ -217,18 +228,23 @@ export class SyncEngine {
     }
 
     const wanted = await store.due('want', this.config.uploadConcurrency * 4, now);
-    if (wanted.length > 0) {
-      await this.uploadBatch(wanted);
-      return true;
-    }
-
     const unknown = await store.due('unknown', this.config.hashBatchSize, now);
-    if (unknown.length > 0) {
-      await this.hashBatch(unknown);
-      return true;
-    }
+    if (wanted.length === 0 && unknown.length === 0) return false;
 
-    return false;
+    // allSettled rather than all, and then rethrown by hand. A revoked token
+    // throws out of the uploader to end the run, and `all` would return on it
+    // while the hasher was still going — leaving a loop writing to the store
+    // after run() had unwound, which is the one thing this engine's freedom from
+    // locking rests on not happening. Both halves finish; the failure still
+    // reaches the caller.
+    const outcomes = await Promise.allSettled([
+      wanted.length > 0 ? this.uploadBatch(wanted) : Promise.resolve(),
+      unknown.length > 0 ? this.hashBatch(unknown, wanted.length === 0) : Promise.resolve(),
+    ]);
+    const failure = outcomes.find((outcome) => outcome.status === 'rejected');
+    if (failure) throw (failure as PromiseRejectedResult).reason;
+
+    return true;
   }
 
   /**
@@ -327,15 +343,25 @@ export class SyncEngine {
     }
   }
 
-  private async hashBatch(items: QueueItem[]): Promise<void> {
+  /**
+   * Hashes a batch, one original at a time.
+   *
+   * `announce` is false while uploads are running alongside. Both halves report,
+   * and a phase change always beats the throttle in report() — so left to
+   * themselves they would fight over the label several times a second and force
+   * a re-render each time. Bytes reaching the archive is the more useful of the
+   * two things to be told about, so the uploader keeps the line and this goes
+   * quiet until it is working alone.
+   *
+   * Serial within the batch on purpose. The gain being chased here is the
+   * overlap with the network; hashing two originals at once only divides the
+   * same disk between them.
+   */
+  private async hashBatch(items: QueueItem[], announce: boolean): Promise<void> {
     for (const item of items) {
       if (this.stopping) return;
 
-      // Set before the hash begins. File.md5 is a synchronous JSI call and
-      // nothing repaints while it runs, so a label written afterwards would
-      // never be seen.
-      this.report('hashing', `Preparing ${item.filename} — the app may freeze briefly`, true);
-      await this.deps.clock.sleep(0);
+      if (announce) this.report('hashing', `Preparing ${item.filename}`);
 
       let opened: OpenedAsset;
       try {
@@ -573,8 +599,11 @@ export class SyncEngine {
    *
    * What gets throttled is the 40,000th "Uploading IMG_4823" — same phase, new
    * label, and a re-render per item is the run loop's biggest cost at that size.
-   * `force` overrides for a label written immediately before something that
-   * blocks the JS thread, which would otherwise never be painted at all.
+   * `force` overrides for the two labels that would otherwise be wrong rather
+   * than merely late: the name of the file an upload has just begun, when three
+   * workers are naming files faster than the throttle passes them, and the last
+   * percentage of a resumable transfer, which must not be left reading 88% after
+   * every byte is across.
    */
   private report(phase: Phase, activity: string, force = false): void {
     const now = this.deps.clock.now();

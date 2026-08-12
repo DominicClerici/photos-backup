@@ -77,8 +77,27 @@ export type PhotoKitFacts = {
   location: PhotoKitLocation | null;
 };
 
+/**
+ * One row of the library listing — see listAssets() in the Swift module.
+ *
+ * `localId` carries the same `ph://` prefix expo-media-library puts on its own
+ * identifiers, because it is the queue's primary key and rows already exist
+ * under it.
+ */
+export type PhotoKitAsset = {
+  localId: string;
+  kind: 'still' | 'video';
+  filename: string | null;
+  createdAt: number | null;
+  modifiedAt: number | null;
+  /** True for a Live Photo's still, whose paired video is a second queue entry. */
+  isLive: boolean;
+};
+
 type PhotoFactsNativeModule = {
   factsForAssetAsync(localId: string): Promise<PhotoKitFacts | null>;
+  enumerateAsync(limit: number): Promise<PhotoKitAsset[]>;
+  md5ForFileAsync(uri: string): Promise<string>;
 };
 
 const native = requireOptionalNativeModule<PhotoFactsNativeModule>('PhotoFacts');
@@ -87,11 +106,53 @@ const native = requireOptionalNativeModule<PhotoFactsNativeModule>('PhotoFacts')
 export const hasPhotoFacts = native != null;
 
 /**
+ * Whether a function is in this build, asked one function at a time.
+ *
+ * A missing module is not the only way to be out of date, and after the first
+ * time this module grew it stopped being the likely one: the ordinary case is a
+ * dev client that carries PhotoFacts as it was a fortnight ago, running a JS
+ * bundle that knows about something added since. That build answers
+ * `requireOptionalNativeModule` perfectly well and then throws on the call.
+ */
+function carries(name: keyof PhotoFactsNativeModule): boolean {
+  return typeof native?.[name] === 'function';
+}
+
+/**
  * Everything PhotoKit knows about one asset, or null when this build has no
  * native module, when the identifier no longer names anything, or when the photo
  * library is not readable.
  */
 export async function photoKitFacts(localId: string): Promise<PhotoKitFacts | null> {
-  if (!native) return null;
-  return (await native.factsForAssetAsync(localId)) ?? null;
+  if (!carries('factsForAssetAsync')) return null;
+  return (await native!.factsForAssetAsync(localId)) ?? null;
+}
+
+/**
+ * The whole library in one call, or null when this build cannot do it and the
+ * caller should fall back to listing it the slow way.
+ *
+ * Null means "this build cannot", never "the library is empty" — an empty
+ * library is an empty array. The caller's fallback is a great deal slower, so
+ * the two must not be confusable.
+ *
+ * `limit` of 0 means the whole library.
+ */
+export async function photoKitEnumerate(limit: number): Promise<PhotoKitAsset[] | null> {
+  if (!carries('enumerateAsync')) return null;
+  return native!.enumerateAsync(limit);
+}
+
+/**
+ * The MD5 of a local file, computed off the JavaScript thread, or null when this
+ * build has no native hash and the caller should fall back to the synchronous
+ * one.
+ *
+ * Again null is only ever "this build cannot". A file that could not be read
+ * rejects, because a digest is a claim about bytes and the queue has to be able
+ * to tell a failed read from a hash.
+ */
+export async function photoKitMd5(uri: string): Promise<string | null> {
+  if (!carries('md5ForFileAsync')) return null;
+  return native!.md5ForFileAsync(uri);
 }

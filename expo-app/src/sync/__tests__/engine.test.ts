@@ -192,6 +192,41 @@ test('a rejected item fails without opening the breaker', async () => {
   expect(h.phases).toContain('retrying');
 });
 
+// Hashing is disk and CPU, uploading is the network, and taking turns means each
+// waits out the other. The two own disjoint states, so they do not have to.
+test('hashing runs alongside uploading rather than after it', async () => {
+  const timeline: string[] = [];
+
+  const media = new FakeMedia([], new Map([['fresh', { size: 10, md5: 'md5-fresh' }]]));
+  const open = media.open.bind(media);
+  media.open = async (item, opts) => {
+    timeline.push(`${opts.hash ? 'hash' : 'read'}:${item.localId}`);
+    return open(item, opts);
+  };
+
+  const transport = new FakeTransport(twoRound('want'), (request) => {
+    timeline.push(`upload:${request.localId}`);
+    return { id: `asset-${request.localId}`, sha256: 'sha', duplicate: false };
+  });
+
+  const h = build({
+    transport,
+    media,
+    seed: [
+      queued('ready', { state: 'want', md5: 'md5-ready', size: 100 }),
+      queued('fresh', { state: 'unknown' }),
+    ],
+  });
+
+  await h.engine.run();
+
+  // The hash of `fresh` was opened before `ready` finished uploading. Run one
+  // after the other — which is what `want` having priority over `unknown` used
+  // to mean — and the upload necessarily lands first.
+  expect(timeline.indexOf('hash:fresh')).toBeLessThan(timeline.indexOf('upload:ready'));
+  expect(statesOf(h.store)).toEqual({ ready: 'done', fresh: 'done' });
+});
+
 test('an item already hashed resumes without hashing again', async () => {
   const h = build({
     transport: new FakeTransport(twoRound('want')),

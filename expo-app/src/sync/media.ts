@@ -8,7 +8,14 @@ import {
   type AssetMetadata,
 } from 'expo-media-library';
 
-import { photoKitFacts, type PhotoKitFacts, type PhotoKitLocation } from '../../modules/photo-facts';
+import {
+  photoKitEnumerate,
+  photoKitFacts,
+  photoKitMd5,
+  type PhotoKitAsset,
+  type PhotoKitFacts,
+  type PhotoKitLocation,
+} from '../../modules/photo-facts';
 import { sweepChunks } from './chunked';
 import {
   errorText,
@@ -43,40 +50,39 @@ export class PhotoKitMediaSource implements MediaSource {
    * Lists the newest assets, adding a second queue entry for each Live Photo's
    * paired video.
    *
-   * maxItems of 0 means the whole library. Enumeration is cheap — Phase 0 walked
-   * 3,573 assets without a noticeable pause — so this re-runs on every start and
-   * relies on the store to ignore what it already has.
+   * maxItems of 0 means the whole library. This re-runs on every start and
+   * relies on the store to ignore what it already has, which is only a
+   * reasonable design if listing the library is cheap — and Phase 0's "3,573
+   * assets without a noticeable pause" was measured on the listing alone. The
+   * Live Photo question was not free: expo-media-library's metadata carries no
+   * subtypes, so answering it meant a native round-trip per image, awaited in
+   * turn, tens of thousands of times, every run. The native enumerator answers it
+   * in the same pass that produces the list.
    */
   async enumerate(maxItems: number): Promise<EnumeratedAsset[]> {
-    let query = new Query()
-      .within(AssetField.MEDIA_TYPE, [MediaType.IMAGE, MediaType.VIDEO])
-      .orderBy({ key: AssetField.CREATION_TIME, ascending: false });
-    if (maxItems > 0) query = query.limit(maxItems);
-
-    const metadata: AssetMetadata[] = await query.exeForMetadata();
+    const listed = (await photoKitEnumerate(maxItems)) ?? (await listViaMediaLibrary(maxItems));
 
     const assets: EnumeratedAsset[] = [];
-    for (const entry of metadata) {
-      const filename = entry.filename ?? entry.id;
+    for (const entry of listed) {
+      const filename = entry.filename ?? entry.localId;
       assets.push({
-        localId: entry.id,
-        kind: entry.mediaType === MediaType.VIDEO ? 'video' : 'still',
+        localId: entry.localId,
+        kind: entry.kind,
         parentLocalId: null,
         filename,
-        createdAt: entry.creationTime,
-        modifiedAt: entry.modificationTime,
+        createdAt: entry.createdAt,
+        modifiedAt: entry.modifiedAt,
       });
 
-      if (entry.mediaType !== MediaType.IMAGE) continue;
-      if (!(await isLivePhoto(entry.id))) continue;
+      if (!entry.isLive) continue;
 
       assets.push({
-        localId: entry.id + LIVE_SUFFIX,
+        localId: entry.localId + LIVE_SUFFIX,
         kind: 'live_video',
-        parentLocalId: entry.id,
+        parentLocalId: entry.localId,
         filename: pairedVideoName(filename),
-        createdAt: entry.creationTime,
-        modifiedAt: entry.modificationTime,
+        createdAt: entry.createdAt,
+        modifiedAt: entry.modifiedAt,
       });
     }
     return assets;
@@ -148,7 +154,7 @@ export class PhotoKitMediaSource implements MediaSource {
     return {
       uri: file.uri,
       size: file.size ?? 0,
-      md5: opts.hash ? digest(file) : null,
+      md5: opts.hash ? await digest(file) : null,
       // Nothing to release: this points straight at the library.
       release: async () => {},
     };
@@ -193,7 +199,7 @@ export class PhotoKitMediaSource implements MediaSource {
       return {
         uri: extracted.uri,
         size: extracted.size ?? 0,
-        md5: opts.hash ? digest(extracted) : null,
+        md5: opts.hash ? await digest(extracted) : null,
         release: async () => {
           deleteQuietly(extracted);
         },
@@ -204,7 +210,7 @@ export class PhotoKitMediaSource implements MediaSource {
     return {
       uri: moved.uri,
       size: moved.size ?? 0,
-      md5: opts.hash ? digest(moved) : null,
+      md5: opts.hash ? await digest(moved) : null,
       release: async () => {
         deleteQuietly(moved);
       },
@@ -260,6 +266,37 @@ async function quietly<T>(read: () => Promise<T>, fallback: T): Promise<T> {
   }
 }
 
+/**
+ * The listing as it was before the native enumerator: expo-media-library for the
+ * metadata, then one round-trip per image to ask about Live Photos.
+ *
+ * Kept because enumeration is the one step of a run that cannot degrade — an
+ * empty list is a backup that does nothing — and a dev client older than the
+ * native enumerator is an ordinary thing to be running. It is slow in exactly
+ * the way described above, and only ever reached on such a build.
+ */
+async function listViaMediaLibrary(maxItems: number): Promise<PhotoKitAsset[]> {
+  let query = new Query()
+    .within(AssetField.MEDIA_TYPE, [MediaType.IMAGE, MediaType.VIDEO])
+    .orderBy({ key: AssetField.CREATION_TIME, ascending: false });
+  if (maxItems > 0) query = query.limit(maxItems);
+
+  const metadata: AssetMetadata[] = await query.exeForMetadata();
+
+  const listed: PhotoKitAsset[] = [];
+  for (const entry of metadata) {
+    listed.push({
+      localId: entry.id,
+      kind: entry.mediaType === MediaType.VIDEO ? 'video' : 'still',
+      filename: entry.filename,
+      createdAt: entry.creationTime,
+      modifiedAt: entry.modificationTime,
+      isLive: entry.mediaType === MediaType.IMAGE ? await isLivePhoto(entry.id) : false,
+    });
+  }
+  return listed;
+}
+
 async function isLivePhoto(localId: string): Promise<boolean> {
   try {
     const subtypes = await new Asset(localId).getMediaSubtypes();
@@ -271,11 +308,19 @@ async function isLivePhoto(localId: string): Promise<boolean> {
 }
 
 /**
- * Reads the digest. This is a synchronous JSI property that blocks the JS thread
- * for the length of the hash — around 2.4s for a 1GB file per Phase 0 — which is
- * why callers announce it before asking.
+ * Reads the digest, off the JS thread where this build can.
+ *
+ * The fallback is expo-file-system's `File.md5`, a synchronous JSI property that
+ * blocks the JS thread for the length of the hash — around 2.4s for a 1GB file
+ * per Phase 0. Both produce the same digest over the same bytes; the difference
+ * is only whether the rest of the app, the upload in flight included, keeps
+ * running while it happens. A build old enough to take the fallback still backs
+ * up correctly, in the stop-start way it always did.
  */
-function digest(file: File): string {
+async function digest(file: File): Promise<string> {
+  const native = await photoKitMd5(file.uri);
+  if (native) return native;
+
   const md5 = file.md5;
   if (!md5) throw new SyncError(`could not hash ${file.uri}`, 'item');
   return md5;

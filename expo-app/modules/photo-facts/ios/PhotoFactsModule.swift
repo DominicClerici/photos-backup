@@ -16,19 +16,50 @@
 // fact — the same rule internal/photokit applies on the server. Duplication with
 // what expo already reports costs bytes; a gap costs the fact.
 //
-// Three things it deliberately does not do. It never asks for photo library
+// Two things it deliberately does not do. It never asks for photo library
 // authorization, because expo-media-library owns that prompt and a second one
-// would be a mystery to the person holding the phone. It never touches
-// PHImageManager or PHAssetResourceManager, because those can pull an original
-// down from iCloud and this app runs against a phone with iCloud Photos off. And
-// it never throws: it is called once per asset across a library of tens of
-// thousands, always after the bytes are already archived, so an asset that
-// cannot answer one question must still answer the rest.
+// would be a mystery to the person holding the phone. And it never touches
+// PHImageManager or PHAssetResourceManager for bytes, because those can pull an
+// original down from iCloud and this app runs against a phone with iCloud Photos
+// off — the resource inventory below is metadata PhotoKit already holds, not a
+// request for any of it.
+//
+// The module also carries two things the sync engine cannot get cheaply from
+// expo-media-library, and they are here rather than in a module of their own
+// because they are the same complaint about the same bridge: listing a library
+// costs one crossing per asset when it should cost one, and hashing a file
+// happens on the thread that is trying to run the app.
+//
+//   factsForAssetAsync  never throws. It is called once per asset across a
+//                       library of tens of thousands, always after the bytes are
+//                       already archived, so an asset that cannot answer one
+//                       question must still answer the rest.
+//   enumerateAsync      never throws, for the same reason it exists: it is the
+//                       first step of every run and an empty answer is a run
+//                       that does nothing, which the caller can see.
+//   md5ForFileAsync     does throw, and must. A digest is a claim about bytes
+//                       the server will verify, so "could not read it" has to
+//                       reach the queue as this item's failure rather than as a
+//                       hash of nothing.
 
 import CoreLocation
+import CryptoKit
 import ExpoModulesCore
 import Foundation
 import Photos
+
+/// Hashing runs on a queue of its own.
+///
+/// Every AsyncFunction that does not name a queue shares one serial
+/// DispatchQueue with every other Expo module in the app. Hashing a 1GB video
+/// there would hold up the calls the upload path is making at the same time —
+/// which is exactly the serialization this was moved off the JS thread to end.
+private let hashQueue = DispatchQueue(label: "photofacts.hash", qos: .utility)
+
+/// Read size for the hash. Larger than the 64KB expo-file-system uses: this runs
+/// off the JS thread, so the only thing the block size buys or costs is syscalls
+/// against peak memory, and a 1GB video is worth the megabyte.
+private let hashBlockSize = 1024 * 1024
 
 public class PhotoFactsModule: Module {
   public func definition() -> ModuleDefinition {
@@ -45,6 +76,21 @@ public class PhotoFactsModule: Module {
       }
       promise.resolve(facts(of: asset))
     }
+
+    // The whole library in one call. See listAssets for what this replaces.
+    AsyncFunction("enumerateAsync") { (limit: Int, promise: Promise) in
+      promise.resolve(listAssets(limit: limit))
+    }
+
+    AsyncFunction("md5ForFileAsync") { (uri: String, promise: Promise) in
+      do {
+        let digest = try md5Digest(ofFileAt: uri)
+        promise.resolve(digest)
+      } catch {
+        promise.reject(error)
+      }
+    }
+    .runOnQueue(hashQueue)
   }
 }
 
@@ -75,6 +121,117 @@ private func findAsset(_ localId: String) -> PHAsset? {
 
   return PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: options).firstObject
 }
+
+// MARK: - Enumeration
+
+/// Every image and video in the library, newest capture first, in one call.
+///
+/// What this replaces: a Query().exeForMetadata() for the list, and then — because
+/// the metadata expo-media-library returns carries no subtypes — one further
+/// `getMediaSubtypes()` per image to ask the single question "is this a Live
+/// Photo?". Each of those is its own PHAsset fetch and its own crossing of the
+/// bridge, awaited in turn, on a library of tens of thousands, at the start of
+/// every run including the one that has nothing to do. Here it is one fetch and
+/// one crossing, and the subtype is already in hand.
+///
+/// Everything about the answer is chosen to match what expo-media-library
+/// produced, because the identifiers are primary keys in a queue that already has
+/// rows in it and the timestamps are what `sync/check` matches an archived asset
+/// on. A `ph://` prefix on the identifier, milliseconds rounded rather than
+/// truncated, `value(forKey: "filename")` for the name: all of it is
+/// AssetMapper.toMetadata's behaviour, deliberately.
+///
+/// Left at PHFetchOptions' defaults for the same reason: hidden assets and the
+/// non-representative frames of a burst stay out, as they always have. Including
+/// them is a decision about what this app archives, not about how fast it can
+/// list a library, and it does not belong in this change.
+private func listAssets(limit: Int) -> [[String: Any?]] {
+  let options = PHFetchOptions()
+  options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+  options.predicate = NSPredicate(
+    format: "mediaType == %d || mediaType == %d",
+    PHAssetMediaType.image.rawValue,
+    PHAssetMediaType.video.rawValue
+  )
+  // A fetchLimit of 0 means "no limit" to PhotoKit and "the whole library" to
+  // the caller, which is the same thing, but it is set only when asked so the
+  // two never have to agree about it.
+  if limit > 0 {
+    options.fetchLimit = limit
+  }
+
+  let result = PHAsset.fetchAssets(with: options)
+  var assets: [[String: Any?]] = []
+  assets.reserveCapacity(result.count)
+
+  result.enumerateObjects { asset, _, _ in
+    let isImage = asset.mediaType == .image
+    assets.append([
+      "localId": assetUriPrefix + asset.localIdentifier,
+      "kind": isImage ? "still" : "video",
+      "filename": asset.value(forKey: "filename") as? String,
+      "createdAt": milliseconds(asset.creationDate),
+      "modifiedAt": milliseconds(asset.modificationDate),
+      // The reason the whole function exists. Only an image can carry one, and
+      // the paired video is a second queue entry the caller builds from this.
+      "isLive": isImage && asset.mediaSubtypes.contains(.photoLive)
+    ])
+  }
+  return assets
+}
+
+/// Milliseconds the way expo-media-library writes them — rounded, not truncated.
+/// A queue full of rows timed one way cannot be matched against a server holding
+/// them timed the other.
+private func milliseconds(_ date: Date?) -> Int? {
+  guard let date else {
+    return nil
+  }
+  return Int((date.timeIntervalSince1970 * 1000.0).rounded())
+}
+
+// MARK: - Hashing
+
+/// The MD5 of a file, computed off the JavaScript thread.
+///
+/// expo-file-system can already do this, and its result is identical — the same
+/// CryptoKit MD5 over the same bytes. What it cannot do is get out of the way:
+/// `File.md5` is a synchronous JSI property, so the hash runs on the JS thread
+/// and nothing else in the app moves until it finishes. On a 1GB video that is
+/// seconds of frozen interface and, worse, seconds in which the upload loop
+/// cannot start the next transfer. Same digest, different thread.
+private func md5Digest(ofFileAt uri: String) throws -> String {
+  let url = fileURL(from: uri)
+
+  // PhotoKit hands back URLs the app is extended access to. Claiming it is
+  // harmless when there is nothing to claim, and the alternative — a read that
+  // fails for a reason nothing here would explain — is not.
+  let scoped = url.startAccessingSecurityScopedResource()
+  defer {
+    if scoped {
+      url.stopAccessingSecurityScopedResource()
+    }
+  }
+
+  let handle = try FileHandle(forReadingFrom: url)
+  defer { try? handle.close() }
+
+  var hasher = Insecure.MD5()
+  while let block = try handle.read(upToCount: hashBlockSize), !block.isEmpty {
+    hasher.update(data: block)
+  }
+  return hasher.finalize().map { String(format: "%02hhx", $0) }.joined()
+}
+
+/// Accepts what expo-file-system's `File.uri` hands out, and a bare path too.
+private func fileURL(from uri: String) -> URL {
+  guard let url = URL(string: uri), url.isFileURL else {
+    return URL(fileURLWithPath: uri)
+  }
+  return url
+}
+
+// MARK: - Facts
 
 private func facts(of asset: PHAsset) -> [String: Any?] {
   // Local metadata only — the resource inventory is what PhotoKit already holds
