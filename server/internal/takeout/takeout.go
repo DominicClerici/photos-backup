@@ -36,9 +36,11 @@ import (
 // Sidecar is the subset of Google's per-item JSON worth naming. The rest is
 // preserved verbatim by the caller rather than modelled here — see Metadata.Raw.
 type Sidecar struct {
-	// Title is the filename Google Photos held the item under. It is the most
-	// reliable link back to the media file, because it is data rather than an
-	// artifact of how the export named things.
+	// Title is the filename Google Photos held the item under. It is usually the
+	// most reliable link back to the media file, because it is data rather than
+	// an artifact of how the export named things — with one exception that
+	// matters: when two items in a folder share a title, both sidecars carry
+	// that same title, and only their filenames say which is which.
 	Title       string `json:"title"`
 	Description string `json:"description"`
 
@@ -218,6 +220,22 @@ func IsDatedFolder(name string) bool {
 
 // counterSuffix matches the `(1)` a collision within a folder appends.
 var counterSuffix = regexp.MustCompile(`\((\d+)\)$`)
+
+// HasCollisionCounter reports whether a sidecar's own name carries the counter
+// Google appends when two items in one folder share a filename.
+//
+// It is worth asking separately from MediaNameFor because the counter is the
+// only place the export records which of the two colliding items a sidecar
+// belongs to. Google writes the original title into both of them — see
+// Sidecar.Title — so on a collision the title cannot tell them apart and the
+// name is all there is.
+func HasCollisionCounter(sidecarName string) bool {
+	base := strings.TrimSuffix(sidecarName, ".json")
+	if base == sidecarName {
+		return false
+	}
+	return counterSuffix.MatchString(base)
+}
 
 // MediaNameFor reduces a sidecar's filename to the media filenames it could
 // describe, best guess first.

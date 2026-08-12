@@ -275,6 +275,10 @@ export class HttpTransport implements Transport {
           end,
         });
       } catch (e) {
+        // Staging a chunk fails locally — a short original, a full disk — and
+        // calling that unreachable would trip the breaker and hold the whole
+        // run over something the server never saw.
+        if (e instanceof SyncError) throw e;
         throw new SyncError(errorText(e), 'unreachable');
       }
 

@@ -208,6 +208,77 @@ func TestPreviewRunsConcurrentlyUpToTheCap(t *testing.T) {
 	}
 }
 
+// A Google Takeout of iPhone ProRAW hands back re-encoded JPEGs that kept their
+// .dng names. ImageMagick picks the RAW decoder off the extension, so trusting
+// the name means libraw is asked to demosaic a JPEG and the asset parks as
+// unreadable — with the photo perfectly intact on disk the whole time.
+func TestThumbsRenderAJPEGThatKeptARawExtension(t *testing.T) {
+	mislabeled := filepath.Join(t.TempDir(), "IMG_4471.dng")
+	data, err := os.ReadFile(fixture("photo.jpg"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	if err := os.WriteFile(mislabeled, data, 0o600); err != nil {
+		t.Fatalf("write mislabeled fixture: %v", err)
+	}
+
+	want := targets(t, 96, 512)
+	if err := New().Thumbs(context.Background(), mislabeled, want); err != nil {
+		t.Fatalf("Thumbs on a JPEG named .dng: %v", err)
+	}
+	for _, target := range want {
+		if w, h := decodeFile(t, target.Path); w != target.Size || h != target.Size {
+			t.Errorf("thumb is %dx%d, want %dx%d", w, h, target.Size, target.Size)
+		}
+	}
+}
+
+func TestSniffNamesTheCoderTheBytesCallFor(t *testing.T) {
+	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0, 16, 'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1}
+	heic := []byte{0, 0, 0, 24, 'f', 't', 'y', 'p', 'h', 'e', 'i', 'c', 0, 0, 0, 0}
+	webp := []byte{'R', 'I', 'F', 'F', 8, 0, 0, 0, 'W', 'E', 'B', 'P', 'V', 'P', '8', ' '}
+	// A DNG is a TIFF. Sniffing it must stay silent: naming a coder here would
+	// take every genuine RAW away from libraw, which is the only thing that can
+	// demosaic one.
+	dng := []byte{'I', 'I', 42, 0, 8, 0, 0, 0, 3, 0, 0, 1, 4, 0, 1, 0}
+
+	for _, tc := range []struct {
+		name  string
+		head  []byte
+		coder string
+	}{
+		{"jpeg", jpeg, "jpeg"},
+		{"heic", heic, "heic"},
+		{"webp", webp, "webp"},
+		{"dng stays with libraw", dng, ""},
+		{"too short to tell", jpeg[:4], ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "blob")
+			if err := os.WriteFile(path, tc.head, 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if got := sniff(path); got != tc.coder {
+				t.Errorf("sniff = %q, want %q", got, tc.coder)
+			}
+		})
+	}
+}
+
+func TestSourceKeepsTheFrameSelectorWithACoder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "photo.dng")
+	if err := os.WriteFile(path, []byte{0xFF, 0xD8, 0xFF, 0xE0, 0, 16, 'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1}, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got, want := source(path), "jpeg:"+path+"[0]"; got != want {
+		t.Errorf("source = %q, want %q", got, want)
+	}
+	missing := filepath.Join(t.TempDir(), "gone.heic")
+	if got, want := source(missing), missing+"[0]"; got != want {
+		t.Errorf("source of an unreadable file = %q, want %q", got, want)
+	}
+}
+
 func TestConversionReportsTheFailingInput(t *testing.T) {
 	err := New().Thumbs(context.Background(), fixture("does-not-exist.heic"), targets(t, 256))
 	if err == nil {

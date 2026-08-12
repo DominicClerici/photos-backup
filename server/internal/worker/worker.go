@@ -254,6 +254,7 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 	}
 
 	decodable := true
+	var thumbErr error
 	switch {
 	case asset.IsLivePair():
 		if decodable, err = r.liveMetadata(ctx, asset, src, &meta); err != nil {
@@ -264,13 +265,19 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 			return err
 		}
 	default:
-		if err := r.writeThumbs(ctx, asset.SHA256, src); err != nil {
-			return err
-		}
+		// Held rather than returned, so the metadata below is stored first. What
+		// exiftool read is good whether or not the render worked, and a job that
+		// parks having written nothing leaves an asset that looks unreadable
+		// when only its thumbnail was — which is exactly how three JPEGs named
+		// .dng came to look like corrupt files.
+		thumbErr = r.writeThumbs(ctx, asset.SHA256, src)
 	}
 
 	if err := r.Store.ApplyMetadata(ctx, assetID, meta); err != nil {
 		return err
+	}
+	if thumbErr != nil {
+		return thumbErr
 	}
 
 	if asset.IsLivePair() {

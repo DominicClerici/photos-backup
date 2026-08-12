@@ -149,9 +149,7 @@ func (c *Converter) Preview(ctx context.Context, src string, w io.Writer) error 
 // run drives one ImageMagick, with ops carrying its own output specification —
 // stdout for the preview, a file per size for the thumbnails.
 func (c *Converter) run(ctx context.Context, w io.Writer, src string, ops ...string) error {
-	// [0] takes the primary image. A HEIC can hold several — a burst, or the
-	// stills of a Live Photo — and without this ImageMagick renders every one.
-	args := append([]string{src + "[0]"}, ops...)
+	args := append([]string{source(src)}, ops...)
 
 	cmd := exec.CommandContext(ctx, c.binary(), args...)
 	var stderr bytes.Buffer
@@ -162,6 +160,72 @@ func (c *Converter) run(ctx context.Context, w io.Writer, src string, ops ...str
 		return fmt.Errorf("convert %s to webp: %w: %s", src, err, bytes.TrimSpace(stderr.Bytes()))
 	}
 	return nil
+}
+
+// source names one file in ImageMagick's argv.
+//
+// [0] takes the primary image. A HEIC can hold several — a burst, or the
+// stills of a Live Photo — and without this ImageMagick renders every one.
+func source(path string) string {
+	spec := path + "[0]"
+	if coder := sniff(path); coder != "" {
+		return coder + ":" + spec
+	}
+	return spec
+}
+
+// sniff names the ImageMagick coder that should read a file, from its leading
+// bytes, or returns "" to leave the choice to ImageMagick.
+//
+// It exists because ImageMagick routes to libraw on the extension alone, and an
+// export can hand us a file whose name has outlived its contents: a Google
+// Takeout of iPhone ProRAW arrives as ordinary JPEGs still called .dng, and
+// every one of them fails as "Unsupported file format or not RAW file" — a
+// decoder error for a photo with nothing wrong with it. Sniffing makes the
+// extension a hint and the bytes the fact, which is the same order of trust
+// applyContentID already uses for pairing.
+//
+// The formats here are the ones whose magic is unambiguous. TIFF is absent on
+// purpose: a DNG *is* a TIFF, so sniffing that would route every genuine RAW
+// away from libraw and into a coder that cannot demosaic it — turning this from
+// a fix into the same bug pointed the other way.
+func sniff(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		// Nothing to report here: ImageMagick is about to fail on the same file
+		// and its error says more than this one could.
+		return ""
+	}
+	defer f.Close()
+
+	var head [16]byte
+	n, err := io.ReadFull(f, head[:])
+	if err != nil && n < len(head) {
+		return ""
+	}
+	b := head[:n]
+
+	switch {
+	case bytes.HasPrefix(b, []byte{0xFF, 0xD8, 0xFF}):
+		return "jpeg"
+	case bytes.HasPrefix(b, []byte("\x89PNG\r\n\x1a\n")):
+		return "png"
+	case bytes.HasPrefix(b, []byte("GIF87a")), bytes.HasPrefix(b, []byte("GIF89a")):
+		return "gif"
+	case bytes.HasPrefix(b, []byte("RIFF")) && bytes.Equal(b[8:12], []byte("WEBP")):
+		return "webp"
+	}
+	// ISO base media: the brand at byte 8 separates a still HEIF from an AVIF,
+	// and both from the .mov that shares the container.
+	if bytes.Equal(b[4:8], []byte("ftyp")) {
+		switch string(b[8:12]) {
+		case "avif", "avis":
+			return "avif"
+		case "heic", "heix", "heim", "heis", "hevc", "hevx", "mif1", "msf1":
+			return "heic"
+		}
+	}
+	return ""
 }
 
 func (c *Converter) acquire(ctx context.Context) error {

@@ -315,16 +315,25 @@ func walkExport(roots []string) (
 			albums[relDir] = []takeout.Album{album}
 		}
 
+		// In name order, because matching is now order-dependent: the first
+		// sidecar to claim a media file keeps it, and which one that is must not
+		// come out of Go's map iteration.
+		jsonNames := make([]string, 0, len(c.jsons))
+		for name := range c.jsons {
+			jsonNames = append(jsonNames, name)
+		}
+		sort.Strings(jsonNames)
+
 		matched := make(map[string]json.RawMessage)
-		for name, at := range c.jsons {
+		for _, name := range jsonNames {
 			if takeout.IsDirectoryJSON(name) {
 				continue
 			}
-			raw, err := os.ReadFile(at)
+			raw, err := os.ReadFile(c.jsons[name])
 			if err != nil {
 				return nil, nil, nil, 0, err
 			}
-			target, ok := matchSidecar(name, raw, media)
+			target, ok := matchSidecar(name, raw, media, matched)
 			if !ok {
 				// Recorded under its own name so the caller can report it.
 				matched[name] = raw
@@ -341,17 +350,53 @@ func walkExport(roots []string) (
 
 // matchSidecar decides which media file a sidecar describes.
 //
-// The title inside the sidecar is tried first because it is the only part of
-// this that is data rather than an artifact: it is the filename Google Photos
-// actually held the item under. The name-derived candidates come second, and a
-// prefix match last, for the exports where the media name itself was truncated
-// to fit the sidecar's length cap.
-func matchSidecar(sidecarName string, raw []byte, media map[string]bool) (string, bool) {
-	if parsed, err := takeout.Parse(raw); err == nil && media[parsed.Title] {
+// The title inside the sidecar is tried first because it is usually the only
+// part of this that is data rather than an artifact: it is the filename Google
+// Photos actually held the item under. The name-derived candidates come second,
+// and a prefix match last, for the exports where the media name itself was
+// truncated to fit the sidecar's length cap.
+//
+// The "usually" is the whole point of this function's shape. Two items in one
+// folder with the same title get one media file each — `IMG_1.HEIC` and
+// `IMG_1(1).HEIC` — but both of their sidecars say `"title": "IMG_1.HEIC"`,
+// because the title is what Photos held and the counter is what the export
+// invented to keep the names apart. Believe the title there and both sidecars
+// claim `IMG_1.HEIC`: one overwrites the other, and `IMG_1(1).HEIC` imports with
+// no capture time, no coordinates, no people and no album. In the sample export
+// that is 119 files, and it is silent, because from the outside every sidecar
+// found a home. So a counter in the sidecar's own name disqualifies the title
+// entirely — it is the only record of which of the two items this is.
+//
+// taken is what the sidecars already read in this directory have claimed. A
+// media file is described by exactly one sidecar, so a second claim on the same
+// file is always a mistake — and letting it through does double damage, since it
+// drops the document already sitting there as well as mis-attaching this one.
+func matchSidecar(sidecarName string, raw []byte, media map[string]bool, taken map[string]json.RawMessage) (string, bool) {
+	free := func(name string) bool { return media[name] && taken[name] == nil }
+
+	byName := takeout.MediaNameFor(sidecarName)
+	byTitle := func() (string, bool) {
+		// A counter does not merely outrank the title, it makes the title
+		// unusable: it says this sidecar is the second item under a shared
+		// title, so the title is the *other* sibling's filename, and following
+		// it would take the file that sibling's own sidecar is entitled to.
+		// Better to fall through and be reported than to be confidently wrong
+		// about which photograph this is.
+		if takeout.HasCollisionCounter(sidecarName) {
+			return "", false
+		}
+		parsed, err := takeout.Parse(raw)
+		if err != nil || !free(parsed.Title) {
+			return "", false
+		}
 		return parsed.Title, true
 	}
-	for _, candidate := range takeout.MediaNameFor(sidecarName) {
-		if media[candidate] {
+
+	if name, ok := byTitle(); ok {
+		return name, true
+	}
+	for _, candidate := range byName {
+		if free(candidate) {
 			return candidate, true
 		}
 	}
@@ -362,7 +407,7 @@ func matchSidecar(sidecarName string, raw []byte, media map[string]bool) (string
 	stem := strings.TrimSuffix(sidecarName, ".json")
 	var only string
 	for name := range media {
-		if !strings.HasPrefix(name, stem) {
+		if !strings.HasPrefix(name, stem) || !free(name) {
 			continue
 		}
 		if only != "" {

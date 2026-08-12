@@ -1,9 +1,18 @@
-import { Directory, File, Paths } from 'expo-file-system';
+import { Directory, File, FileMode, Paths } from 'expo-file-system';
 
-import { errorText } from './types';
+import { SyncError } from './types';
 
-/** Where the fallback sender stages slices it has to materialize. */
+/** Where the sender stages the slice it is about to upload. */
 const CHUNK_DIRECTORY = 'chunks';
+
+/**
+ * How much of a chunk crosses the JS heap at a time while it is staged.
+ *
+ * The chunk itself is 8MB, but there is no reason to hold all of it: the copy
+ * reads a block, writes it, and drops it, so a backfill of 550MB videos never
+ * has more than this in JavaScript at once.
+ */
+const COPY_BLOCK = 1024 * 1024;
 
 export type ChunkSender = (url: string, headers: Record<string, string>, chunk: ChunkRef) => Promise<Response>;
 
@@ -17,78 +26,35 @@ export type ChunkRef = {
 /**
  * How chunks get onto the wire.
  *
- * Two strategies, because the good one is not known to work. `File.slice()`
- * hands back a Blob backed by native storage, so `fetch` can stream 8MB without
- * it ever existing in JavaScript — but whether React Native's networking accepts
- * that particular Blob is not something the documentation settles, and it is not
- * worth a 100GB backfill finding out the hard way.
+ * The obvious implementation — `fetch(url, { body: file.slice(start, end) })` —
+ * cannot work on this stack, in two separate ways. expo-file-system 57
+ * implements `File.slice()` as `new Blob([this.bytesSync().slice(start, end)])`,
+ * which first reads the *entire* original into JavaScript (550MB of video, to
+ * send 8MB of it) and then hands React Native's BlobManager a typed array, which
+ * it refuses outright: "Creating blobs from 'ArrayBuffer' and 'ArrayBufferView'
+ * are not supported". Nothing about that is conditional or version-dependent, so
+ * there is no cheap path to try first and no runtime question to answer.
  *
- * So the first chunk of a session tries the cheap path. If it fails in a way
- * that looks like "this body type is not supported", the sender switches to
- * staging each slice as a temp file and uploading that — one extra 8MB write and
- * delete per chunk, using the same `File.upload()` call Phase 0 already proved.
- * The choice sticks for the rest of the process.
+ * What is left is the path Phase 0 already proved: stage the range as a temp
+ * file and hand it to `File.upload()`, which streams from native storage. The
+ * copy costs one 8MB write and delete per chunk and never opens the original in
+ * JavaScript — only `COPY_BLOCK` bytes of it exist here at a time.
  */
 export class ChunkTransport {
-  private strategy: 'blob' | 'staged' | 'unknown' = 'unknown';
-
   constructor(private readonly onLog?: (line: string) => void) {}
 
   /** Which path is in use, for the diagnostics screen. */
   get mode(): string {
-    return this.strategy;
+    return 'staged';
   }
 
   async send(url: string, headers: Record<string, string>, chunk: ChunkRef): Promise<Response> {
-    if (this.strategy === 'staged') {
-      return this.sendStaged(url, headers, chunk);
-    }
-
-    try {
-      const response = await this.sendBlob(url, headers, chunk);
-      if (this.strategy === 'unknown') {
-        this.strategy = 'blob';
-        // Logged on the way up as well as the way down: which strategy a real
-        // phone lands on is the open question this class exists to answer, and
-        // silence on success would leave it open.
-        this.onLog?.('chunk upload: Blob bodies accepted; slices stream straight from storage');
-      }
-      return response;
-    } catch (e) {
-      // A network failure has to stay a network failure — falling back on one
-      // would hide a dead server behind a slower code path.
-      if (this.strategy !== 'unknown' || !looksLikeUnsupportedBody(e)) {
-        throw e;
-      }
-      this.strategy = 'staged';
-      this.onLog?.(`chunk upload: Blob bodies rejected (${errorText(e)}); staging slices to disk instead`);
-      return this.sendStaged(url, headers, chunk);
-    }
-  }
-
-  /** The cheap path: the 8MB never enters the JS heap. */
-  private async sendBlob(url: string, headers: Record<string, string>, chunk: ChunkRef): Promise<Response> {
-    const blob = chunk.file.slice(chunk.start, chunk.end);
-    return fetch(url, { method: 'PUT', headers, body: blob });
-  }
-
-  /**
-   * The fallback: materialize the slice, upload the file, delete it.
-   *
-   * The temp file is removed in a finally, and anything that still escapes is
-   * cleaned up by sweepChunks() on the next start — a backfill that leaked 8MB
-   * per chunk would fill the phone long before it finished.
-   */
-  private async sendStaged(url: string, headers: Record<string, string>, chunk: ChunkRef): Promise<Response> {
     const directory = chunkDirectory();
     directory.create({ intermediates: true, idempotent: true });
 
     const staged = new File(directory, `chunk-${chunk.start}.bin`);
     try {
-      const buffer = await chunk.file.slice(chunk.start, chunk.end).arrayBuffer();
-      if (staged.exists) staged.delete();
-      staged.create();
-      staged.write(new Uint8Array(buffer));
+      stage(chunk, staged);
 
       const result = await staged.upload(url, {
         httpMethod: 'PUT',
@@ -101,10 +67,49 @@ export class ChunkTransport {
     } finally {
       try {
         if (staged.exists) staged.delete();
-      } catch {
-        // Swept on the next run.
+      } catch (e) {
+        // Swept on the next run; it costs disk, not correctness.
+        this.onLog?.(`could not remove a staged chunk: ${String(e)}`);
       }
     }
+  }
+}
+
+/**
+ * Copies one byte range of the original into `staged`, block by block.
+ *
+ * Both halves are native file handles, so the original is never opened as a
+ * whole — the alternative is what `File.slice()` does, and a 550MB read on a
+ * phone is a crash rather than a slow path.
+ */
+function stage(chunk: ChunkRef, staged: File): void {
+  if (staged.exists) staged.delete();
+  staged.create();
+
+  const source = chunk.file.open(FileMode.ReadOnly);
+  try {
+    source.offset = chunk.start;
+    const sink = staged.open(FileMode.WriteOnly);
+    try {
+      for (let at = chunk.start; at < chunk.end; ) {
+        const block = source.readBytes(Math.min(COPY_BLOCK, chunk.end - at));
+        // A read that returns nothing before the range is filled means the
+        // original is shorter than the size the upload was declared with, which
+        // no amount of retrying against the server fixes.
+        if (block.length === 0) {
+          throw new SyncError(
+            `${chunk.file.uri} ended at ${at} bytes, short of the ${chunk.end} the upload declared`,
+            'item'
+          );
+        }
+        sink.writeBytes(block);
+        at += block.length;
+      }
+    } finally {
+      sink.close();
+    }
+  } finally {
+    source.close();
   }
 }
 
@@ -128,26 +133,4 @@ export function sweepChunks(): number {
 
 function chunkDirectory(): Directory {
   return new Directory(Paths.cache, CHUNK_DIRECTORY);
-}
-
-/**
- * Whether a thrown error means "fetch cannot send this body", as opposed to the
- * network being down.
- *
- * Deliberately generous about what counts: guessing wrong here costs one slower
- * upload path, while guessing the other way costs a video that never uploads.
- */
-function looksLikeUnsupportedBody(e: unknown): boolean {
-  const message = errorText(e).toLowerCase();
-  if (message.includes('network request failed') || message.includes('timed out')) {
-    return false;
-  }
-  return (
-    message.includes('blob') ||
-    message.includes('body') ||
-    message.includes('unsupported') ||
-    message.includes('not a function') ||
-    message.includes('undefined is not an object') ||
-    message.includes('cannot read')
-  );
 }
