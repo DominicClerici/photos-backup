@@ -500,7 +500,7 @@ export function Timeline({
         <div ref={board} className="relative w-full" style={{ height: frame.totalHeight }}>
           {headings.map((d) => (
             <div
-              key={days[d].key}
+              key={days[d].id}
               data-day={d}
               className="absolute top-0 left-0 flex w-full items-end gap-2.5 pb-2.5"
               style={{

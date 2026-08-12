@@ -31,7 +31,7 @@ proxies `/api/*` here; see its README to bring the browser side up.
 | `LIVE_PREVIEW_CONCURRENCY` | `2` | simultaneous on-demand Live Photo renditions |
 | `LIVE_PREVIEW_CACHE_MB` | `64` | memory those renditions are held in between requests |
 | `WORKER_DISABLED` | unset | run as a pure API server; nothing drains the queue |
-| `VIDEO_ENCODER` | `libx264` | ffmpeg encoder for playback renditions |
+| `VIDEO_ENCODER` | `libx264` | ffmpeg encoder for playback renditions; `h264_nvenc` on an NVIDIA host |
 | `MAGICK_BIN` / `FFMPEG_BIN` / `FFPROBE_BIN` / `EXIFTOOL_BIN` | on `PATH` | binary overrides |
 | `UPLOAD_SESSION_TTL` | `24h` | how long an abandoned partial upload is kept |
 | `MDNS_DISABLED` | unset | stop advertising; publish via Avahi instead |
@@ -299,6 +299,23 @@ Two jobs per asset, in two separately sized pools:
 The pools are split so a handful of 4K transcodes cannot claim every slot and
 starve the thumbnails behind them — during a backfill that would look like the
 gallery doing nothing at all.
+
+Splitting the pools bounds the slots, not the CPU, and libx264 will take every
+core it can reach whatever its pool size is. Measured on the archive machine
+(Ryzen 9 9950X, RTX 5060 Ti) against a queue of 1080p60 HEVC iPhone clips:
+
+| encoder | queue of 149s of footage | 48 thumbnails alongside it |
+|---|---|---|
+| `libx264`, `TRANSCODE_CONCURRENCY=1` | 25.4s | — |
+| `libx264`, `TRANSCODE_CONCURRENCY=4` | 23.4s | 7.8s (3.6x slower than idle) |
+| `h264_nvenc`, `TRANSCODE_CONCURRENCY=4` | 9.8s | 2.9s (1.3x slower than idle) |
+
+Raising `TRANSCODE_CONCURRENCY` on libx264 buys little, because one clip
+already saturates the machine — 90s of CPU for 4s of wall on a single 18s
+clip. The encoder is the lever that matters: NVENC costs about a twelfth of
+the CPU, which is what keeps the metadata pool moving while the queue drains.
+`VIDEO_ENCODER=h264_nvenc` with `TRANSCODE_CONCURRENCY=4` is the archive
+machine's configuration; the defaults stay portable.
 
 Stored on disk: `<sha>.thumb.webp`, and `<sha>.mp4` for video. The 2048px
 preview is rendered per request and never stored; the browser's cache does the

@@ -87,6 +87,18 @@ export interface GridMetrics {
 
 /** A run of consecutive items sharing a calendar day, as indices into the list. */
 export interface Day {
+  /**
+   * Identity of the run, unique across the list and stable as pages append.
+   *
+   * The date is not unique on its own. Items arrive ordered by instant but are
+   * filed under their own local day, so a photo taken across a timezone
+   * boundary can put a date either side of another one and leave that date
+   * split into two runs — which as a React key means two siblings claiming to
+   * be the same node. The start index disambiguates them, and paging only ever
+   * appends, so it never changes once assigned.
+   */
+  id: string;
+  /** The YYYY-MM-DD this run falls under; shared by every item in it. */
   key: string;
   label: string;
   start: number;
@@ -217,7 +229,13 @@ export function buildDays(items: TimelineItem[]): Day[] {
     const key = cachedDayKey(items[i]);
     let end = i;
     while (end < items.length && cachedDayKey(items[end]) === key) end++;
-    days.push({ key, label: dayLabelOf(key), start: i, count: end - i });
+    days.push({
+      id: `${key}#${i}`,
+      key,
+      label: dayLabelOf(key),
+      start: i,
+      count: end - i,
+    });
     i = end;
   }
   return days;

@@ -44,6 +44,11 @@ type LiveThumbTarget struct {
 // metadata worker parked for an hour.
 const LiveThumbMaxSeconds = 6
 
+// LiveThumbCRF is the motion thumbnail's quality target on x264's scale, which
+// videoArgs translates for a hardware encoder. Looser than the playback
+// rendition on purpose.
+const LiveThumbCRF = 30
+
 type Tool struct {
 	FFmpeg  string
 	FFprobe string
@@ -51,8 +56,10 @@ type Tool struct {
 	// archive machine has an NVIDIA card and can try h264_nvenc without a code
 	// change.
 	Encoder string
-	// CRF is the x264 quality target. Ignored by hardware encoders, which is
-	// fine — they read their own rate-control flags and default sensibly.
+	// CRF is the quality target, named for x264's scale because that is the
+	// portable default. NVENC is given the same picture through its own
+	// vocabulary rather than being left to its stock rate control — see
+	// videoArgs, where ignoring this was a silent and expensive mistake.
 	CRF int
 	// LiveConcurrency caps simultaneous on-demand Live Photo renditions. Same
 	// reasoning as derive.Converter's preview cap, and a lower number, because
@@ -284,12 +291,9 @@ func orNone(s string) string {
 
 // Transcode writes an H.264/AAC MP4 that any browser can play.
 func (t *Tool) Transcode(ctx context.Context, src, dst string, info Info) error {
-	args := []string{
-		"-nostdin", "-y",
-		"-v", "error",
-		"-i", src,
-		"-map_metadata", "0",
-	}
+	args := []string{"-nostdin", "-y", "-v", "error"}
+	args = append(args, t.decodeArgs()...)
+	args = append(args, "-i", src, "-map_metadata", "0")
 
 	// Only scale when there is something to scale down. ffmpeg's scaler has no
 	// "shrink only" mode, so the decision is made here from the probed size
@@ -300,10 +304,8 @@ func (t *Tool) Transcode(ctx context.Context, src, dst string, info Info) error 
 			PlaybackMaxEdge, PlaybackMaxEdge))
 	}
 
+	args = append(args, t.videoArgs(t.crf(), speedBalanced)...)
 	args = append(args,
-		"-c:v", t.encoder(),
-		"-crf", strconv.Itoa(t.crf()),
-		"-preset", "medium",
 		// Baseline chroma layout. Phone video is often 10-bit HDR, which most
 		// browsers refuse outright.
 		"-pix_fmt", "yuv420p",
@@ -376,27 +378,27 @@ func (t *Tool) LiveThumbs(ctx context.Context, src string, targets []LiveThumbTa
 		graph += fmt.Sprintf(";[s%d]scale=w=%d:h=%d:flags=lanczos[o%d]", i, ordered[i].Size, ordered[i].Size, i)
 	}
 
-	args := []string{
-		"-nostdin", "-y", "-v", "error",
+	args := []string{"-nostdin", "-y", "-v", "error"}
+	args = append(args, t.decodeArgs()...)
+	args = append(args,
 		// Before -i, so the limit applies to what is read rather than having to
 		// be repeated on every output.
 		"-t", strconv.Itoa(LiveThumbMaxSeconds),
 		"-i", src,
 		"-filter_complex", graph,
-	}
+	)
 	dsts := make([]string, len(ordered))
 	for i, target := range ordered {
 		dsts[i] = target.Path
 		args = append(args,
 			// Only the filter's video comes through, so the paired clip's audio
 			// track is dropped by never being mapped.
-			"-map", fmt.Sprintf("[o%d]", i),
-			"-c:v", t.encoder(),
-			// Looser than the playback rendition. At thumbnail size the
-			// difference is invisible and the file is a third of the size, which
-			// is what a grid firing these off on hover needs it to be.
-			"-crf", "30",
-			"-preset", "veryfast",
+			"-map", fmt.Sprintf("[o%d]", i))
+		// Looser than the playback rendition. At thumbnail size the difference
+		// is invisible and the file is a third of the size, which is what a
+		// grid firing these off on hover needs it to be.
+		args = append(args, t.videoArgs(LiveThumbCRF, speedFast)...)
+		args = append(args,
 			"-pix_fmt", "yuv420p",
 			"-movflags", "+faststart",
 			target.Path,
@@ -422,19 +424,20 @@ func (t *Tool) LivePreview(ctx context.Context, src, dst string, info Info) erro
 	}
 	defer t.release()
 
-	args := []string{"-nostdin", "-y", "-v", "error", "-i", src}
+	args := []string{"-nostdin", "-y", "-v", "error"}
+	args = append(args, t.decodeArgs()...)
+	args = append(args, "-i", src)
 	if w, h := info.DisplaySize(); w > PlaybackMaxEdge || h > PlaybackMaxEdge {
 		args = append(args, "-vf", fmt.Sprintf(
 			"scale=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos",
 			PlaybackMaxEdge, PlaybackMaxEdge))
 	}
+	// The fast end of the curve, where the stored rendition takes the balanced
+	// one. This is being waited on by somebody who has already opened the
+	// photo, and it is three seconds long: latency is worth more here than
+	// bitrate.
+	args = append(args, t.videoArgs(t.crf(), speedFast)...)
 	args = append(args,
-		"-c:v", t.encoder(),
-		"-crf", strconv.Itoa(t.crf()),
-		// veryfast, where the stored rendition uses medium. This one is being
-		// waited on by somebody who has already opened the photo, and it is
-		// three seconds long: latency is worth more here than bitrate.
-		"-preset", "veryfast",
 		"-pix_fmt", "yuv420p",
 		"-c:a", "aac",
 		"-b:a", "128k",
@@ -563,4 +566,89 @@ func (t *Tool) crf() int {
 		return 22
 	}
 	return t.CRF
+}
+
+// speed places an encode on the quality-for-time curve. The two encoder
+// families spell the same intent differently and their names do not translate
+// — x264's "veryfast" is a visibly worse picture than NVENC's p1 — so the
+// intent is named here and each family maps it to its own vocabulary.
+type speed int
+
+const (
+	// speedBalanced is for a rendition written once and watched later, where a
+	// few extra seconds of encode buy bitrate back for the life of the archive.
+	speedBalanced speed = iota
+	// speedFast is for the renditions somebody is waiting on.
+	speedFast
+)
+
+// nvencCQ converts the x264 CRF the call sites ask for into the constant
+// quality NVENC wants. Both scales are QP-derived but they are not aligned,
+// and NVENC's runs leaner for the same number: measured on this archive's own
+// footage, x264 -crf 22 sits at NVENC -cq 28 (equal VMAF, slightly smaller
+// file) and the 256px Live Photo thumbnail's -crf 30 sits at -cq 36 (equal
+// bytes). Six is an empirical fit at the two resolutions that are actually
+// encoded here, not a law — anything moved far from them wants re-measuring.
+const nvencCQOffset = 6
+
+func (t *Tool) isNVENC() bool { return strings.Contains(t.encoder(), "nvenc") }
+
+// videoArgs returns the encoder, its rate control and its preset.
+//
+// These cannot be written once and shared, which is the whole reason this
+// function exists. x264 reads -crf and named presets; NVENC reads -cq and pN
+// presets, accepts "medium" as a deprecated alias, and ignores -crf in
+// silence. So the obvious VIDEO_ENCODER=h264_nvenc encodes perfectly happily
+// and quietly abandons the quality target for NVENC's stock 2Mbps VBR: on a
+// sample clip that measured VMAF 76.0 against 91.6 for the libx264 it
+// replaced, at a third of the bitrate. Nothing fails; the archive just fills
+// up with worse video than it was asked for.
+func (t *Tool) videoArgs(crf int, s speed) []string {
+	if !t.isNVENC() {
+		preset := "medium"
+		if s == speedFast {
+			preset = "veryfast"
+		}
+		return []string{"-c:v", t.encoder(), "-crf", strconv.Itoa(crf), "-preset", preset}
+	}
+
+	// p4 rather than p5/p6: on a saturated queue NVENC is the bottleneck, and
+	// p4 measured within 0.05 VMAF and 0.4% of p5's size for two thirds of its
+	// encode time. p1 for the renditions that are being waited on, where it is
+	// still better than the x264 preset it stands in for.
+	preset := "p4"
+	if s == speedFast {
+		preset = "p1"
+	}
+	// -b:v 0 is what makes -cq a pure quality target; without it NVENC treats
+	// the flags as a bitrate cap and the quality number stops meaning much.
+	return []string{
+		"-c:v", t.encoder(),
+		"-preset", preset,
+		"-tune", "hq",
+		"-rc", "vbr",
+		"-cq", strconv.Itoa(crf + nvencCQOffset),
+		"-b:v", "0",
+	}
+}
+
+// decodeArgs offers the decode to the GPU when the encode is already there.
+// They go before -i, and they are a plain "-hwaccel cuda" with no output
+// format: ffmpeg then decodes on NVDEC and hands ordinary frames back to the
+// filter chain, which halved decode CPU on a 1080p60 HEVC clip (15.2s to 7.6s)
+// and costs nothing when it cannot be done — an input NVDEC does not handle
+// falls back to software decode on its own.
+//
+// Emphatically not "-hwaccel_output_format cuda", which is the faster-looking
+// version of this and is wrong. Keeping frames in GPU memory puts them out of
+// reach of ffmpeg's autorotate, and this build has no NPP or other GPU
+// transpose to put in its place, so ffmpeg silently skips the rotation *and*
+// drops the display matrix: every portrait iPhone video comes out 1920x1080
+// landscape with nothing left to tell a player otherwise. Verified, not
+// feared.
+func (t *Tool) decodeArgs() []string {
+	if !t.isNVENC() {
+		return nil
+	}
+	return []string{"-hwaccel", "cuda"}
 }

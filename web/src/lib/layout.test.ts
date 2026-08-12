@@ -163,6 +163,34 @@ test("buildDays splits a day boundary using each file's own offset", () => {
   );
 });
 
+// The ids are React keys for the headings, and a date on both sides of a
+// timezone hop is a date that appears twice.
+test("buildDays gives every run its own id, even when a date recurs", () => {
+  const items = [
+    item("2026-08-05T02:00:00Z", 0),
+    // 21:00 the previous evening in Vermont, taken between the two UTC photos.
+    item("2026-08-05T01:00:00Z", -240),
+    item("2026-08-05T00:30:00Z", 0),
+  ];
+  const days = buildDays(items);
+
+  assert.deepEqual(
+    days.map((d) => d.key),
+    ["2026-08-05", "2026-08-04", "2026-08-05"],
+  );
+  assert.equal(new Set(days.map((d) => d.id)).size, days.length);
+});
+
+test("buildDays ids stay put as later pages append", () => {
+  const first = buildDays(sameDay(4));
+  const grown = buildDays([...sameDay(4), item("2026-08-04T12:00:00Z")]);
+
+  assert.deepEqual(
+    grown.slice(0, first.length).map((d) => d.id),
+    first.map((d) => d.id),
+  );
+});
+
 test("buildDays handles an empty timeline", () => {
   assert.deepEqual(buildDays([]), []);
 });

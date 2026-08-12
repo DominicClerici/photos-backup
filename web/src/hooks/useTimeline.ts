@@ -29,6 +29,12 @@ export function useTimeline(): TimelineState {
   const cursor = useRef<string | undefined>(undefined);
   const inFlight = useRef(false);
   const exhausted = useRef(false);
+  // Keyset paging cannot serve the same asset twice on its own, but an import
+  // that rewrites a photo's date moves it in the ordering the cursor is walking,
+  // and a page fetched after that can hand back something an earlier one
+  // already did. Two tiles for one asset would both key on its id, so the ids
+  // seen so far decide what a page is allowed to append.
+  const seen = useRef(new Set<string>());
 
   const loadMore = useCallback(() => {
     if (inFlight.current || exhausted.current) return;
@@ -37,7 +43,9 @@ export function useTimeline(): TimelineState {
 
     fetchTimeline(cursor.current, PAGE_SIZE)
       .then((page) => {
-        setItems((prev) => (page.items.length ? [...prev, ...page.items] : prev));
+        const fresh = page.items.filter((it) => !seen.current.has(it.id));
+        for (const it of fresh) seen.current.add(it.id);
+        setItems((prev) => (fresh.length ? [...prev, ...fresh] : prev));
         cursor.current = page.next_cursor;
         if (!page.next_cursor) {
           exhausted.current = true;

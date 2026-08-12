@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -333,5 +334,155 @@ func assertCodec(t *testing.T, path, want string) {
 	}
 	if got := strings.TrimSpace(out); got != want {
 		t.Errorf("codec = %q, want %q — browsers outside Safari will not play anything else", got, want)
+	}
+}
+
+func TestVideoArgsTranslateTheQualityTargetForEachEncoder(t *testing.T) {
+	x264 := New().videoArgs(22, speedBalanced)
+	if !slices.Contains(x264, "-crf") {
+		t.Errorf("libx264 args carry no -crf: %v", x264)
+	}
+	if i := slices.Index(x264, "-preset"); i < 0 || x264[i+1] != "medium" {
+		t.Errorf("libx264 balanced preset = %v, want medium", x264)
+	}
+
+	tool := New()
+	tool.Encoder = "h264_nvenc"
+	nv := tool.videoArgs(22, speedBalanced)
+
+	// The whole point. NVENC ignores -crf without saying so, which is how a
+	// backfill ends up at its stock 2Mbps VBR instead of the quality asked for.
+	if slices.Contains(nv, "-crf") {
+		t.Errorf("NVENC args carry -crf, which it silently ignores: %v", nv)
+	}
+	if i := slices.Index(nv, "-cq"); i < 0 || nv[i+1] != "28" {
+		t.Errorf("NVENC args = %v, want -cq 28 for CRF 22", nv)
+	}
+	// Without this NVENC reads the flags as a bitrate cap and -cq stops
+	// meaning much.
+	if i := slices.Index(nv, "-b:v"); i < 0 || nv[i+1] != "0" {
+		t.Errorf("NVENC args = %v, want -b:v 0 so -cq is a pure quality target", nv)
+	}
+	if i := slices.Index(nv, "-preset"); i < 0 || !strings.HasPrefix(nv[i+1], "p") {
+		t.Errorf("NVENC preset = %v, want one of NVENC's own pN presets", nv)
+	}
+}
+
+func TestDecodeArgsLeaveFramesWhereAutorotateCanReachThem(t *testing.T) {
+	if got := New().decodeArgs(); len(got) != 0 {
+		t.Errorf("libx264 decode args = %v, want none", got)
+	}
+
+	tool := New()
+	tool.Encoder = "h264_nvenc"
+	got := tool.decodeArgs()
+	if !slices.Contains(got, "-hwaccel") {
+		t.Errorf("NVENC decode args = %v, want the decode offered to the GPU", got)
+	}
+	// Keeping frames in GPU memory puts them out of autorotate's reach, and
+	// there is no GPU transpose here to replace it: every portrait clip then
+	// comes out landscape with its display matrix dropped. Verified against
+	// ffmpeg, and the reason this assertion exists.
+	if slices.Contains(got, "-hwaccel_output_format") {
+		t.Errorf("NVENC decode args = %v, which would silently unrotate portrait video", got)
+	}
+}
+
+// rotatedFixture re-muxes the sample clip with a quarter-turn display matrix,
+// which is the shape every iPhone clip arrives in.
+func rotatedFixture(t *testing.T) string {
+	t.Helper()
+	dst := filepath.Join(t.TempDir(), "portrait.mov")
+	if _, err := execOutput(New().ffmpeg(), "-nostdin", "-y", "-v", "error",
+		"-display_rotation", "90", "-i", fixture("clip.mov"), "-c", "copy", dst); err != nil {
+		t.Fatalf("build a rotated fixture: %v", err)
+	}
+	return dst
+}
+
+// encodersUnderTest is libx264 plus, where the machine can actually do it,
+// h264_nvenc. Asked by encoding rather than by reading `ffmpeg -encoders`,
+// which lists NVENC on any build compiled with it, card or no card.
+func encodersUnderTest(t *testing.T) []string {
+	t.Helper()
+	encoders := []string{"libx264"}
+	_, err := execOutput(New().ffmpeg(), "-nostdin", "-y", "-v", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15:duration=0.2",
+		"-c:v", "h264_nvenc", "-preset", "p1", filepath.Join(t.TempDir(), "probe.mp4"))
+	if err == nil {
+		encoders = append(encoders, "h264_nvenc")
+	}
+	return encoders
+}
+
+func TestTranscodeBakesInTheRotation(t *testing.T) {
+	ctx := context.Background()
+	for _, encoder := range encodersUnderTest(t) {
+		t.Run(encoder, func(t *testing.T) {
+			tool := New()
+			tool.Encoder = encoder
+			tool.CRF = 30
+
+			src := rotatedFixture(t)
+			info, err := tool.Probe(ctx, src)
+			if err != nil {
+				t.Fatalf("Probe: %v", err)
+			}
+			if w, h := info.DisplaySize(); w != 480 || h != 640 {
+				t.Fatalf("fixture displays at %dx%d, want the rotated 480x640", w, h)
+			}
+
+			dst := filepath.Join(t.TempDir(), "playback.mp4")
+			if err := tool.Transcode(ctx, src, dst, info); err != nil {
+				t.Fatalf("Transcode: %v", err)
+			}
+
+			out, err := tool.Probe(ctx, dst)
+			if err != nil {
+				t.Fatalf("probe the transcode: %v", err)
+			}
+			// Upright in the pixels, not in a metadata flag a player may or may
+			// not honour. Landscape here means the rotation was dropped on the
+			// way through, which is what a GPU-resident decode does.
+			if out.Width != 480 || out.Height != 640 {
+				t.Errorf("transcode is %dx%d, want the upright 480x640", out.Width, out.Height)
+			}
+		})
+	}
+}
+
+func TestTranscodeHonoursTheQualityTargetOnEveryEncoder(t *testing.T) {
+	ctx := context.Background()
+	for _, encoder := range encodersUnderTest(t) {
+		t.Run(encoder, func(t *testing.T) {
+			info, err := New().Probe(ctx, fixture("clip.mov"))
+			if err != nil {
+				t.Fatalf("Probe: %v", err)
+			}
+
+			sizeAt := func(crf int) int64 {
+				tool := New()
+				tool.Encoder = encoder
+				tool.CRF = crf
+				dst := filepath.Join(t.TempDir(), "playback.mp4")
+				if err := tool.Transcode(ctx, fixture("clip.mov"), dst, info); err != nil {
+					t.Fatalf("Transcode at CRF %d: %v", crf, err)
+				}
+				stat, err := os.Stat(dst)
+				if err != nil {
+					t.Fatalf("stat the transcode: %v", err)
+				}
+				return stat.Size()
+			}
+
+			// A quality target the encoder is ignoring produces the same file
+			// whatever it is set to, which is exactly the failure that hid
+			// behind h264_nvenc accepting -crf and discarding it.
+			high, low := sizeAt(18), sizeAt(36)
+			if high <= low {
+				t.Errorf("CRF 18 produced %d bytes and CRF 36 produced %d: the quality target is not reaching %s",
+					high, low, encoder)
+			}
+		})
 	}
 }

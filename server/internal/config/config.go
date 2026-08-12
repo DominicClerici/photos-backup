@@ -54,7 +54,11 @@ type Config struct {
 	// gallery is blocked on this work, so it gets the parallelism.
 	WorkerConcurrency int
 	// TranscodeConcurrency sizes the video pool. One by default, because ffmpeg
-	// already spreads a single clip across several cores.
+	// already spreads a single clip across several cores — measured, a second
+	// libx264 worker is worth a few percent on long clips. It is worth
+	// considerably more on the three-second Live Photo sidecars that dominate
+	// the queue by count, where one clip cannot fill the machine; the archive
+	// host raises this to 4 in its env file.
 	TranscodeConcurrency int
 	// PreviewConcurrency caps simultaneous on-demand preview conversions, so a
 	// fast scroll cannot fork an ImageMagick per request.
@@ -72,7 +76,9 @@ type Config struct {
 	WorkerDisabled bool
 
 	// VideoEncoder is the ffmpeg encoder for playback renditions. libx264 works
-	// everywhere; the archive machine's NVIDIA card can try h264_nvenc.
+	// everywhere; the archive machine's NVIDIA card runs h264_nvenc, which
+	// video.videoArgs knows how to configure. Anything named *nvenc takes the
+	// hardware path there, including hevc_nvenc.
 	VideoEncoder string
 
 	// UploadSessionTTL is how long a partial upload is kept after its last
