@@ -4,6 +4,8 @@
  * declared here, which is what makes the engine testable in plain Node.
  */
 
+import type { PhotoKitFacts } from '../../modules/photo-facts';
+
 export type ItemKind = 'still' | 'video' | 'live_video';
 
 /**
@@ -121,6 +123,84 @@ export type UploadResponse = {
   duplicate: boolean;
 };
 
+/**
+ * What the photo library knows about an asset that the asset's own bytes do
+ * not, and that nothing else can recover once the phone is wiped or the photo
+ * is deleted from it.
+ *
+ * A heart, an album and "this is a screenshot" are decisions a person made, not
+ * facts a camera recorded — no amount of re-reading the original brings them
+ * back. They are the phone's version of a Takeout's sidecar, and they travel
+ * the same way: a separate request after the bytes are safe, never a header on
+ * the upload, because a caption or an album name has no business in one and
+ * losing the description must never cost the photograph.
+ *
+ * The location is here for the small number of originals that carry none of
+ * their own — anything a messaging app rewrote, anything saved out of another
+ * app. The file's own coordinates outrank it wherever it has some.
+ */
+export type AssetFacts = {
+  favorite: boolean;
+  /** PhotoKit's subtypes: 'screenshot', 'livePhoto', 'panorama', 'hdr', … */
+  subtypes: string[];
+  /** Album titles. PhotoKit lets one asset be in several. */
+  albums: string[];
+  location: AssetLocation | null;
+  /**
+   * Everything else PHAsset answered, straight from the native module — the
+   * Hidden album, the burst, the source, the resource inventory, the rest of
+   * the fix. Null when this build has no PhotoFacts module in it, which is the
+   * ordinary state of a JS reload against an older dev client.
+   */
+  photoKit: PhotoKitFacts | null;
+};
+
+/**
+ * Where the library says the photo was taken.
+ *
+ * Two coordinates is all expo-media-library reports and all this had until the
+ * native module arrived, so everything past them is optional: an asset described
+ * by an older build carries a pair of numbers and nothing else.
+ */
+export type AssetLocation = {
+  latitude: number;
+  longitude: number;
+  altitude?: number;
+  horizontalAccuracy?: number;
+  verticalAccuracy?: number;
+  course?: number;
+  speed?: number;
+  /** When CoreLocation took the fix, which is not when the shutter fired. */
+  timestamp?: string | null;
+};
+
+/**
+ * Whether an asset is worth a request of its own.
+ *
+ * The old rule was a list of the four things the library could report — a heart,
+ * a subtype, an album, a location — and it was already one field away from being
+ * wrong: adding the Hidden album to AssetFacts without touching it would have
+ * left every hidden-but-otherwise-unremarkable photo silently undescribed,
+ * losing exactly the fact the native module was built to capture.
+ *
+ * So anything the native module answered for counts, without enumerating what it
+ * said. That does mean a request per asset rather than per interesting asset,
+ * which on a library of tens of thousands is tens of thousands of small posts to
+ * a server on the same LAN, once each in the life of the queue. It buys two
+ * things worth more than that: an edit history and a source type for every asset
+ * rather than for the photogenic ones, and a rule that cannot rot the next time
+ * somebody captures a new fact and forgets this function exists.
+ */
+export function describable(facts: AssetFacts): boolean {
+  if (facts.photoKit !== null) return true;
+  return (
+    facts.favorite ||
+    facts.subtypes.length > 0 ||
+    facts.albums.length > 0 ||
+    facts.location !== null
+  );
+}
+
 /** Fraction of one original that has reached the server, for the progress line. */
 export type UploadProgress = (sent: number, total: number) => void;
 
@@ -134,6 +214,12 @@ export interface Transport {
    * starting over.
    */
   uploadResumable(request: UploadRequest, onProgress?: UploadProgress): Promise<UploadResponse>;
+  /**
+   * Records what the library knows about an archived asset. Separate from the
+   * upload because it describes bytes that are already safe, and because it is
+   * also the only way an asset the server already had ever gets described.
+   */
+  describe(assetId: string, facts: AssetFacts): Promise<void>;
 }
 
 export type EnumeratedAsset = NewItem;
@@ -157,6 +243,12 @@ export interface MediaSource {
    * the JS thread for its duration, so the caller decides when to pay for it.
    */
   open(item: QueueItem, opts: { hash: boolean }): Promise<OpenedAsset>;
+  /**
+   * Reads the library's own record of an asset — see AssetFacts. Returns null
+   * for anything that has none of its own, which is every Live Photo's paired
+   * video: PhotoKit holds one asset there, and the still is it.
+   */
+  facts(item: QueueItem): Promise<AssetFacts | null>;
   /** Removes extracted copies left behind by a previous run. */
   sweep(): Promise<number>;
 }

@@ -20,6 +20,10 @@ import (
 // than merging keeps the precedence honest in both directions: the file's own
 // answer wins whenever it has one, and the sidecar fills the gap, on this run
 // and on every re-run.
+// The caption is the one field here that a second source also writes, so it
+// follows the coordinates' rule rather than overwriting: exif_description is
+// what the file said, and description keeps whatever it already had — a caption
+// typed into Google Photos outranks a camera's "Screenshot".
 func (s *Store) ApplyMetadata(ctx context.Context, assetID string, m Metadata) error {
 	const update = `
 		update assets set
@@ -27,14 +31,43 @@ func (s *Store) ApplyMetadata(ctx context.Context, assetID string, m Metadata) e
 			camera_make = nullif($6, ''), camera_model = nullif($7, ''), lens = nullif($8, ''),
 			gps_lat = coalesce($9, import_gps_lat), gps_lon = coalesce($10, import_gps_lon),
 			exif_captured_at = $11, exif_offset_minutes = $12,
+
+			exif_metadata = $13::jsonb,
+			gps_altitude = $14, gps_direction = $15, gps_accuracy = $16, gps_at = $17,
+			iso = $18, f_number = $19, exposure_seconds = $20,
+			focal_length = $21, focal_length_35 = $22, flash = $23,
+			exif_description = nullif($24, ''),
+			description = coalesce(description, nullif($24, '')),
+			color_profile = nullif($25, ''), capture_type = $26,
+			video_codec = nullif($27, ''), frame_rate = $28, bitrate = $29,
+			audio_codec = nullif($30, ''), audio_channels = $31,
+			faces = $32::jsonb,
+
 			derived_state = 'ready'
 		where id = $1::uuid`
+
+	var raw, faces any
+	if len(m.Raw) > 0 {
+		raw = []byte(m.Raw)
+	}
+	if len(m.Faces) > 0 {
+		faces = []byte(m.Faces)
+	}
 
 	tag, err := s.pool.Exec(ctx, update, assetID,
 		m.Width, m.Height, m.Orientation, m.DurationSeconds,
 		m.CameraMake, m.CameraModel, m.Lens,
 		m.GPSLat, m.GPSLon,
-		m.ExifCapturedAt, m.ExifOffsetMinutes)
+		m.ExifCapturedAt, m.ExifOffsetMinutes,
+		raw,
+		m.GPSAltitude, m.GPSDirection, m.GPSAccuracy, m.GPSAt,
+		m.ISO, m.FNumber, m.ExposureSeconds,
+		m.FocalLength, m.FocalLength35, m.Flash,
+		m.Description,
+		m.ColorProfile, m.CaptureType,
+		m.VideoCodec, m.FrameRate, m.Bitrate,
+		m.AudioCodec, m.AudioChannels,
+		faces)
 	if err != nil {
 		return fmt.Errorf("apply metadata to %s: %w", assetID, err)
 	}

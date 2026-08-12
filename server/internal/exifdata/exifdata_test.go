@@ -2,7 +2,9 @@ package exifdata
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -140,6 +142,235 @@ func TestReadRealIPhoneOriginal(t *testing.T) {
 	}
 	if got.GPSLon == nil || *got.GPSLon > -73.9 {
 		t.Errorf("GPSLon = %v, want ~-73.978 (west is negative)", got.GPSLon)
+	}
+}
+
+// The exposure, the altitude and the bearing are all in the same fixture the
+// capture time comes from, and none of them used to be read.
+func TestReadKeepsTheExposureAndTheRestOfTheFix(t *testing.T) {
+	got, err := New().Read(context.Background(), fixture("iphone-portrait.heic"))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+
+	if got.ISO == nil || *got.ISO != 500 {
+		t.Errorf("ISO = %v, want 500", got.ISO)
+	}
+	if got.FNumber == nil || *got.FNumber != 2.8 {
+		t.Errorf("FNumber = %v, want 2.8", got.FNumber)
+	}
+	if got.ExposureSeconds == nil || *got.ExposureSeconds > 0.017 || *got.ExposureSeconds < 0.016 {
+		t.Errorf("ExposureSeconds = %v, want ~1/60", got.ExposureSeconds)
+	}
+	if got.FocalLength == nil || *got.FocalLength != 9 {
+		t.Errorf("FocalLength = %v, want 9", got.FocalLength)
+	}
+	if got.GPSAltitude == nil || *got.GPSAltitude < 5 || *got.GPSAltitude > 6 {
+		t.Errorf("GPSAltitude = %v, want ~5.35", got.GPSAltitude)
+	}
+	if got.GPSDirection == nil || *got.GPSDirection < 138 || *got.GPSDirection > 139 {
+		t.Errorf("GPSDirection = %v, want ~138", got.GPSDirection)
+	}
+	if got.ColorProfile != "Display P3" {
+		t.Errorf("ColorProfile = %q, want Display P3", got.ColorProfile)
+	}
+
+	// Everything the file carries, kept as it was answered and qualified by the
+	// group it came from, so a tag nobody thought to promote to a column is
+	// still here to promote later.
+	if len(got.Raw) == 0 {
+		t.Fatal("Raw is empty; nothing was kept verbatim")
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(got.Raw, &raw); err != nil {
+		t.Fatalf("Raw is not an object: %v", err)
+	}
+	for _, tag := range archivePaths {
+		if _, ok := raw[tag]; ok {
+			t.Errorf("Raw carries %s, which describes the blob's place on disk and not the photograph", tag)
+		}
+	}
+	if _, ok := raw["EXIF:ISO"]; !ok {
+		t.Error("Raw is missing EXIF:ISO, so it is not the whole answer")
+	}
+	// A tag this package never asks for by name. Before the wide pass it could
+	// not be here at all, which is the whole point of the change: the choice of
+	// what deserves a column is wrong about something, and this is what makes
+	// being wrong recoverable without re-reading the archive.
+	if _, ok := raw["EXIF:MeteringMode"]; !ok {
+		t.Error("Raw is missing EXIF:MeteringMode, so it is still only the tags this package happens to name")
+	}
+	// Group-qualified, so two tags of the same name in different groups cannot
+	// silently overwrite one another.
+	for key := range raw {
+		if !strings.Contains(key, ":") {
+			t.Errorf("Raw key %q is not group-qualified", key)
+			break
+		}
+	}
+}
+
+func TestReadDescribesAVideosStream(t *testing.T) {
+	got, err := New().Read(context.Background(), fixture("live-clip.mov"))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+
+	if got.VideoCodec != "avc1" {
+		t.Errorf("VideoCodec = %q, want avc1", got.VideoCodec)
+	}
+	if got.FrameRate == nil || *got.FrameRate != 30 {
+		t.Errorf("FrameRate = %v, want 30", got.FrameRate)
+	}
+	if got.AudioChannels == nil || *got.AudioChannels != 1 {
+		t.Errorf("AudioChannels = %v, want 1", got.AudioChannels)
+	}
+	if got.Bitrate == nil || *got.Bitrate == 0 {
+		t.Errorf("Bitrate = %v, want the container's average", got.Bitrate)
+	}
+}
+
+// QuickTime writes CreateDate in UTC with no zone and CreationDate in local
+// time with one. Reading only the first gives the right instant and loses the
+// fact that it was mid-afternoon where the video was shot.
+func TestCaptureTimePrefersQuickTimesLocalTime(t *testing.T) {
+	got := raw{
+		CreationDate:    "2019:08:12 12:36:15-07:00",
+		CreateDate:      "2019:08:12 19:36:15",
+		MediaCreateDate: "2019:08:12 19:36:15",
+	}.toData()
+
+	want := time.Date(2019, 8, 12, 19, 36, 15, 0, time.UTC)
+	if got.CapturedAt == nil || !got.CapturedAt.Equal(want) {
+		t.Errorf("CapturedAt = %v, want %v", got.CapturedAt, want)
+	}
+	if got.OffsetMinutes == nil || *got.OffsetMinutes != -420 {
+		t.Errorf("OffsetMinutes = %v, want -420", got.OffsetMinutes)
+	}
+}
+
+// EXIF wins over QuickTime where a file somehow has both: DateTimeOriginal is
+// the photograph's own answer.
+func TestCaptureTimeStillPrefersDateTimeOriginal(t *testing.T) {
+	got := raw{
+		DateTimeOriginal:   "2019:08:12 05:00:00",
+		OffsetTimeOriginal: "+00:00",
+		CreationDate:       "2019:08:12 12:36:15-07:00",
+	}.toData()
+
+	if got.CapturedAt == nil || got.CapturedAt.Hour() != 5 {
+		t.Errorf("CapturedAt = %v, want the EXIF tag's 05:00", got.CapturedAt)
+	}
+}
+
+// exiftool renders a one-element XMP list as a bare value and a longer one as
+// an array, and writes the numbers as strings either way.
+func TestFacesReadWhicheverShapeTheRegionsArriveIn(t *testing.T) {
+	cases := map[string]struct {
+		json string
+		want int
+	}{
+		"one region, unwrapped": {`{
+			"RegionType": "Face", "RegionAreaUnit": "normalized",
+			"RegionAreaX": "0.46", "RegionAreaY": "0.79",
+			"RegionAreaW": "0.12", "RegionAreaH": "0.16"
+		}`, 1},
+		"several regions": {`{
+			"RegionType": ["Face", "Face"], "RegionAreaUnit": ["normalized", "normalized"],
+			"RegionAreaX": ["0.47", "0.44"], "RegionAreaY": ["0.57", "0.45"],
+			"RegionAreaW": ["0.04", "0.04"], "RegionAreaH": ["0.05", "0.05"]
+		}`, 2},
+		// Columns that do not line up cannot be zipped into boxes, and a box in
+		// the wrong place is worse than none. The raw JSON still has them.
+		"ragged arrays": {`{
+			"RegionAreaX": ["0.47", "0.44"], "RegionAreaY": ["0.57"],
+			"RegionAreaW": ["0.04", "0.04"], "RegionAreaH": ["0.05", "0.05"]
+		}`, 0},
+		// A region value that is not a number costs the boxes and nothing else.
+		// Refusing the record would fail the metadata job over an XMP oddity and
+		// take the capture time and the exposure down with it.
+		"a value that is not a number": {`{
+			"RegionAreaX": "middle", "RegionAreaY": "0.57",
+			"RegionAreaW": "0.04", "RegionAreaH": "0.05"
+		}`, 0},
+		// A region measured in pixels means something else entirely.
+		"pixel units": {`{
+			"RegionAreaUnit": "pixel",
+			"RegionAreaX": "1681", "RegionAreaY": "1618",
+			"RegionAreaW": "751", "RegionAreaH": "753"
+		}`, 0},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var x raw
+			if err := json.Unmarshal([]byte(tc.json), &x); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			got := x.toData().Faces
+			if len(got) != tc.want {
+				t.Fatalf("faces = %v, want %d", got, tc.want)
+			}
+			for _, face := range got {
+				if face.X <= 0 || face.X >= 1 || face.W <= 0 || face.W >= 1 {
+					t.Errorf("face %v is not a fraction of the image", face)
+				}
+			}
+		})
+	}
+}
+
+// A 2008 JPEG in the real library records "ISO": 75.4582213796711, and a 2019
+// HEIC records "Software": 12.4 where a string belongs. Decoded strictly, one
+// odd tag is not an error in that tag — it is an error for the whole record,
+// which fails the metadata job, retries four more times, and finally marks a
+// perfectly good photograph broken and thumbnail-less over a number nothing was
+// ever going to display.
+func TestAnOddlyTypedTagCostsThatTagAndNothingElse(t *testing.T) {
+	var x raw
+	err := json.Unmarshal([]byte(`{
+		"ISO": 75.4582213796711,
+		"Model": 12.4,
+		"FocalLengthIn35mmFormat": "26",
+		"AudioChannels": "undef",
+		"GPSAltitude": "inf",
+		"DateTimeOriginal": "2008:06:14 11:02:31"
+	}`), &x)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	got := x.toData()
+	if got.ISO == nil || *got.ISO != 75 {
+		t.Errorf("ISO = %v, want the fraction rounded to 75", got.ISO)
+	}
+	if got.CameraModel != "12.4" {
+		t.Errorf("CameraModel = %q, want the number rendered as text", got.CameraModel)
+	}
+	if got.FocalLength35 == nil || *got.FocalLength35 != 26 {
+		t.Errorf("FocalLength35 = %v, want 26 from the string", got.FocalLength35)
+	}
+	if got.AudioChannels != nil {
+		t.Errorf("AudioChannels = %v, want nil for a tag that is not a number", got.AudioChannels)
+	}
+	if got.GPSAltitude != nil {
+		t.Errorf("GPSAltitude = %v, want nil — an infinity is not a measurement", got.GPSAltitude)
+	}
+	// And the rest of the record survived, which is the whole point.
+	if got.CapturedAt == nil {
+		t.Error("CapturedAt is nil; one odd tag took the capture time with it")
+	}
+}
+
+// A screenshot's UserComment is a bare newline, which is not a caption.
+func TestDescriptionTakesTheFirstTagThatSaysSomething(t *testing.T) {
+	got := raw{UserComment: "\n", CaptionAbstract: " a caption "}.toData()
+	if got.Description != "a caption" {
+		t.Errorf("Description = %q, want the trimmed caption", got.Description)
+	}
+
+	if empty := (raw{UserComment: "  "}).toData(); empty.Description != "" {
+		t.Errorf("Description = %q, want empty for whitespace", empty.Description)
 	}
 }
 

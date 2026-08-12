@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/dominicclerici/photos-backup/server/internal/takeout"
 )
 
 // importClient speaks the same protocol the phone does.
@@ -241,6 +243,46 @@ func (c *importClient) describe(assetID string, it *importItem) error {
 
 	if resp.StatusCode != http.StatusNoContent {
 		return statusErr("import-metadata", resp)
+	}
+	return nil
+}
+
+// orphan hands the archive something this import read and could not attach.
+//
+// Same shape as describe and the opposite claim: that one says "this asset is
+// what the export was describing", this one says "the export described
+// something and I could not tell you what". Both have to reach the archive,
+// because the export is deleted afterwards and only one of them can be
+// recovered by looking at the files again.
+func (c *importClient) orphan(kind, locator, assetID string, sidecar json.RawMessage, albums []takeout.Album, reason string) error {
+	payload := map[string]any{
+		"source":  "google-takeout",
+		"kind":    kind,
+		"locator": locator,
+		"reason":  reason,
+	}
+	if assetID != "" {
+		payload["assetId"] = assetID
+	}
+	if len(sidecar) > 0 {
+		payload["sidecar"] = sidecar
+	}
+	if len(albums) > 0 {
+		refs := make([]albumPayload, 0, len(albums))
+		for _, album := range albums {
+			refs = append(refs, albumPayload{Title: album.Title, Description: album.Description})
+		}
+		payload["albums"] = refs
+	}
+
+	resp, err := c.postJSON("/v1/import/orphans", payload)
+	if err != nil {
+		return err
+	}
+	defer drainBody(resp)
+
+	if resp.StatusCode != http.StatusNoContent {
+		return statusErr("import/orphans", resp)
 	}
 	return nil
 }

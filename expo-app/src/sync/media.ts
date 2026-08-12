@@ -8,10 +8,13 @@ import {
   type AssetMetadata,
 } from 'expo-media-library';
 
+import { photoKitFacts, type PhotoKitFacts, type PhotoKitLocation } from '../../modules/photo-facts';
 import { sweepChunks } from './chunked';
 import {
   errorText,
   SyncError,
+  type AssetFacts,
+  type AssetLocation,
   type EnumeratedAsset,
   type MediaSource,
   type OpenedAsset,
@@ -81,6 +84,49 @@ export class PhotoKitMediaSource implements MediaSource {
 
   async open(item: QueueItem, opts: { hash: boolean }): Promise<OpenedAsset> {
     return item.kind === 'live_video' ? this.openPairedVideo(item, opts) : this.openOriginal(item, opts);
+  }
+
+  /**
+   * Reads what PhotoKit knows and the file does not.
+   *
+   * Read here, at upload time, rather than during enumeration: a backfill
+   * enumerates the whole library on every run and uploads a shrinking slice of
+   * it, so asking per asset here is a handful of native calls per photo archived
+   * rather than per photo owned.
+   *
+   * Four of the five lookups go through expo-media-library, which is why the
+   * fifth exists at all: its Asset exposes ten getters out of PHAsset's forty,
+   * and the thirty it leaves behind — the Hidden album, the burst, whether the
+   * shot has ever been edited — are unrecoverable rather than merely absent.
+   *
+   * Nothing here is allowed to fail the item. A photo whose albums could not be
+   * listed is still a photo that belongs in the archive, so a failed lookup
+   * degrades to the part that did answer, and a build without the native module
+   * degrades to exactly what this returned before there was one.
+   */
+  async facts(item: QueueItem): Promise<AssetFacts | null> {
+    // The paired video is not an asset to PhotoKit — it is a property of the
+    // still, and the still is the one carrying the heart and the album.
+    if (item.kind === 'live_video') return null;
+
+    const asset = new Asset(item.localId);
+    const [favorite, subtypes, albums, location, photoKit] = await Promise.all([
+      quietly(() => asset.getFavorite(), false),
+      quietly(() => asset.getMediaSubtypes(), [] as MediaSubtype[]),
+      quietly(() => asset.getAlbums(), []),
+      quietly(() => asset.getLocation(), null),
+      quietly<PhotoKitFacts | null>(() => photoKitFacts(item.localId), null),
+    ]);
+
+    const titles = await Promise.all(albums.map((album) => quietly(() => album.getTitle(), '')));
+
+    return {
+      favorite,
+      subtypes: subtypes.map((subtype) => String(subtype)),
+      albums: titles.filter((title) => title.trim() !== ''),
+      location: assetLocation(location, photoKit?.location ?? null),
+      photoKit,
+    };
   }
 
   private async openOriginal(item: QueueItem, opts: { hash: boolean }): Promise<OpenedAsset> {
@@ -187,6 +233,31 @@ export class PhotoKitMediaSource implements MediaSource {
 
 function liveDirectory(): Directory {
   return new Directory(Paths.cache, LIVE_DIRECTORY);
+}
+
+/**
+ * One location out of the two readings of the same CLLocation.
+ *
+ * The native module's is preferred where there is one, because it is that
+ * CLLocation with the rest of itself still attached — altitude, accuracies, the
+ * time the fix was taken — where expo-media-library reduces it to a pair of
+ * numbers on the way through. They never disagree about the coordinates.
+ */
+function assetLocation(
+  reported: { latitude: number; longitude: number } | null,
+  full: PhotoKitLocation | null
+): AssetLocation | null {
+  if (full) return full;
+  return reported ? { latitude: reported.latitude, longitude: reported.longitude } : null;
+}
+
+/** Runs a library lookup, falling back rather than throwing. */
+async function quietly<T>(read: () => Promise<T>, fallback: T): Promise<T> {
+  try {
+    return (await read()) ?? fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 async function isLivePhoto(localId: string): Promise<boolean> {

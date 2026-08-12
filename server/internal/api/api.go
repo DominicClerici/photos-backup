@@ -69,6 +69,10 @@ func (s *Server) Handler() http.Handler {
 	// an asset rather than creating one, which is why it hangs off the asset
 	// rather than sitting beside the upload endpoints.
 	mux.HandleFunc("POST /v1/assets/{id}/import-metadata", s.requireDevice(s.handleImportMetadata))
+	// What an export knew and the import could not attach to anything. It names
+	// no asset — a sidecar orphan has none by definition — so unlike the route
+	// above it sits on its own rather than under /v1/assets.
+	mux.HandleFunc("POST /v1/import/orphans", s.requireDevice(s.handleImportOrphan))
 
 	// Resumable uploads. The id is derived from the declaration, so POST
 	// /v1/uploads is both "begin" and "where did I get to".
@@ -119,6 +123,7 @@ func (s *Server) PlaintextHandler() http.Handler {
 		"POST /v1/sync/check",
 		"POST /v1/assets",
 		"POST /v1/assets/{id}/import-metadata",
+		"POST /v1/import/orphans",
 		"POST /v1/uploads",
 		"GET /v1/uploads/{id}",
 		"PUT /v1/uploads/{id}",

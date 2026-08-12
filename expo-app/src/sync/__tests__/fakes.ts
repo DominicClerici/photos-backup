@@ -1,4 +1,6 @@
+import type { PhotoKitFacts } from '../../../modules/photo-facts';
 import type {
+  AssetFacts,
   CheckRequestItem,
   CheckResultItem,
   Clock,
@@ -51,11 +53,19 @@ export class FakeTransport implements Transport {
   readonly uploads: UploadRequest[] = [];
   /** Local ids that went down the resumable path rather than single-shot. */
   readonly resumable: string[] = [];
+  readonly described: { assetId: string; facts: AssetFacts }[] = [];
+  /** Set to make describe() throw, which must never reach an item. */
+  describeFails = false;
 
   constructor(
     private readonly checkResponder: CheckResponder,
     private readonly uploadResponder: UploadResponder = defaultUpload
   ) {}
+
+  async describe(assetId: string, facts: AssetFacts): Promise<void> {
+    if (this.describeFails) throw new SyncError('describe blew up', 'item');
+    this.described.push({ assetId, facts });
+  }
 
   async check(deviceId: string, items: CheckRequestItem[]): Promise<CheckResultItem[]> {
     const call = { deviceId, items };
@@ -122,6 +132,8 @@ export class FakeMedia implements MediaSource {
   readonly opens: { localId: string; hash: boolean }[] = [];
   readonly releases: string[] = [];
   sweepCount = 0;
+  /** What facts() answers, per local id. Anything absent has none. */
+  readonly facts_: Map<string, AssetFacts> = new Map();
 
   constructor(
     private readonly assets: EnumeratedAsset[] = [],
@@ -149,6 +161,11 @@ export class FakeMedia implements MediaSource {
     };
   }
 
+  async facts(item: QueueItem): Promise<AssetFacts | null> {
+    if (item.kind === 'live_video') return null;
+    return this.facts_.get(item.localId) ?? null;
+  }
+
   async sweep(): Promise<number> {
     return this.sweepCount;
   }
@@ -156,6 +173,50 @@ export class FakeMedia implements MediaSource {
   hashOpens(): string[] {
     return this.opens.filter((open) => open.hash).map((open) => open.localId);
   }
+}
+
+/**
+ * A set of library facts to hang on a fake asset. The default is the shape a
+ * build without the PhotoFacts native module produces: what
+ * expo-media-library can answer, and nothing from PHAsset itself.
+ */
+export function facts(overrides: Partial<AssetFacts> = {}): AssetFacts {
+  return { favorite: false, subtypes: [], albums: [], location: null, photoKit: null, ...overrides };
+}
+
+/**
+ * What the native module answers for an unremarkable photo, so a test can vary
+ * the one field it is about.
+ */
+export function photoKit(overrides: Partial<PhotoKitFacts> = {}): PhotoKitFacts {
+  return {
+    localId: 'ph://asset',
+    hidden: false,
+    favorite: false,
+    mediaType: { value: 1, name: 'image' },
+    mediaSubtypes: { value: 0, names: [] },
+    sourceType: { value: 1, names: ['typeUserLibrary'] },
+    playbackStyle: { value: 1, name: 'image' },
+    burstIdentifier: null,
+    burstSelectionTypes: { value: 0, names: [] },
+    representsBurst: false,
+    pixelWidth: 4032,
+    pixelHeight: 3024,
+    durationSeconds: 0,
+    createdAt: '2025-01-06T01:38:05.000Z',
+    modifiedAt: '2025-01-06T01:38:05.000Z',
+    hasAdjustments: false,
+    originalFilename: 'IMG_5874.HEIC',
+    resources: [
+      {
+        type: { value: 1, name: 'photo' },
+        originalFilename: 'IMG_5874.HEIC',
+        uniformTypeIdentifier: 'public.heic',
+      },
+    ],
+    location: null,
+    ...overrides,
+  };
 }
 
 export function asset(localId: string, overrides: Partial<EnumeratedAsset> = {}): EnumeratedAsset {

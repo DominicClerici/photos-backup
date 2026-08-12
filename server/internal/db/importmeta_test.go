@@ -249,6 +249,48 @@ func TestATrashedItemIsRecordedAsArchived(t *testing.T) {
 	}
 }
 
+// The Hidden album is recorded the same way Google's bin is: as a fact about
+// where the source kept it, not as an instruction. An asset the phone hid is
+// archived, flagged, and still in the timeline.
+func TestAHiddenPhotoIsRecordedAsArchived(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	id, _, err := s.RecordAsset(ctx, sampleAsset())
+	if err != nil {
+		t.Fatalf("RecordAsset: %v", err)
+	}
+
+	meta, err := ImportMetadataFrom(SourcePhotoKit, []byte(`{
+		"favorite": false,
+		"subtypes": [],
+		"hidden": true,
+		"photoKit": { "hidden": true, "hasAdjustments": true }
+	}`), nil)
+	if err != nil {
+		t.Fatalf("ImportMetadataFrom: %v", err)
+	}
+	if err := s.ApplyImportMetadata(ctx, id, meta); err != nil {
+		t.Fatalf("ApplyImportMetadata: %v", err)
+	}
+
+	got, err := s.Asset(ctx, id)
+	if err != nil {
+		t.Fatalf("load asset: %v", err)
+	}
+	if !got.Archived {
+		t.Error("Archived = false on a photo the phone had in the Hidden album")
+	}
+
+	page, err := s.Timeline(ctx, nil, 10)
+	if err != nil {
+		t.Fatalf("Timeline: %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Error("a hidden photo vanished from the timeline; the flag is recorded, not acted on")
+	}
+}
+
 func TestAnUnknownImportSourceIsRefused(t *testing.T) {
 	if _, err := ImportMetadataFrom("apple-photos", []byte(`{}`), nil); err == nil {
 		t.Error("a format nothing can read was accepted")

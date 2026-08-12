@@ -17,6 +17,16 @@ import (
 const (
 	KindAsset    = "asset"
 	KindMetadata = "metadata"
+	// KindImportOrphan records something an import read but could not attach to
+	// an asset: a sidecar whose media file was not in the export, or albums for
+	// an item that had no sidecar to carry them.
+	//
+	// It names no blob, which is why it is its own kind rather than a metadata
+	// line with an empty digest. It is here rather than only in the database
+	// for the reason every other line is: the export it was read from is
+	// usually deleted the week after the import, and an unmatched sidecar is
+	// then the only copy of what Google knew about that photograph.
+	KindImportOrphan = "import-orphan"
 )
 
 // Entry is one line of manifest.jsonl: everything needed to rebuild a database
@@ -81,6 +91,18 @@ type Entry struct {
 	ImportSource  string          `json:"import_source,omitempty"`
 	ImportSidecar json.RawMessage `json:"import_sidecar,omitempty"`
 	ImportAlbums  []AlbumRef      `json:"import_albums,omitempty"`
+
+	// The orphan line's payload, on top of the three fields above.
+	//
+	// OrphanKind is "sidecar" or "album". Locator is where the thing sat inside
+	// the export — the sidecar's path for the first, the media file's for the
+	// second — which is what makes replaying an import idempotent rather than
+	// additive. Reason is why it could not be attached, in words, because the
+	// point of keeping these is to be read later by someone deciding what to do
+	// about them.
+	OrphanKind   string `json:"orphan_kind,omitempty"`
+	Locator      string `json:"locator,omitempty"`
+	OrphanReason string `json:"orphan_reason,omitempty"`
 
 	StoredAt time.Time `json:"stored_at"`
 }

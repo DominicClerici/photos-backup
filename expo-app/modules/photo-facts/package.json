@@ -1,0 +1,10 @@
+{
+  "name": "photo-facts",
+  "version": "0.1.0",
+  "description": "Reads the parts of a PHAsset that expo-media-library's bridge does not expose.",
+  "main": "index.ts",
+  "license": "MIT",
+  "author": "Dominic Clerici",
+  "homepage": "https://github.com/dominicclerici/photos-backup",
+  "private": true
+}

@@ -161,3 +161,67 @@ func TestVerifyIgnoresMetadataLines(t *testing.T) {
 		t.Errorf("findings on an intact imported archive: %v", report.Findings)
 	}
 }
+
+const orphanedReindexSidecar = `{
+  "title": "IMG_9999.HEIC",
+  "description": "the last morning",
+  "photoTakenTime": { "timestamp": "1736125085" },
+  "people": [{ "name": "Brody" }]
+}`
+
+// An unmatched sidecar is the one thing in the archive that names no blob, and
+// so the one thing a rebuild has no other way to find. If it does not come back
+// off the manifest it is gone for good: the export it was read from is deleted,
+// and there is no file to re-read it from the way every other fact here can be.
+func TestReindexRestoresImportOrphans(t *testing.T) {
+	a := newArchive(t)
+	ctx := context.Background()
+
+	// One of each kind, written the way the import endpoint writes them.
+	for _, entry := range []manifest.Entry{{
+		Type:          manifest.KindImportOrphan,
+		OrphanKind:    db.OrphanSidecar,
+		Locator:       "Photos from 2025/IMG_9999.HEIC.supplemental-metadata.json",
+		OrphanReason:  "no media file in this export matched the sidecar",
+		ImportSource:  db.SourceGoogleTakeout,
+		ImportSidecar: []byte(orphanedReindexSidecar),
+		StoredAt:      time.Now().UTC(),
+	}, {
+		Type:         manifest.KindImportOrphan,
+		OrphanKind:   db.OrphanAlbum,
+		Locator:      "Archive/IMG_0002.HEIC",
+		OrphanReason: "no sidecar matched this item",
+		ImportSource: db.SourceGoogleTakeout,
+		ImportAlbums: []manifest.AlbumRef{{Title: "Archive"}},
+		StoredAt:     time.Now().UTC(),
+	}} {
+		if err := a.manifest.Append(entry); err != nil {
+			t.Fatalf("append orphan line: %v", err)
+		}
+	}
+
+	a.dropIndex(t)
+
+	result, err := verify.Reindex(ctx, a.deps, verify.ReindexOptions{})
+	if err != nil {
+		t.Fatalf("reindex: %v", err)
+	}
+	if result.Orphans != 2 {
+		t.Errorf("Orphans = %d, want both lines replayed", result.Orphans)
+	}
+
+	counts, err := a.store.ImportOrphanCounts(ctx)
+	if err != nil {
+		t.Fatalf("ImportOrphanCounts: %v", err)
+	}
+	if counts[db.OrphanSidecar] != 1 || counts[db.OrphanAlbum] != 1 {
+		t.Errorf("counts = %v, want one of each restored", counts)
+	}
+
+	// An orphan line names no blob, so it must not be mistaken for one: a
+	// rebuild that read it as an asset line would invent an archived file with
+	// no bytes behind it.
+	if result.Missing != 0 {
+		t.Errorf("Missing = %d, want the orphan lines not counted as absent blobs", result.Missing)
+	}
+}

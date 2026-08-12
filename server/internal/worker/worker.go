@@ -10,6 +10,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -584,7 +585,46 @@ func metadataFrom(d exifdata.Data) db.Metadata {
 		GPSLon:            d.GPSLon,
 		ExifCapturedAt:    d.CapturedAt,
 		ExifOffsetMinutes: d.OffsetMinutes,
+
+		Raw:          d.Raw,
+		GPSAltitude:  d.GPSAltitude,
+		GPSDirection: d.GPSDirection,
+		GPSAccuracy:  d.GPSAccuracy,
+		GPSAt:        d.GPSAt,
+
+		ISO:             d.ISO,
+		FNumber:         d.FNumber,
+		ExposureSeconds: d.ExposureSeconds,
+		FocalLength:     d.FocalLength,
+		FocalLength35:   d.FocalLength35,
+		Flash:           d.Flash,
+
+		Description:  d.Description,
+		ColorProfile: d.ColorProfile,
+		CaptureType:  d.CaptureType,
+
+		VideoCodec:    d.VideoCodec,
+		FrameRate:     d.FrameRate,
+		Bitrate:       d.Bitrate,
+		AudioCodec:    d.AudioCodec,
+		AudioChannels: d.AudioChannels,
+
+		Faces: encodeFaces(d.Faces),
 	}
+}
+
+// encodeFaces renders the region list for the jsonb column, and nothing at all
+// when there were no regions — an empty array would read as "something looked
+// and found no faces", which is not what an absent XMP region list means.
+func encodeFaces(faces []exifdata.Face) json.RawMessage {
+	if len(faces) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(faces)
+	if err != nil {
+		return nil
+	}
+	return encoded
 }
 
 func (r *Runner) log() *slog.Logger {

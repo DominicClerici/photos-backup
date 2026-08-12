@@ -38,7 +38,10 @@ type ReindexResult struct {
 	Mappings int64
 	// Described counts import sidecars replayed onto assets.
 	Described int64
-	Elapsed   time.Duration
+	// Orphans counts what an import could not attach, restored to the table it
+	// was recorded in rather than onto an asset — see db.ImportOrphan.
+	Orphans int64
+	Elapsed time.Duration
 }
 
 // Reindex rebuilds the database from manifest.jsonl and the blob tree.
@@ -64,6 +67,16 @@ func Reindex(ctx context.Context, d Deps, opt ReindexOptions) (ReindexResult, er
 		result.Lines++
 		if opt.Progress != nil {
 			opt.Progress(result.Lines)
+		}
+		if e.Type == manifest.KindImportOrphan {
+			// Held back with the metadata lines, and for a stronger reason. An
+			// album orphan names an asset that may be further down this log,
+			// and a sidecar orphan names no blob at all — so it never passes
+			// the digest check below, and replaying it here rather than there
+			// is the only way a rebuilt database gets it back. The export it
+			// was read from is gone by then.
+			pending = append(pending, e)
+			return nil
 		}
 		if e.SHA256 == "" {
 			return nil
@@ -111,7 +124,13 @@ func Reindex(ctx context.Context, d Deps, opt ReindexOptions) (ReindexResult, er
 			return result, err
 		}
 	} else {
-		result.Described = int64(len(pending))
+		for _, e := range pending {
+			if e.Type == manifest.KindImportOrphan {
+				result.Orphans++
+				continue
+			}
+			result.Described++
+		}
 	}
 
 	result.Elapsed = time.Since(started)
@@ -258,6 +277,13 @@ func adoptOrphans(ctx context.Context, d Deps, opt ReindexOptions, seen map[stri
 // there describes nothing.
 func replayImports(ctx context.Context, d Deps, entries []manifest.Entry, result *ReindexResult) error {
 	for _, e := range entries {
+		if e.Type == manifest.KindImportOrphan {
+			if err := replayOrphan(ctx, d, e, result); err != nil {
+				return err
+			}
+			continue
+		}
+
 		asset, err := d.Store.AssetBySHA256(ctx, e.SHA256)
 		if errors.Is(err, db.ErrNotFound) {
 			continue
@@ -281,6 +307,36 @@ func replayImports(ctx context.Context, d Deps, entries []manifest.Entry, result
 		}
 		result.Described++
 	}
+	return nil
+}
+
+// replayOrphan restores one import orphan from its manifest line.
+//
+// The asset reference is dropped rather than resolved: the line records where
+// the item sat inside an export, and a rebuilt database has no way back from
+// that to a row. The evidence — the sidecar, the albums, the reason — is what
+// mattered, and it survives whole.
+func replayOrphan(ctx context.Context, d Deps, e manifest.Entry, result *ReindexResult) error {
+	orphan := db.ImportOrphan{
+		Source:  e.ImportSource,
+		Kind:    e.OrphanKind,
+		Locator: e.Locator,
+		Sidecar: e.ImportSidecar,
+		Reason:  e.OrphanReason,
+	}
+	for _, album := range e.ImportAlbums {
+		orphan.Albums = append(orphan.Albums,
+			db.AlbumRef{Title: album.Title, Description: album.Description})
+	}
+	if err := orphan.Validate(); err != nil {
+		// A line this build cannot read is not a reason to abandon a rebuild,
+		// the same rule the import lines above follow. It stays in the log.
+		return nil
+	}
+	if err := d.Store.RecordImportOrphan(ctx, orphan); err != nil {
+		return fmt.Errorf("replay import orphan %s: %w", e.Locator, err)
+	}
+	result.Orphans++
 	return nil
 }
 

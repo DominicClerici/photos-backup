@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -43,6 +44,26 @@ type importItem struct {
 	assetID string
 }
 
+// mediaFile is one candidate file, carrying where it sits inside the export
+// rather than only where it sits on this disk.
+//
+// The two differ as soon as an export arrives as several zips, which is how
+// Google delivers anything large. Every path an importer reasons about — which
+// sidecar describes this file, which album it is in, what local id it keeps
+// across runs — is relative to the top of the export, and unzipping into six
+// directories changes only the part in front of that.
+type mediaFile struct {
+	path string
+	// rel is the path from the root it was found under, slash-separated. It is
+	// the item's identity: the same file is the same rel whether the export was
+	// unzipped into one directory or six.
+	rel string
+	// relDir is rel's directory, "." at the top of the export. Sidecars and
+	// albums are grouped by it, so a sidecar in one delivery finds the media
+	// file in another.
+	relDir string
+}
+
 // scanResult is an export, read.
 type scanResult struct {
 	items []*importItem
@@ -58,12 +79,39 @@ type scanResult struct {
 	described int
 	// unmatchedSidecars are sidecars whose media file could not be found, which
 	// is the signal that the filename rules have drifted again.
-	unmatchedSidecars []string
+	//
+	// Their contents travel with them. Reporting the filename and dropping the
+	// body was the wrong half to keep: the name says a rule needs fixing, and
+	// the body is the caption, the people, the coordinates and the capture time
+	// for a photograph that exists somewhere — and the export it was read from
+	// is deleted long before anyone gets to the rule.
+	unmatchedSidecars []unmatchedSidecar
 	albums            []string
 	skippedTrash      int
+	// duplicatePaths counts files that appear at the same place in more than one
+	// delivery of the same export. The first one read wins; the rest are the
+	// same item arriving twice.
+	duplicatePaths int
 }
 
-// scanExport reads an export directory into an ordered list of uploads.
+// unmatchedSidecar is a sidecar that describes no file this scan could find,
+// kept whole so the archive can hold the evidence rather than a filename.
+type unmatchedSidecar struct {
+	// locator is where it sat inside the export, which is its identity across
+	// deliveries and across re-runs.
+	locator string
+	raw     json.RawMessage
+}
+
+// scanExport reads an export into an ordered list of uploads.
+//
+// It takes several roots because Google delivers a large export as a stack of
+// zips, and it splits an item from its sidecar across them freely: in the real
+// export, `20180116_000028.mp4` is in the sixth zip and the JSON describing it
+// is in the first. Read one directory at a time, 5,979 of that export's 11,282
+// sidecars describe a file that is not there, and the metadata in them is lost
+// the moment the export is deleted. Read together, none are. So the unit is the
+// export, not the directory, and every root is a delivery of the same one.
 //
 // The order is the point of doing this as one pass rather than streaming: every
 // still is uploaded before any video, so that when a paired video's row is
@@ -71,70 +119,73 @@ type scanResult struct {
 // that same transaction. Getting it wrong is survivable — the metadata worker
 // resolves late pairings too — but it costs a re-run of the video's derivatives,
 // and on a library that is a third Live Photos that is a great deal of ffmpeg.
-func scanExport(ctx context.Context, exif *exifdata.Reader, root string, includeTrash bool) (scanResult, error) {
-	root = filepath.Clean(root)
+func scanExport(ctx context.Context, exif *exifdata.Reader, roots []string, includeTrash bool) (scanResult, error) {
 	var result scanResult
 
-	files, sidecarsByDir, albumsByDir, err := walkExport(root)
+	cleaned := make([]string, 0, len(roots))
+	for _, root := range roots {
+		cleaned = append(cleaned, filepath.Clean(root))
+	}
+
+	files, sidecarsByDir, albumsByDir, duplicates, err := walkExport(cleaned)
 	if err != nil {
 		return result, err
 	}
+	result.duplicatePaths = duplicates
 
-	// One exiftool over the whole tree. It is what says which files are media
-	// at all, which are video, and which carry a content identifier.
+	// One exiftool per root. It is what says which files are media at all,
+	// which are video, and which carry a content identifier.
 	identified := make(map[string]exifdata.Scanned, len(files))
-	err = exif.ScanTree(ctx, root, func(s exifdata.Scanned) error {
-		identified[filepath.Clean(s.Path)] = s
-		return nil
-	})
-	if err != nil {
-		return result, fmt.Errorf("read metadata under %s: %w", root, err)
+	for _, root := range cleaned {
+		err := exif.ScanTree(ctx, root, func(s exifdata.Scanned) error {
+			identified[filepath.Clean(s.Path)] = s
+			return nil
+		})
+		if err != nil {
+			return result, fmt.Errorf("read metadata under %s: %w", root, err)
+		}
 	}
 
-	for _, path := range files {
-		scanned, ok := identified[path]
+	for _, file := range files {
+		scanned, ok := identified[file.path]
 		if !ok || !isMedia(scanned.MIMEType) {
 			// Not something this archive stores: the sidecars themselves, the
 			// export's HTML, anything exiftool could not identify.
 			continue
 		}
-		info, err := os.Stat(path)
-		if err != nil {
-			return result, err
-		}
-
-		dir := filepath.Dir(path)
-		rel, err := filepath.Rel(root, path)
+		info, err := os.Stat(file.path)
 		if err != nil {
 			return result, err
 		}
 
 		item := &importItem{
-			path:      path,
-			localID:   filepath.ToSlash(rel),
-			filename:  filepath.Base(path),
+			path:      file.path,
+			localID:   file.rel,
+			filename:  filepath.Base(file.path),
 			size:      info.Size(),
 			modified:  info.ModTime().UTC(),
 			isVideo:   scanned.IsVideo(),
 			contentID: scanned.ContentID,
-			albums:    albumsByDir[dir],
+			albums:    albumsByDir[file.relDir],
 		}
-		if raw, ok := sidecarsByDir[dir][item.filename]; ok {
+		if raw, ok := sidecarsByDir[file.relDir][item.filename]; ok {
 			item.attachSidecar(raw)
-			delete(sidecarsByDir[dir], item.filename)
+			delete(sidecarsByDir[file.relDir], item.filename)
 		}
 		result.items = append(result.items, item)
 	}
 
 	result.pairs, result.orphanVideos = inheritSidecars(result.items)
 
-	for dir, remaining := range sidecarsByDir {
-		for name := range remaining {
+	for relDir, remaining := range sidecarsByDir {
+		for name, raw := range remaining {
 			result.unmatchedSidecars = append(result.unmatchedSidecars,
-				filepath.Join(filepath.Base(dir), name))
+				unmatchedSidecar{locator: path.Join(relDir, name), raw: raw})
 		}
 	}
-	sort.Strings(result.unmatchedSidecars)
+	sort.Slice(result.unmatchedSidecars, func(i, j int) bool {
+		return result.unmatchedSidecars[i].locator < result.unmatchedSidecars[j].locator
+	})
 
 	kept := result.items[:0]
 	for _, item := range result.items {
@@ -177,61 +228,101 @@ func (it *importItem) attachSidecar(raw json.RawMessage) {
 	it.trashed = meta.Trashed
 }
 
-// walkExport collects the media paths, the item sidecars grouped by directory,
-// and the albums the directory layout implies.
-func walkExport(root string) (files []string, sidecars map[string]map[string]json.RawMessage, albums map[string][]takeout.Album, err error) {
+// walkExport collects the media files, the item sidecars, and the albums the
+// directory layout implies — all of them keyed by the directory's place inside
+// the export rather than on disk, so several deliveries of one export read as
+// one export.
+func walkExport(roots []string) (
+	files []mediaFile,
+	sidecars map[string]map[string]json.RawMessage,
+	albums map[string][]takeout.Album,
+	duplicates int,
+	err error,
+) {
 	sidecars = make(map[string]map[string]json.RawMessage)
 	albums = make(map[string][]takeout.Album)
 
 	// Two passes over each directory, because a sidecar can only be matched to
 	// a media file once the directory's media filenames are all known — the
 	// truncation rules resolve by looking for a name that is actually there.
-	byDir := make(map[string][]string)
-
-	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	// The first pass gathers every root, so the second sees a directory whole
+	// even when its contents were split across zips.
+	type contents struct {
+		media map[string]string // filename -> the absolute path it was found at
+		jsons map[string]string // filename -> the absolute path it was found at
+	}
+	byRelDir := make(map[string]*contents)
+	at := func(relDir string) *contents {
+		c, ok := byRelDir[relDir]
+		if !ok {
+			c = &contents{media: map[string]string{}, jsons: map[string]string{}}
+			byRelDir[relDir] = c
 		}
-		if d.IsDir() {
-			if strings.HasPrefix(d.Name(), ".") && path != root {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if strings.HasPrefix(d.Name(), ".") {
-			return nil
-		}
-		byDir[filepath.Dir(path)] = append(byDir[filepath.Dir(path)], d.Name())
-		return nil
-	})
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("walk %s: %w", root, err)
+		return c
 	}
 
-	for dir, names := range byDir {
-		media := make(map[string]bool, len(names))
-		var jsons []string
-		for _, name := range names {
-			if strings.EqualFold(filepath.Ext(name), ".json") {
-				jsons = append(jsons, name)
-				continue
+	for _, root := range roots {
+		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
 			}
+			if d.IsDir() {
+				if strings.HasPrefix(d.Name(), ".") && p != root {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if strings.HasPrefix(d.Name(), ".") {
+				return nil
+			}
+
+			rel, err := filepath.Rel(root, p)
+			if err != nil {
+				return err
+			}
+			relDir := path.Dir(filepath.ToSlash(rel))
+			c := at(relDir)
+
+			if strings.EqualFold(filepath.Ext(d.Name()), ".json") {
+				if _, seen := c.jsons[d.Name()]; !seen {
+					c.jsons[d.Name()] = p
+				}
+				return nil
+			}
+			if _, seen := c.media[d.Name()]; seen {
+				// The same item at the same place in two deliveries. Every
+				// observed instance is the identical file zipped twice, and
+				// keeping both would give two uploads one local id.
+				duplicates++
+				return nil
+			}
+			c.media[d.Name()] = p
+			files = append(files, mediaFile{path: p, rel: filepath.ToSlash(rel), relDir: relDir})
+			return nil
+		})
+		if err != nil {
+			return nil, nil, nil, 0, fmt.Errorf("walk %s: %w", root, err)
+		}
+	}
+
+	for relDir, c := range byRelDir {
+		media := make(map[string]bool, len(c.media))
+		for name := range c.media {
 			media[name] = true
-			files = append(files, filepath.Join(dir, name))
 		}
 
-		if album, ok := albumFor(dir, root, jsons, len(media) > 0); ok {
-			albums[dir] = []takeout.Album{album}
+		if album, ok := albumFor(relDir, c.jsons, len(media) > 0); ok {
+			albums[relDir] = []takeout.Album{album}
 		}
 
 		matched := make(map[string]json.RawMessage)
-		for _, name := range jsons {
+		for name, at := range c.jsons {
 			if takeout.IsDirectoryJSON(name) {
 				continue
 			}
-			raw, err := os.ReadFile(filepath.Join(dir, name))
+			raw, err := os.ReadFile(at)
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, 0, err
 			}
 			target, ok := matchSidecar(name, raw, media)
 			if !ok {
@@ -241,11 +332,11 @@ func walkExport(root string) (files []string, sidecars map[string]map[string]jso
 			}
 			matched[target] = raw
 		}
-		sidecars[dir] = matched
+		sidecars[relDir] = matched
 	}
 
-	sort.Strings(files)
-	return files, sidecars, albums, nil
+	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
+	return files, sidecars, albums, duplicates, nil
 }
 
 // matchSidecar decides which media file a sidecar describes.
@@ -289,20 +380,20 @@ func matchSidecar(sidecarName string, raw []byte, media map[string]bool) (string
 // directly and is not one of the chronological buckets loose photos are filed
 // into. Its metadata.json names it when there is one; the directory name does
 // when there is not.
-func albumFor(dir, root string, jsons []string, hasMedia bool) (takeout.Album, bool) {
-	if dir == root || !hasMedia {
+func albumFor(relDir string, jsons map[string]string, hasMedia bool) (takeout.Album, bool) {
+	if relDir == "." || !hasMedia {
 		return takeout.Album{}, false
 	}
-	name := filepath.Base(dir)
+	name := path.Base(relDir)
 	if takeout.IsDatedFolder(name) {
 		return takeout.Album{}, false
 	}
 
-	for _, jsonName := range jsons {
+	for jsonName, at := range jsons {
 		if !takeout.IsAlbumDescriptor(jsonName) {
 			continue
 		}
-		raw, err := os.ReadFile(filepath.Join(dir, jsonName))
+		raw, err := os.ReadFile(at)
 		if err != nil {
 			break
 		}

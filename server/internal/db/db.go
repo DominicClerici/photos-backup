@@ -4,6 +4,7 @@ package db
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -116,6 +117,38 @@ type Metadata struct {
 	GPSLon            *float64
 	ExifCapturedAt    *time.Time
 	ExifOffsetMinutes *int
+
+	// Raw is every tag the reader asked for, verbatim. See the 0007 migration:
+	// the fields around it are what has a column today, and this is what makes
+	// that choice reversible without re-reading the archive.
+	Raw json.RawMessage
+
+	GPSAltitude  *float64
+	GPSDirection *float64
+	GPSAccuracy  *float64
+	GPSAt        *time.Time
+
+	ISO             *int
+	FNumber         *float64
+	ExposureSeconds *float64
+	FocalLength     *float64
+	FocalLength35   *int
+	Flash           *int
+
+	// Description is the caption the file itself carries. It does not overwrite
+	// the one an export's sidecar supplied; it fills the gap where there is none.
+	Description  string
+	ColorProfile string
+	CaptureType  *int
+
+	VideoCodec    string
+	FrameRate     *float64
+	Bitrate       *int64
+	AudioCodec    string
+	AudioChannels *int
+
+	// Faces are region boxes as fractions of the image, already normalized.
+	Faces json.RawMessage
 }
 
 // Derivative states, shared by DerivedState and PlaybackState.

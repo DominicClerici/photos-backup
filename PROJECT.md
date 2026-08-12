@@ -601,6 +601,59 @@ live in `import_gps_lat`/`import_gps_lon` and feed the canonical pair only where
 the file itself carried nothing — which makes the precedence hold in both
 directions and under any order of arrival.
 
+### Phase 9 — Capturing all of it
+
+An audit of both ingest paths against the real 15,689-file export, before the
+export gets deleted and the question becomes unanswerable. Two of the findings
+were losses rather than omissions:
+
+**239 files were never uploaded.** exiftool recursing a directory reads only the
+extensions it knows and skips a file that has none — which is what a Takeout
+leaves of every Live Photo's paired video. The importer asks exiftool what is in
+the tree, so those files did not exist as far as it was concerned: no error, no
+unmatched sidecar, nothing to notice. Phase 4 had already been bitten by
+extensionless videos and fixed classification for them; the new scan gate put the
+loss back one layer up, where it was silent instead of visible. The fixture
+export had none, which is the second half of why it survived.
+
+**Importing zip-by-zip discarded 53% of the sidecars.** Google splits an item
+from the JSON describing it across numbered zips freely, and sidecars were
+matched inside one directory. Six separate runs leave 5,979 of 11,282 sidecars
+describing a file that is not there. `--from` now repeats and the scan groups by
+where a file sits *inside* the export rather than on disk, which also makes a
+local id the same whether the export was unzipped once or six times.
+
+**The rest was the file being read too narrowly.** Twelve tags were read where
+half the library carries an exposure, 57% an altitude, a third a video stream
+nothing recorded, and 9% face boxes something else had already found. None of it
+was lost — the originals are archived, so it was a requeue away — but none of it
+was answerable either. The tag list is wider, the tags worth an index have
+columns, and everything read is also kept verbatim in `exif_metadata`: the same
+bargain the sidecar already makes, for the same reason, since the choice of what
+deserves a column is wrong about something.
+
+Two things that only showed up against real files. A video's timezone lives in
+`CreationDate`, not the `CreateDate` beside it, which is UTC with no zone — the
+share of the library with a known local time went from 32% to 61% on that one
+tag. And a 2008 JPEG records an ISO of `75.4582213796711`: decoded strictly that
+is not an error in one tag but an error for the whole record, which fails the
+metadata job, retries four more times, and marks a good photograph broken and
+thumbnail-less. Every tag now decodes leniently.
+
+**The phone was the thinner of the two paths.** It sent a filename and two
+timestamps. PhotoKit also knows the heart, the albums, and Apple's own subtypes —
+screenshot, portrait, panorama, burst — and none of it survives the phone being
+wiped or the photo being deleted from it. It now travels as a sidecar to the same
+endpoint the importer uses, `source: "ios-photokit"`, after the bytes are safe:
+an album list has no business in a header, and losing the description must not
+cost the photograph. It runs for assets the archive already held too, which is
+the only moment a library backed up before any of this existed can still hand its
+hearts over.
+
+Left deliberately: the read path. Every column here is written and none is served
+— deciding what the gallery shows is the next question, and it is a much easier
+one to change your mind about than what was captured.
+
 ### v2
 
 - **ML service.** Python, CLIP semantic search, then face detection and clustering.

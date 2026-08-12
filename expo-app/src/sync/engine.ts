@@ -8,6 +8,7 @@ import {
 import { CHUNK_THRESHOLD } from './chunkPlan';
 import {
   asSyncError,
+  describable,
   emptyCounts,
   errorText,
   SyncError,
@@ -299,6 +300,12 @@ export class SyncEngine {
           state: 'done',
           assetId: result.assetId ?? null,
         });
+        // The archive already holds the bytes, which is exactly the case where
+        // nothing else would ever describe them: a library backed up before the
+        // phone knew how to say "favourite" would otherwise keep its hearts and
+        // its albums to itself forever. An item reaches `done` once, so this
+        // costs one request per asset in the life of the queue.
+        if (result.assetId) await this.describe(item, result.assetId);
         return;
       case 'want':
         await this.deps.store.update(item.localId, { ...settled, state: 'want' });
@@ -448,10 +455,34 @@ export class SyncEngine {
         nextAttemptAt: 0,
         lastError: null,
       });
+      await this.describe(item, response.id);
     } catch (e) {
       await this.blameItem(item, asSyncError(e, 'item'));
     } finally {
       await this.release(opened);
+    }
+  }
+
+  /**
+   * Tells the archive what the photo library knows about an asset it now holds.
+   *
+   * It cannot fail the item, by construction. Every caller reaches here after
+   * the bytes are archived and acked, so there is nothing left to retry and
+   * nothing to undo; a heart that did not make it across is worth one log line,
+   * not an attempt spent or an original re-sent.
+   *
+   * An asset with nothing to say is not described at all — see describable(),
+   * which owns that judgement so that adding a fact cannot silently fail to
+   * send it.
+   */
+  private async describe(item: QueueItem, assetId: string): Promise<void> {
+    try {
+      const facts = await this.deps.media.facts(item);
+      if (!facts || !describable(facts)) return;
+
+      await this.deps.transport.describe(assetId, facts);
+    } catch (e) {
+      this.log(`could not record what the library knows about ${item.filename}: ${errorText(e)}`);
     }
   }
 

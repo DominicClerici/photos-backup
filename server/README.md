@@ -351,6 +351,57 @@ file a photo under the day it was taken instead of the day it falls on in
 whatever timezone the browser happens to be in. A photo shot at 23:50 in Vermont
 belongs under that day for a viewer in Berlin too.
 
+**A video's offset comes from a different tag.** QuickTime writes `CreateDate`
+in UTC with no zone and `CreationDate` in local time with one, and reading only
+the first gives the right instant with the timezone thrown away — 4,526 of the
+real export's files, every one a video. `CreationDate` is read ahead of both UTC
+tags, which is what took the share of the library with a known local time from
+32% to 61%.
+
+## What the metadata job reads
+
+Everything in this table, off the original, on every upload and every reindex.
+The percentages are of the real 15,689-file export, and they are why each one is
+here — a tag nothing in the library carries is not worth a column.
+
+| | | |
+|---|---|---|
+| the exposure | `iso`, `f_number`, `exposure_seconds`, `focal_length`, `focal_length_35`, `flash` | 50% |
+| the rest of the fix | `gps_altitude`, `gps_direction`, `gps_accuracy`, `gps_at` | 57% / 30% |
+| the stream | `video_codec`, `frame_rate`, `bitrate`, `audio_codec`, `audio_channels` | every video |
+| faces | `faces`, as fractions of the image — geometry, not identity | 9% |
+| the file's own caption | `exif_description` | 12% |
+| colour and capture | `color_profile`, `capture_type` | 35% / 32% |
+| all of it, verbatim | `exif_metadata` | every file |
+
+`exif_metadata` is the same bargain `import_metadata` makes for a sidecar: the
+columns beside it are a choice about what deserves an index, that choice is
+wrong about something, and this is what makes being wrong cost a query rather
+than a full-archive re-read. It is not the recovery copy — the original is, and
+it outranks this.
+
+Two rules hold across the whole table. `exif_description` fills `description`
+only where nothing else has, so a caption typed into Google Photos outranks a
+camera's "Screenshot" no matter which job ran last — the same shape
+`import_gps_lat` already has. And a tag decodes leniently: files really do
+record an ISO of `75.4582213796711` and a `Software` of `12.4` where a string
+belongs, and read strictly, one odd tag fails the whole record, retries four
+more times, and marks a good photograph broken and thumbnail-less.
+
+## What only the phone knows
+
+A heart, an album, and "this is a screenshot" are decisions a person made.
+Nothing in the bytes records them, and re-reading the original recovers none of
+them, so the app posts them to the same endpoint the Takeout importer posts its
+sidecars to — `POST /v1/assets/:id/import-metadata`, with `source:
+"ios-photokit"` — after the bytes are safely archived.
+
+It is a second request rather than more upload headers for the reason the
+importer's is: an album list has no business in a header, and a failure has to
+cost the description rather than the photograph. It also runs for an asset the
+archive already held, which is the only moment a library backed up before any of
+this existed can still hand over its hearts and albums.
+
 ## Pairing a Live Photo
 
 A Live Photo is two files, and there are two independent ways to know they are
@@ -394,6 +445,11 @@ the choice does not move under a reindex.
 
 ```sh
 photobackup import --from ~/Takeout/Google\ Photos [--dry-run]
+
+# An export delivered as several zips is one export. Pass all of them.
+photobackup import \
+  --from ~/takeout-1/Takeout/Google\ Photos \
+  --from ~/takeout-2/Takeout/Google\ Photos
 ```
 
 It walks the export first and uploads second, because three decisions have to be
@@ -401,6 +457,16 @@ made over the whole tree before anything is sent: which video belongs to which
 photo, which sidecar describes which file, and which directories are albums.
 Then it uploads every still before any video, so a paired video's row finds its
 still already archived.
+
+**`--from` repeats, and a split export needs it to.** Google delivers a large
+Takeout as numbered zips and splits an item from the JSON describing it across
+them freely — `20180116_000028.mp4` in the sixth zip, its sidecar in the first.
+Imported one directory at a time, 5,979 of the real export's 11,282 sidecars
+describe a file that is not there, and everything they knew is gone the day the
+export is deleted. Passing every directory to one run drops that to zero: the
+scan groups sidecars, albums and media by where they sit *inside* the export
+rather than on disk, so a file's local id is the same whether the export was
+unzipped into one directory or six.
 
 Uploads go over HTTPS to photod rather than straight into the blob tree, even
 though the command runs on the archive machine. That way an import commits in
@@ -418,6 +484,13 @@ What it reads out of the export:
 | the file | the Apple content identifier, and everything exiftool reads |
 | `*.supplemental-metadata.json` | capture time, coordinates, caption, favourite, people, trash |
 | the directory | album membership, and the album's title from its `metadata.json` |
+
+A file with no extension is read like any other. exiftool recursing a directory
+skips those by default, and a Takeout strips the extension off every Live
+Photo's paired video — 239 of the real export's 15,689 files, every one of them
+video. Left at the default the scan never sees them, so the import never uploads
+them and the loss is invisible: no error, no unmatched sidecar, just a library
+missing its motion.
 
 The sidecars matter most for the files Google stripped: a screenshot or a saved
 image has no EXIF at all, and `photoTakenTime` is the only capture time it has.
@@ -464,7 +537,7 @@ The maintenance CLI. Reads the same environment photod does.
 photobackup verify [--deep] [--fix]     audit the archive against itself
 photobackup export --to DIR [--copy]    materialize a date tree of hardlinks
 photobackup reindex [--adopt-orphans]   rebuild the database from manifest.jsonl
-photobackup import --from DIR           ingest a Google Photos export
+photobackup import --from DIR [--from…] ingest a Google Photos export
 photobackup pair [--ttl 10m]            mint a single-use code to pair a device
 photobackup devices [--revoke ID]       list paired devices, or unpair one
 photobackup ca [--serve]                the CA to install on a device, and how

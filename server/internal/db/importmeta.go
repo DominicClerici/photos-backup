@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/dominicclerici/photos-backup/server/internal/photokit"
 	"github.com/dominicclerici/photos-backup/server/internal/takeout"
 )
 
@@ -42,6 +43,10 @@ type ImportMetadata struct {
 
 	People []string
 	Albums []AlbumRef
+	// Subtypes are what the source called this asset — "screenshot",
+	// "livePhoto", "panorama". A Takeout knows none; PhotoKit knows them all
+	// and nothing ever asked it.
+	Subtypes []string
 }
 
 // AlbumRef is an album an asset belongs to, as the source named it.
@@ -50,8 +55,17 @@ type AlbumRef struct {
 	Description string
 }
 
-// SourceGoogleTakeout is the only export format this archive can read today.
-const SourceGoogleTakeout = "google-takeout"
+// The sources whose sidecars this archive can read.
+//
+// Two of them, and they are not the same kind of thing: one is an export of a
+// service, the other is the device the photographs came off. What makes them
+// one mechanism is that both know things the file does not — a heart, an album,
+// a caption — and neither can be asked again once the export is deleted or the
+// phone is wiped.
+const (
+	SourceGoogleTakeout = "google-takeout"
+	SourcePhotoKit      = "ios-photokit"
+)
 
 // ImportMetadataFrom interprets a source's own sidecar.
 //
@@ -64,21 +78,30 @@ const SourceGoogleTakeout = "google-takeout"
 // raw JSON of a format nothing can read would look like the data had been
 // captured while holding nothing anything could show.
 func ImportMetadataFrom(source string, sidecar []byte, albums []AlbumRef) (ImportMetadata, error) {
-	if source != SourceGoogleTakeout {
-		return ImportMetadata{}, fmt.Errorf(
-			"unknown import source %q; this archive reads %q", source, SourceGoogleTakeout)
-	}
 	if len(sidecar) == 0 {
 		return ImportMetadata{}, errors.New("sidecar is required")
 	}
 
+	switch source {
+	case SourceGoogleTakeout:
+		return fromTakeout(sidecar, albums)
+	case SourcePhotoKit:
+		return fromPhotoKit(sidecar, albums)
+	default:
+		return ImportMetadata{}, fmt.Errorf(
+			"unknown import source %q; this archive reads %q and %q",
+			source, SourceGoogleTakeout, SourcePhotoKit)
+	}
+}
+
+func fromTakeout(sidecar []byte, albums []AlbumRef) (ImportMetadata, error) {
 	parsed, err := takeout.Normalize(sidecar)
 	if err != nil {
 		return ImportMetadata{}, err
 	}
 
 	return ImportMetadata{
-		Source:      source,
+		Source:      SourceGoogleTakeout,
 		Raw:         parsed.Raw,
 		Description: parsed.Description,
 		Favorite:    parsed.Favorite,
@@ -91,6 +114,40 @@ func ImportMetadataFrom(source string, sidecar []byte, albums []AlbumRef) (Impor
 		GPSLat:   parsed.GPSLat,
 		GPSLon:   parsed.GPSLon,
 		People:   parsed.People,
+		Albums:   albums,
+	}, nil
+}
+
+// fromPhotoKit reads the phone's own description of an asset it has uploaded.
+//
+// It carries no caption and no capture time: the app sends the capture time as
+// an upload header where it belongs, and iOS has nowhere to type a caption.
+// What it has that nothing else does is the heart, the albums, Apple's own
+// classification of the shot, and — since the phone learned to read PHAsset
+// directly rather than through expo-media-library — the Hidden album, the
+// burst, the source and whether the shot was ever edited. Only the first four
+// and the hiding become columns; the rest is kept whole in Raw.
+func fromPhotoKit(sidecar []byte, albums []AlbumRef) (ImportMetadata, error) {
+	parsed, err := photokit.Normalize(sidecar)
+	if err != nil {
+		return ImportMetadata{}, err
+	}
+
+	return ImportMetadata{
+		Source:   SourcePhotoKit,
+		Raw:      parsed.Raw,
+		Favorite: parsed.Favorite,
+		// The Hidden album lands on the same flag a Takeout's archived and
+		// trashed items do. Putting a photo in Hidden is a person saying "not
+		// in the roll, but keep it", which is the same kind of fact as Google's
+		// "this was out of the way" — and this archive records that kind of
+		// fact rather than acting on it, so an asset the phone hid is still
+		// archived, still in the timeline, and flagged for whoever wants to
+		// filter on it.
+		Archived: parsed.Hidden,
+		GPSLat:   parsed.GPSLat,
+		GPSLon:   parsed.GPSLon,
+		Subtypes: parsed.Subtypes,
 		Albums:   albums,
 	}, nil
 }
@@ -122,6 +179,12 @@ func (s *Store) ApplyImportMetadata(ctx context.Context, assetID string, m Impor
 			import_metadata = coalesce($6::jsonb, import_metadata),
 			import_gps_lat  = coalesce($7, import_gps_lat),
 			import_gps_lon  = coalesce($8, import_gps_lon),
+			-- Merged rather than replaced, and never emptied: a source that
+			-- names no subtypes is not asserting the photo has none.
+			subtypes = (
+				select coalesce(array_agg(distinct value order by value), '{}')
+				from unnest(subtypes || $10::text[]) as value
+			),
 			-- The canonical columns, filled only where nothing else has. The
 			-- metadata worker owns gps_lat/gps_lon and re-applies this same
 			-- fallback, so these two stay correct whichever job ran last.
@@ -134,9 +197,13 @@ func (s *Store) ApplyImportMetadata(ctx context.Context, assetID string, m Impor
 	if len(m.Raw) > 0 {
 		raw = []byte(m.Raw)
 	}
+	subtypes := m.Subtypes
+	if subtypes == nil {
+		subtypes = []string{}
+	}
 	tag, err := tx.Exec(ctx, update, assetID,
 		m.Description, m.Favorite, m.Archived, m.Source, raw,
-		m.GPSLat, m.GPSLon, m.TakenAt)
+		m.GPSLat, m.GPSLon, m.TakenAt, subtypes)
 	if err != nil {
 		return fmt.Errorf("apply import metadata to %s: %w", assetID, err)
 	}

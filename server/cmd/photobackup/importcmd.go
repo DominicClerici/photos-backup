@@ -30,6 +30,24 @@ import (
 // request per two hundred files instead of re-reading the whole export.
 const importDeviceName = "google-takeout import"
 
+// rootsFlag collects a repeated --from.
+//
+// One export, several directories: Google splits a large Takeout into numbered
+// zips and does not keep an item and its sidecar in the same one. Importing
+// them one at a time is what loses the metadata, so the flag takes them all and
+// the scan treats them as the single export they are.
+type rootsFlag []string
+
+func (r *rootsFlag) String() string { return strings.Join(*r, ", ") }
+
+func (r *rootsFlag) Set(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return errors.New("an export directory cannot be empty")
+	}
+	*r = append(*r, value)
+	return nil
+}
+
 // runImport ingests a Google Photos export.
 //
 // A Takeout is not the phone's protocol wearing a hat. Nothing in it declares
@@ -40,7 +58,8 @@ const importDeviceName = "google-takeout import"
 // all decided over the whole tree before a byte is sent.
 func runImport(ctx context.Context, args []string) (int, error) {
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
-	from := fs.String("from", "", "the export directory to import (required)")
+	var from rootsFlag
+	fs.Var(&from, "from", "an export directory to import; repeat it once per zip of a split export (required)")
 	server := fs.String("server", "", "photod base URL; empty means the local one from LISTEN_ADDR")
 	token := fs.String("token", os.Getenv("PHOTOBACKUP_TOKEN"),
 		"device token to upload with; empty means mint one for this machine")
@@ -53,20 +72,24 @@ func runImport(ctx context.Context, args []string) (int, error) {
 	if err := fs.Parse(args); err != nil {
 		return exitUsage, nil
 	}
-	if *from == "" {
+	if len(from) == 0 {
 		fmt.Fprintln(os.Stderr, "import needs --from DIR")
 		return exitUsage, nil
 	}
-	if _, err := os.Stat(*from); err != nil {
-		return fail(fmt.Errorf("--from: %w", err))
+	for _, root := range from {
+		if _, err := os.Stat(root); err != nil {
+			return fail(fmt.Errorf("--from: %w", err))
+		}
 	}
 
 	cfg := config.FromEnv()
 	exif := &exifdata.Reader{Binary: cfg.ExiftoolBin}
 
 	started := time.Now()
-	fmt.Printf("reading %s\n", *from)
-	export, err := scanExport(ctx, exif, *from, *includeTrash)
+	for _, root := range from {
+		fmt.Printf("reading %s\n", root)
+	}
+	export, err := scanExport(ctx, exif, from, *includeTrash)
 	if err != nil {
 		return fail(err)
 	}
@@ -118,12 +141,20 @@ func reportExport(export scanResult, elapsed time.Duration) {
 	if len(export.albums) > 0 {
 		fmt.Printf("  %d albums: %s\n", len(export.albums), strings.Join(truncateList(export.albums, 6), ", "))
 	}
+	if export.duplicatePaths > 0 {
+		fmt.Printf("  %d files appear at the same path in more than one directory; the first was kept\n",
+			export.duplicatePaths)
+	}
 	if export.skippedTrash > 0 {
 		fmt.Printf("  %d skipped as deleted — pass --include-trash to keep them\n", export.skippedTrash)
 	}
 	if n := len(export.unmatchedSidecars); n > 0 {
-		fmt.Printf("  %d sidecars matched no file, so their metadata is lost: %s\n",
-			n, strings.Join(truncateList(export.unmatchedSidecars, 4), ", "))
+		locators := make([]string, 0, n)
+		for _, sidecar := range export.unmatchedSidecars {
+			locators = append(locators, sidecar.locator)
+		}
+		fmt.Printf("  %d sidecars matched no file; they are kept whole for review: %s\n",
+			n, strings.Join(truncateList(locators, 4), ", "))
 	}
 }
 
@@ -213,6 +244,8 @@ func runImportUploads(ctx context.Context, client *importClient, export scanResu
 		return err
 	}
 
+	recordOrphanSidecars(ctx, client, export)
+
 	fmt.Printf("\n%d uploaded, %d sidecars applied", uploaded.Load(), described.Load())
 	if n := failed.Load(); n > 0 {
 		fmt.Printf(", %d failed", n)
@@ -234,17 +267,65 @@ func uploadOne(client *importClient, item *importItem, chunkThreshold, chunkSize
 	return client.upload(item)
 }
 
+// The kinds of orphan this importer records. They are the wire spelling of
+// db.OrphanSidecar and db.OrphanAlbum, repeated rather than imported so that
+// the client stays a client — it speaks the archive's HTTP protocol and knows
+// nothing about its schema, exactly as the phone does.
+const (
+	orphanSidecar = "sidecar"
+	orphanAlbum   = "album"
+)
+
 func describeOne(client *importClient, item *importItem) error {
 	if item.sidecar == nil && len(item.albums) == 0 {
 		return nil
 	}
 	if item.sidecar == nil {
 		// Album membership with no sidecar has nothing to travel in: the
-		// endpoint reads the source's own JSON, and there is none. Rare enough
-		// to skip rather than to invent a sidecar for.
-		return nil
+		// endpoint that applies an import reads the source's own JSON, and
+		// there is none. Inventing one would put a fabricated document in the
+		// archive's verbatim copy, which is the one thing that copy must never
+		// contain — so this is recorded as an orphan instead, with the asset it
+		// belongs to named, and left for a decision rather than guessed at.
+		return client.orphan(orphanAlbum, item.localID, item.assetID,
+			nil, item.albums,
+			"the item is in an album folder but no sidecar matched it, "+
+				"and album membership exists nowhere else in an export")
 	}
 	return client.describe(item.assetID, item)
+}
+
+// recordOrphanSidecars hands the archive every sidecar that matched no file.
+//
+// After the uploads rather than before, because an orphan is only an orphan
+// once the whole export has been read — and because it must not be able to
+// delay a single byte of the archive.
+func recordOrphanSidecars(ctx context.Context, client *importClient, export scanResult) {
+	if len(export.unmatchedSidecars) == 0 {
+		return
+	}
+
+	var kept, failed int
+	for _, sidecar := range export.unmatchedSidecars {
+		if ctx.Err() != nil {
+			break
+		}
+		err := client.orphan(orphanSidecar, sidecar.locator, "", sidecar.raw, nil,
+			"no media file in this export matched the sidecar; "+
+				"it describes a photograph that is somewhere else")
+		if err != nil {
+			failed++
+			fmt.Fprintf(os.Stderr, "  %s: orphan not recorded: %v\n", sidecar.locator, err)
+			continue
+		}
+		kept++
+	}
+
+	fmt.Printf("%d unmatched sidecars kept for review", kept)
+	if failed > 0 {
+		fmt.Printf(", %d could not be recorded", failed)
+	}
+	fmt.Println()
 }
 
 // checkAll asks the archive about every item, in batches.

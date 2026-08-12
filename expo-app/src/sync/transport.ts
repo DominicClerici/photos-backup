@@ -6,6 +6,7 @@ import {
   errorText,
   SyncError,
   toIso,
+  type AssetFacts,
   type CheckRequestItem,
   type CheckResultItem,
   type Transport,
@@ -118,6 +119,46 @@ export class HttpTransport implements Transport {
       throw new SyncError('sync/check response carried no results array', 'item');
     }
     return results as CheckResultItem[];
+  }
+
+  /**
+   * Hands the archive what the library knows about an asset it already holds.
+   *
+   * The same endpoint the Google Takeout importer posts its sidecars to, with
+   * the phone named as the source: a heart, an album and "this is a screenshot"
+   * are exactly the class of thing a sidecar carries — decisions a person made,
+   * which no amount of re-reading the original recovers.
+   */
+  async describe(assetId: string, facts: AssetFacts): Promise<void> {
+    const response = await postJson(
+      `${this.base()}/v1/assets/${encodeURIComponent(assetId)}/import-metadata`,
+      this.headers(),
+      {
+        source: 'ios-photokit',
+        // The albums travel beside the sidecar rather than inside it, which is
+        // the shape the endpoint already takes and what puts them in the
+        // manifest as their own field.
+        albums: facts.albums.map((title) => ({ title })),
+        sidecar: {
+          favorite: facts.favorite,
+          subtypes: facts.subtypes,
+          location: facts.location,
+          // Left out entirely rather than sent as false when the native module
+          // is not in this build: the sidecar is stored verbatim and read again
+          // years later, and "the phone never said" is not the same claim as
+          // "the phone said no".
+          ...(facts.photoKit ? { hidden: facts.photoKit.hidden, photoKit: facts.photoKit } : {}),
+        },
+      }
+    );
+
+    if (response.status !== 204) {
+      throw new SyncError(
+        `import-metadata returned ${response.status}: ${await safeText(response)}`,
+        blameFor(response.status),
+        response.status
+      );
+    }
   }
 
   /**

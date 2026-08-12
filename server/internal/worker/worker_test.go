@@ -60,6 +60,46 @@ func TestMetadataJobThumbnailsAPhotoAndReadsItsEXIF(t *testing.T) {
 	}
 }
 
+// The whole point of widening the tag list is that the job that runs on every
+// upload and every reindex is the thing that fills these in. Reading them in
+// exifdata and not writing them here would be the same as not reading them.
+func TestMetadataJobStoresTheExposureAndTheVerbatimTags(t *testing.T) {
+	h := newHarness(t)
+	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
+
+	h.claimAndRun(t, jobs.KindMetadata)
+
+	var (
+		iso               *int
+		fnumber, altitude *float64
+		profile           *string
+		raw               []byte
+	)
+	err := h.Store.Pool().QueryRow(context.Background(),
+		`select iso, f_number, gps_altitude, color_profile, exif_metadata
+		 from assets where id = $1::uuid`, asset.ID).
+		Scan(&iso, &fnumber, &altitude, &profile, &raw)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+
+	if iso == nil || *iso != 500 {
+		t.Errorf("iso = %v, want 500", iso)
+	}
+	if fnumber == nil || *fnumber != 2.8 {
+		t.Errorf("f_number = %v, want 2.8", fnumber)
+	}
+	if altitude == nil {
+		t.Error("gps_altitude is null for a fix that recorded one")
+	}
+	if profile == nil || *profile != "Display P3" {
+		t.Errorf("color_profile = %v, want Display P3", profile)
+	}
+	if len(raw) == 0 {
+		t.Error("exif_metadata is empty; nothing was kept verbatim")
+	}
+}
+
 // A file with no metadata at all still has to come out with a thumbnail and a
 // place on the timeline. Screenshots and messaging-app images arrive this way.
 func TestMetadataJobHandlesAFileWithNoEXIF(t *testing.T) {
