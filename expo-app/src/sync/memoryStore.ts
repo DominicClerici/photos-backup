@@ -96,6 +96,23 @@ export class MemoryQueueStore implements QueueStore {
     return reset;
   }
 
+  async reopenDone(): Promise<number> {
+    let reopened = 0;
+    for (const item of this.items.values()) {
+      if (item.state !== 'done') continue;
+      this.items.set(item.localId, {
+        ...item,
+        state: item.md5 !== null && item.size !== null ? 'hashed' : 'pending',
+        assetId: null,
+        attempts: 0,
+        nextAttemptAt: 0,
+        lastError: null,
+      });
+      reopened += 1;
+    }
+    return reopened;
+  }
+
   /** Test affordance: the full queue, for asserting on end state. */
   snapshot(): QueueItem[] {
     return [...this.items.values()].map((item) => ({ ...item }));

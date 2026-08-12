@@ -311,6 +311,19 @@ export default function App() {
     await refreshQueue(store);
   }, [store, refreshQueue]);
 
+  // Logged rather than announced in the button, because the count is the whole
+  // result: "reopened 6,000" and "reopened 0" mean very different things about
+  // where a missing photo went, and the next run overwrites the queue counts
+  // this would otherwise have to be read from.
+  const recheckArchive = useCallback(async () => {
+    if (!store) return;
+    const reopened = await store.reopenDone();
+    await refreshQueue(store);
+    setLogLines((lines) =>
+      [`reopened ${reopened} finished item(s) to re-check against the archive`, ...lines].slice(0, 20)
+    );
+  }, [store, refreshQueue]);
+
   const onChangeServer = useCallback(
     (value: string) => {
       const next = { ...config, serverUrl: value };
@@ -543,6 +556,20 @@ export default function App() {
             />
           </View>
           <Text style={styles.muted}>0 backs up the whole library.</Text>
+
+          <Pressable
+            style={[styles.button, running && styles.buttonDisabled]}
+            onPress={recheckArchive}
+            disabled={running}
+          >
+            <Text style={styles.buttonText}>Re-check the archive</Text>
+          </Pressable>
+          <Text style={styles.muted}>
+            Forgets what this phone believes it has already backed up, without touching a photo.
+            The next run asks the archive about every item again and re-sends only what is
+            genuinely missing. Use this if the archive was rebuilt, or if a photo you can see on
+            this phone never appears in the gallery.
+          </Text>
         </Section>
 
         {failed.length > 0 && (

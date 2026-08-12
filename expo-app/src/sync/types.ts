@@ -81,6 +81,21 @@ export interface QueueStore {
    * recorded, so a retry does not redo a hash it already has.
    */
   resetFailed(): Promise<number>;
+  /**
+   * Sends every finished item back to be checked against the archive again.
+   *
+   * `done` is the one state nothing else can leave: enqueue() is `insert or
+   * ignore` on the local id, so re-enumeration skips the row, and due() never
+   * selects it. That is correct while the phone's memory and the archive agree,
+   * and a trap when they stop — an archive rebuilt underneath the phone leaves
+   * rows claiming a backup that no longer exists, and the run reports "up to
+   * date" while sending nothing.
+   *
+   * This makes the server the authority again rather than trusting either side:
+   * everything the archive still holds is answered `have` and settles straight
+   * back to done, and only what is genuinely missing goes on to upload.
+   */
+  reopenDone(): Promise<number>;
 }
 
 export type CheckStatus = 'have' | 'unknown' | 'want';

@@ -444,3 +444,79 @@ test('a paired video declares which still it belongs to', async () => {
   expect(byLocalId.get('still#live')?.liveParentLocalId).toBe('still');
   expect(byLocalId.get('still')?.liveParentLocalId).toBeFalsy();
 });
+
+// The trap this exists to escape. `done` is the one state re-enumeration cannot
+// reach — enqueue() ignores the row and due() never selects it — so an archive
+// rebuilt underneath the phone leaves items claiming a backup that is gone, and
+// the run says "up to date" while sending nothing.
+test('an ordinary run cannot re-send an item already marked done', async () => {
+  const h = build({
+    transport: new FakeTransport(twoRound('want')),
+    media: new FakeMedia([asset('a')]),
+    seed: [queued('a', { state: 'done', assetId: 'asset-that-no-longer-exists' })],
+  });
+
+  await h.engine.run();
+
+  expect(h.transport.uploads).toHaveLength(0);
+  expect(h.transport.checkCalls).toHaveLength(0);
+  expect(h.logs.some((line) => line.includes('0 new to the queue'))).toBe(true);
+});
+
+test('reopening finished items re-sends the ones the archive no longer holds', async () => {
+  const h = build({
+    transport: new FakeTransport(twoRound('want')),
+    media: new FakeMedia([asset('a')]),
+    seed: [queued('a', { state: 'done', assetId: 'asset-that-no-longer-exists' })],
+  });
+
+  expect(await h.store.reopenDone()).toBe(1);
+  await h.engine.run();
+
+  expect(h.transport.uploads.map((upload) => upload.localId)).toEqual(['a']);
+  expect(statesOf(h.store)).toEqual({ a: 'done' });
+});
+
+// The whole point of asking again rather than re-uploading: a library the
+// archive still holds settles in round one, so recovering from a stale queue
+// costs one request per two hundred items and not a byte on the wire.
+test('reopened items the archive still holds settle without hashing or uploading', async () => {
+  const h = build({
+    transport: new FakeTransport(alwaysRespond('have')),
+    media: new FakeMedia([asset('a'), asset('b')]),
+    seed: [queued('a', { state: 'done' }), queued('b', { state: 'done' })],
+  });
+
+  await h.store.reopenDone();
+  await h.engine.run();
+
+  expect(h.engine.counts.done).toBe(2);
+  expect(h.transport.uploads).toHaveLength(0);
+  expect(h.media.hashOpens()).toHaveLength(0);
+});
+
+test('reopening keeps a digest already paid for and drops the stale asset id', async () => {
+  const store = new MemoryQueueStore([
+    queued('hashed-already', { state: 'done', md5: 'deadbeef', size: 4242, assetId: 'stale' }),
+    queued('never-hashed', { state: 'done', assetId: 'stale' }),
+  ]);
+
+  expect(await store.reopenDone()).toBe(2);
+
+  expect(store.get('hashed-already')?.state).toBe('hashed');
+  expect(store.get('hashed-already')?.md5).toBe('deadbeef');
+  expect(store.get('never-hashed')?.state).toBe('pending');
+  for (const item of store.snapshot()) expect(item.assetId).toBeNull();
+});
+
+test('reopening leaves failed items alone for retryFailed to own', async () => {
+  const store = new MemoryQueueStore([
+    queued('done', { state: 'done' }),
+    queued('failed', { state: 'failed', lastError: 'a reason worth keeping' }),
+  ]);
+
+  expect(await store.reopenDone()).toBe(1);
+
+  expect(store.get('failed')?.state).toBe('failed');
+  expect(store.get('failed')?.lastError).toBe('a reason worth keeping');
+});

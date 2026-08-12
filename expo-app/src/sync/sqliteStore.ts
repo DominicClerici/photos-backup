@@ -143,6 +143,28 @@ export class SqliteQueueStore implements QueueStore {
     );
     return result.changes;
   }
+
+  async reopenDone(): Promise<number> {
+    // Same landing state as resetFailed, for the same reason: a surviving digest
+    // is the expensive half of the work and re-checking does not invalidate it.
+    //
+    // asset_id is cleared, though. It names a row on the server, and reopening
+    // these items is precisely the act of deciding that claim can no longer be
+    // trusted; the next check writes whatever the archive actually answers.
+    const result = await this.db.runAsync(
+      `update items
+          set state = case
+                        when md5 is not null and size is not null then 'hashed'
+                        else 'pending'
+                      end,
+              asset_id = null,
+              attempts = 0,
+              next_attempt_at = 0,
+              last_error = null
+        where state = 'done'`
+    );
+    return result.changes;
+  }
 }
 
 /** Opens the queue database, creating the schema on first run. */

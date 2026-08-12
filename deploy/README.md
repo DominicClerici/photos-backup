@@ -270,9 +270,17 @@ only for a scripted rebuild.
 
 > **The phone will not re-upload on its own.** The app keeps its own queue in
 > `photobackup-queue.db` and marks finished items `done` permanently, so after a
-> server-side reset it reports a complete backup and sends nothing. Until the
-> server is the authority on what has been backed up, clearing that queue on the
-> phone is a separate step.
+> server-side reset it reports a complete backup and sends nothing. Re-checking
+> is a step on the phone: **Backup › Re-check the archive**, which sends every
+> finished item back to be asked about again. Everything the archive still holds
+> answers `have` in round one and costs nothing; only what the reset actually
+> took is re-sent.
+>
+> Worth knowing even when no reset was run. `done` is the only state
+> re-enumeration cannot reach — `enqueue` is `insert or ignore` on the local id
+> and `due` never selects a finished row — so any item that reaches it while its
+> bytes are not in the archive is invisible to every later run, and the phone
+> reports "up to date" with photos missing.
 
 ## What is still open
 
