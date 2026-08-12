@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -170,12 +171,33 @@ func (s *Store) ApplyImportMetadata(ctx context.Context, assetID string, m Impor
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// The stored sidecar is read and locked before anything is written, because
+	// merging it with the incoming one is the one part of this that a single
+	// statement cannot express — see mergeSidecars. The lock is what makes two
+	// importers describing the same asset at once serialize rather than one
+	// reading a sidecar the other is about to replace.
+	var stored []byte
+	err = tx.QueryRow(ctx,
+		`select import_metadata from assets where id = $1::uuid for update`, assetID).Scan(&stored)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("read the stored sidecar of %s: %w", assetID, err)
+	}
+	sidecar, err := mergeSidecars(stored, m.Raw)
+	if err != nil {
+		return fmt.Errorf("merge sidecar into %s: %w", assetID, err)
+	}
+
 	const update = `
 		update assets set
 			description     = coalesce(nullif($2, ''), description),
 			favorite        = favorite or $3,
 			archived        = archived or $4,
 			import_source   = coalesce(nullif($5, ''), import_source),
+			-- Already merged with what was stored, key by key, under the row
+			-- lock taken above: see mergeSidecars.
 			import_metadata = coalesce($6::jsonb, import_metadata),
 			import_gps_lat  = coalesce($7, import_gps_lat),
 			import_gps_lon  = coalesce($8, import_gps_lon),
@@ -194,8 +216,8 @@ func (s *Store) ApplyImportMetadata(ctx context.Context, assetID string, m Impor
 		where id = $1::uuid`
 
 	var raw any
-	if len(m.Raw) > 0 {
-		raw = []byte(m.Raw)
+	if len(sidecar) > 0 {
+		raw = []byte(sidecar)
 	}
 	subtypes := m.Subtypes
 	if subtypes == nil {
@@ -222,6 +244,108 @@ func (s *Store) ApplyImportMetadata(ctx context.Context, assetID string, m Impor
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 	return nil
+}
+
+// mergeSidecars folds an incoming sidecar into the one already stored, key by
+// key, and returns what the asset should now hold.
+//
+// The column used to be assigned rather than merged, and the iPhone import
+// found what that costs: an asset already described by a Takeout — its caption,
+// its people, its Google Photos URL, the coordinates a person corrected by hand
+// — kept none of it once the phone described the same photo with the handful of
+// things PhotoKit knows. The export was deleted the week after it was imported,
+// so nothing on disk could have been read again to recover it. (Nothing was, in
+// fact, lost: the manifest holds every sidecar verbatim and a reindex replays
+// them. That is a rebuild of the archive, not a repair of one column, and it is
+// not what should stand between two sources describing one photo.)
+//
+// So: every key either source supplied survives, and where both supplied one
+// the newer wins — unless it says nothing, which is the same rule the modelled
+// columns above already follow. A sidecar that does not mention a caption is
+// not asserting that there is no caption, and neither is one that mentions an
+// empty one. Objects are merged the same way the whole sidecar is, so a source
+// that fills in half of a nested object does not take the other half with it.
+//
+// Both directions matter, because the order the two arrive in is not something
+// anyone controls: a phone can describe a photo the Takeout has not reached
+// yet, and a Takeout can describe one the phone described months ago.
+func mergeSidecars(stored, incoming json.RawMessage) (json.RawMessage, error) {
+	if len(incoming) == 0 {
+		return stored, nil
+	}
+	// Every source is parsed before it reaches the store, so this is a bug
+	// rather than a bad export — and it is worth saying so here rather than
+	// letting Postgres refuse the cast three lines later.
+	if !json.Valid(incoming) {
+		return nil, errors.New("sidecar is not valid JSON")
+	}
+	if len(stored) == 0 {
+		return incoming, nil
+	}
+	return mergeJSON(stored, incoming)
+}
+
+func mergeJSON(stored, incoming json.RawMessage) (json.RawMessage, error) {
+	if saysNothing(incoming) {
+		return stored, nil
+	}
+	into, ok := object(stored)
+	if !ok {
+		return incoming, nil
+	}
+	from, ok := object(incoming)
+	if !ok {
+		return incoming, nil
+	}
+
+	for key, value := range from {
+		existing, held := into[key]
+		if !held {
+			// Recorded exactly as it arrived, nulls and all: a key nothing has
+			// claimed yet is the source's own account of this photo, and "the
+			// phone answered null" is a different fact from "the phone was
+			// never asked".
+			into[key] = value
+			continue
+		}
+		merged, err := mergeJSON(existing, value)
+		if err != nil {
+			return nil, err
+		}
+		into[key] = merged
+	}
+	return json.Marshal(into)
+}
+
+// object reports whether a value is a JSON object, and decodes it if so.
+// Members are kept as raw JSON so that anything the merge does not touch is
+// stored byte for byte as its source wrote it.
+func object(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &out); err != nil || out == nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// saysNothing reports whether a value carries no claim, and so must not
+// displace one already recorded: JSON null, the empty string, and the empty
+// list. It is the nullif the statement above applies to every text column,
+// expressed in JSON.
+func saysNothing(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return true
+	}
+	if len(trimmed) < 2 {
+		return false
+	}
+	// An empty string, list or object, however its source spaced it out.
+	first, last := trimmed[0], trimmed[len(trimmed)-1]
+	if (first == '"' && last == '"') || (first == '[' && last == ']') || (first == '{' && last == '}') {
+		return len(bytes.TrimSpace(trimmed[1:len(trimmed)-1])) == 0
+	}
+	return false
 }
 
 func applyPeople(ctx context.Context, tx pgx.Tx, assetID string, names []string) error {

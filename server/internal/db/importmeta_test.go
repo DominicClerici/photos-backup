@@ -2,6 +2,8 @@ package db
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -289,6 +291,185 @@ func TestAHiddenPhotoIsRecordedAsArchived(t *testing.T) {
 	if len(page.Items) != 1 {
 		t.Error("a hidden photo vanished from the timeline; the flag is recorded, not acted on")
 	}
+}
+
+// The bug the iPhone import exposed. A photo the Takeout had already described
+// was described again by the phone that took it, and the phone's four fields
+// replaced the export's whole sidecar — the caption, the people, the corrected
+// coordinates, the Google Photos URL, all of it, for an export that had been
+// deleted the week the import finished.
+func TestASecondSourceDoesNotReplaceTheFirstsSidecar(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	id, _, err := s.RecordAsset(ctx, sampleAsset())
+	if err != nil {
+		t.Fatalf("RecordAsset: %v", err)
+	}
+	applySidecar(t, s, id, heicSidecar)
+	applyPhotoKitSidecar(t, s, id, `{
+		"favorite": true,
+		"subtypes": ["livePhoto"],
+		"location": null,
+		"photoKit": { "burstIdentifier": "9F0C", "hasAdjustments": true }
+	}`)
+
+	sidecar := storedSidecar(t, s, id)
+	if sidecar["description"] != "at the border" {
+		t.Errorf("description = %v, want the Takeout's caption to survive the phone", sidecar["description"])
+	}
+	if sidecar["people"] == nil {
+		t.Error("the people Google tagged were dropped by a sidecar that names none")
+	}
+	if geo, _ := sidecar["geoData"].(map[string]any); geo == nil || geo["latitude"] != 41.7844 {
+		t.Errorf("geoData = %v, want the Takeout's coordinates", sidecar["geoData"])
+	}
+	// And the phone's own fields are there beside them, including the ones it
+	// answered null for: "the phone said no" is not "the phone was never asked".
+	if sidecar["subtypes"] == nil || sidecar["photoKit"] == nil {
+		t.Errorf("the phone's fields are missing: %v", sidecar)
+	}
+	if _, held := sidecar["location"]; !held {
+		t.Error("the phone's explicit null location was dropped")
+	}
+}
+
+// The same in the other order, which is the one nobody controls: the phone
+// describes a photo, and the Takeout holding the same photo is imported later.
+func TestATakeoutDoesNotReplaceThePhonesSidecar(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	id, _, err := s.RecordAsset(ctx, sampleAsset())
+	if err != nil {
+		t.Fatalf("RecordAsset: %v", err)
+	}
+	applyPhotoKitSidecar(t, s, id, `{"favorite": true, "subtypes": ["screenshot"]}`)
+	applySidecar(t, s, id, heicSidecar)
+
+	sidecar := storedSidecar(t, s, id)
+	if sidecar["subtypes"] == nil {
+		t.Error("the phone's subtypes were dropped by the Takeout")
+	}
+	if sidecar["title"] != "IMG_5874.HEIC" {
+		t.Errorf("title = %v, want the Takeout's", sidecar["title"])
+	}
+}
+
+// A re-import of a corrected sidecar is the case the merge has to get right in
+// the other direction: where the newer one has something to say, it wins.
+func TestALaterSidecarWinsKeyByKey(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	id, _, err := s.RecordAsset(ctx, sampleAsset())
+	if err != nil {
+		t.Fatalf("RecordAsset: %v", err)
+	}
+	applySidecar(t, s, id, heicSidecar)
+	applySidecar(t, s, id, `{
+		"description": "at the Icelandic border",
+		"geoData": { "latitude": 64.1466 },
+		"url": ""
+	}`)
+
+	sidecar := storedSidecar(t, s, id)
+	if sidecar["description"] != "at the Icelandic border" {
+		t.Errorf("description = %v, want the correction", sidecar["description"])
+	}
+	geo, _ := sidecar["geoData"].(map[string]any)
+	if geo == nil || geo["latitude"] != 64.1466 {
+		t.Errorf("geoData.latitude = %v, want the correction", geo["latitude"])
+	}
+	// Half an object is corrected without taking the other half with it.
+	if geo["longitude"] != -122.5848 {
+		t.Errorf("geoData.longitude = %v, want the untouched half of the object", geo["longitude"])
+	}
+	if _, held := sidecar["title"]; !held {
+		t.Error("a key the correction did not mention was dropped")
+	}
+}
+
+func TestMergeSidecars(t *testing.T) {
+	cases := []struct {
+		name             string
+		stored, incoming string
+		want             string
+	}{
+		{"nothing stored yet", "", `{"a":1}`, `{"a":1}`},
+		{"nothing incoming", `{"a":1}`, "", `{"a":1}`},
+		{"disjoint keys", `{"a":1}`, `{"b":2}`, `{"a":1,"b":2}`},
+		{"newer wins", `{"a":1}`, `{"a":2}`, `{"a":2}`},
+		{"null does not erase", `{"a":1}`, `{"a":null}`, `{"a":1}`},
+		{"an empty string does not erase", `{"a":"x"}`, `{"a":""}`, `{"a":"x"}`},
+		{"an empty list does not erase", `{"a":[1]}`, `{"a":[ ]}`, `{"a":[1]}`},
+		{"a null for an unclaimed key is kept", `{"a":1}`, `{"b":null}`, `{"a":1,"b":null}`},
+		{"objects merge", `{"a":{"x":1,"y":2}}`, `{"a":{"y":3,"z":4}}`, `{"a":{"x":1,"y":3,"z":4}}`},
+		{"a list replaces a list", `{"a":[1,2]}`, `{"a":[3]}`, `{"a":[3]}`},
+		{"a scalar replaces an object", `{"a":{"x":1}}`, `{"a":7}`, `{"a":7}`},
+		// Nothing in the archive writes a bare list or scalar as a sidecar, but
+		// the merge is not the place to find that out.
+		{"a list at the top level", `[1]`, `[2]`, `[2]`},
+		{"a scalar under an object", `{"a":1}`, `3`, `3`},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := mergeSidecars(json.RawMessage(c.stored), json.RawMessage(c.incoming))
+			if err != nil {
+				t.Fatalf("mergeSidecars: %v", err)
+			}
+			if !equalJSON(t, got, json.RawMessage(c.want)) {
+				t.Errorf("merge = %s, want %s", got, c.want)
+			}
+		})
+	}
+}
+
+// A sidecar that is not JSON at all never reaches the store — every source is
+// parsed before it gets here — so the merge reports rather than guesses.
+func TestMergeSidecarsRefusesWhatItCannotRead(t *testing.T) {
+	if _, err := mergeSidecars(json.RawMessage(`{"a":1}`), json.RawMessage(`{`)); err == nil {
+		t.Error("a malformed sidecar was merged")
+	}
+}
+
+func applyPhotoKitSidecar(t *testing.T, s *Store, assetID, sidecar string) {
+	t.Helper()
+	meta, err := ImportMetadataFrom(SourcePhotoKit, []byte(sidecar), nil)
+	if err != nil {
+		t.Fatalf("ImportMetadataFrom: %v", err)
+	}
+	if err := s.ApplyImportMetadata(context.Background(), assetID, meta); err != nil {
+		t.Fatalf("ApplyImportMetadata: %v", err)
+	}
+}
+
+func storedSidecar(t *testing.T, s *Store, assetID string) map[string]any {
+	t.Helper()
+	var raw []byte
+	err := s.pool.QueryRow(context.Background(),
+		`select import_metadata from assets where id = $1::uuid`, assetID).Scan(&raw)
+	if err != nil {
+		t.Fatalf("read import_metadata: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode import_metadata: %v", err)
+	}
+	return out
+}
+
+func equalJSON(t *testing.T, a, b json.RawMessage) bool {
+	t.Helper()
+	var x, y any
+	if err := json.Unmarshal(a, &x); err != nil {
+		t.Fatalf("decode %s: %v", a, err)
+	}
+	if err := json.Unmarshal(b, &y); err != nil {
+		t.Fatalf("decode %s: %v", b, err)
+	}
+	return reflect.DeepEqual(x, y)
 }
 
 func TestAnUnknownImportSourceIsRefused(t *testing.T) {
