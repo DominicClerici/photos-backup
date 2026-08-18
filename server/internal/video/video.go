@@ -290,21 +290,60 @@ func orNone(s string) string {
 }
 
 // Transcode writes an H.264/AAC MP4 that any browser can play.
-func (t *Tool) Transcode(ctx context.Context, src, dst string, info Info) error {
+//
+// overlay, when set, names an image to burn into every frame: a Snapchat
+// memory's caption layer, which arrives as its own file and has to be drawn
+// somewhere. A still can be composed at the moment it is served, because
+// ImageMagick is already in the request path. A video cannot — no browser will
+// composite a transparent PNG onto a playing <video> — so for these the layer
+// goes into the pixels. The original is untouched in the blob store either way,
+// and the worker writes a second rendition without this one so the viewer can
+// still be shown the photograph underneath.
+func (t *Tool) Transcode(ctx context.Context, src, dst string, info Info, overlay string) error {
 	args := []string{"-nostdin", "-y", "-v", "error"}
 	args = append(args, t.decodeArgs()...)
-	args = append(args, "-i", src, "-map_metadata", "0")
+	args = append(args, "-i", src)
+	if overlay != "" {
+		// Read once, not looped. The filter holds the single frame for the
+		// length of the clip on its own — see overlayGraph, where that is now
+		// said out loud rather than left to a default.
+		//
+		// `-loop 1` is the obvious way to write this and it is a trap. It makes
+		// the layer an input with no end, and ffmpeg then bounds the encode only
+		// by whatever *other* finite output stream it has: on a clip with an
+		// audio track it stops at the right moment, and on a silent one it never
+		// stops at all. Measured, not feared — a 7.6-second silent memory ran
+		// for thirteen minutes, held sixteen cores, and wrote 300MB of a video
+		// that would have filled the disk. `-shortest` does not save it, which
+		// is the part worth remembering.
+		args = append(args, "-i", overlay)
+	}
+	args = append(args, "-map_metadata", "0")
 
 	// Only scale when there is something to scale down. ffmpeg's scaler has no
 	// "shrink only" mode, so the decision is made here from the probed size
 	// rather than expressed in the filter.
-	if w, h := info.DisplaySize(); w > PlaybackMaxEdge || h > PlaybackMaxEdge {
+	switch w, h := info.DisplaySize(); {
+	case overlay != "":
+		out, err := overlayGraph(info)
+		if err != nil {
+			return fmt.Errorf("transcode %s: %w", src, err)
+		}
+		args = append(args,
+			"-filter_complex", out,
+			"-map", "[v]",
+			// Explicit, and optional, because -filter_complex turns ffmpeg's
+			// automatic stream selection off: without it a memory with sound
+			// comes out silent and nothing says so. The `?` is what lets a
+			// silent one through, and half of these are silent.
+			"-map", "0:a?")
+	case w > PlaybackMaxEdge || h > PlaybackMaxEdge:
 		args = append(args, "-vf", fmt.Sprintf(
 			"scale=w=%d:h=%d:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos",
 			PlaybackMaxEdge, PlaybackMaxEdge))
 	}
 
-	args = append(args, t.videoArgs(t.crf(), speedBalanced)...)
+	args = append(args, t.videoArgs(t.encoderFor(outputMinEdge(info, PlaybackMaxEdge)), t.crf(), speedBalanced)...)
 	args = append(args,
 		// Baseline chroma layout. Phone video is often 10-bit HDR, which most
 		// browsers refuse outright.
@@ -337,6 +376,44 @@ func (t *Tool) Transcode(ctx context.Context, src, dst string, info Info) error 
 		return fmt.Errorf("transcode %s: %w: %s", src, runErr, complaint)
 	}
 	return nil
+}
+
+// overlayGraph is the filter that composes a memory: both inputs scaled to the
+// frame the encoder will write, then one laid over the other at the origin.
+//
+// Both are scaled explicitly to the same numbers rather than one being fitted to
+// the other, because the two files are the same moment recorded at different
+// resolutions — Snapchat's layer is the phone's screen and the video is what the
+// camera captured to fill it, and across this archive they never once agree. The
+// aspect ratios do agree, to within a rounding error, so stretching the layer to
+// the frame lands the caption where the person put it.
+//
+// eof_action=repeat is what makes one still cover a clip of any length: the
+// layer's single frame is held for every frame of the video after it. It is
+// ffmpeg's default and it is written out anyway, because the alternative way to
+// get this — looping the input — turns the layer into a stream with no end and
+// hangs the encode outright on a video with no audio track. See Transcode.
+//
+// A video whose size ffprobe could not report is refused rather than guessed at.
+// The alternative is a burn at the wrong scale, which is a rendition that looks
+// deliberate and is wrong in a way nothing downstream can detect.
+func overlayGraph(info Info) (string, error) {
+	w, h := info.DisplaySize()
+	if w <= 0 || h <= 0 {
+		return "", errors.New("cannot burn in an overlay without the video's dimensions")
+	}
+	if long := max(w, h); long > PlaybackMaxEdge {
+		w = w * PlaybackMaxEdge / long
+		h = h * PlaybackMaxEdge / long
+	}
+	// yuv420p halves both chroma planes, so an odd edge has no representation.
+	w, h = max(w&^1, 2), max(h&^1, 2)
+
+	return fmt.Sprintf(
+		"[0:v]scale=w=%d:h=%d:flags=lanczos[base];"+
+			"[1:v]scale=w=%d:h=%d:flags=lanczos[layer];"+
+			"[base][layer]overlay=0:0:eof_action=repeat:format=auto[v]",
+		w, h, w, h), nil
 }
 
 // LiveThumbs writes a Live Photo's motion thumbnail at every size asked for:
@@ -397,7 +474,11 @@ func (t *Tool) LiveThumbs(ctx context.Context, src string, targets []LiveThumbTa
 		// Looser than the playback rendition. At thumbnail size the difference
 		// is invisible and the file is a third of the size, which is what a
 		// grid firing these off on hover needs it to be.
-		args = append(args, t.videoArgs(LiveThumbCRF, speedFast)...)
+		//
+		// Per output, because the smallest sizes are below what a hardware
+		// encoder will take and one refusal fails the whole run — the outputs
+		// share an ffmpeg, so they cannot share a fate. See nvencMinDimension.
+		args = append(args, t.videoArgs(t.encoderFor(target.Size), LiveThumbCRF, speedFast)...)
 		args = append(args,
 			"-pix_fmt", "yuv420p",
 			"-movflags", "+faststart",
@@ -436,7 +517,7 @@ func (t *Tool) LivePreview(ctx context.Context, src, dst string, info Info) erro
 	// one. This is being waited on by somebody who has already opened the
 	// photo, and it is three seconds long: latency is worth more here than
 	// bitrate.
-	args = append(args, t.videoArgs(t.crf(), speedFast)...)
+	args = append(args, t.videoArgs(t.encoderFor(outputMinEdge(info, PlaybackMaxEdge)), t.crf(), speedFast)...)
 	args = append(args,
 		"-pix_fmt", "yuv420p",
 		"-c:a", "aac",
@@ -591,9 +672,60 @@ const (
 // encoded here, not a law — anything moved far from them wants re-measuring.
 const nvencCQOffset = 6
 
-func (t *Tool) isNVENC() bool { return strings.Contains(t.encoder(), "nvenc") }
+// nvencMinDimension is the smallest edge NVENC's H.264 encoder will accept.
+// Below it InitializeEncoder refuses the whole session — "Frame Dimension less
+// than the minimum supported value" — and nothing is written.
+//
+// It is here because that refusal cost this archive its Live Photos. LiveThumbs
+// writes every stored size from a single ffmpeg, so the 96px motion thumbnail
+// took the 256 and the 512 down with it: setting VIDEO_ENCODER=h264_nvenc
+// marked every paired video in the library live_state = 'failed', and a still
+// whose motion failed draws as an ordinary photo. The stills still deduped, so
+// the only symptom was that nothing anywhere came to life.
+//
+// 145 is measured on this machine's card rather than read from a spec: 144
+// square is refused and 145 square encodes.
+const nvencMinDimension = 145
 
-// videoArgs returns the encoder, its rate control and its preset.
+// softwareEncoder stands in for the configured one on frames it cannot take.
+// libx264 has no such floor, and the outputs that need it are by definition
+// tiny — a three-second 96px square is cheaper in software than the fallback
+// logic that avoids it.
+const softwareEncoder = "libx264"
+
+func isNVENC(encoder string) bool { return strings.Contains(encoder, "nvenc") }
+
+// encoderFor picks the encoder for an output whose shortest edge is minEdge,
+// which is the configured one except where hardware cannot encode a frame that
+// small. minEdge of 0 means the size is not known — the configured encoder
+// stands, because a guess in either direction is worse than the failure it
+// would be guessing about.
+func (t *Tool) encoderFor(minEdge int) string {
+	if enc := t.encoder(); !isNVENC(enc) || minEdge <= 0 || minEdge >= nvencMinDimension {
+		return enc
+	}
+	return softwareEncoder
+}
+
+// outputMinEdge is the shorter edge of what the scaler will actually write,
+// which is what decides whether the hardware encoder can take it. The scale
+// filter only ever shrinks, so an input already inside the box passes through
+// at its own size.
+func outputMinEdge(info Info, maxEdge int) int {
+	w, h := info.DisplaySize()
+	if w <= 0 || h <= 0 {
+		return 0
+	}
+	if long := max(w, h); long > maxEdge {
+		w = w * maxEdge / long
+		h = h * maxEdge / long
+	}
+	return min(w, h)
+}
+
+// videoArgs returns the encoder, its rate control and its preset. The encoder
+// is passed in rather than read off the Tool because it is not the same for
+// every output: see encoderFor.
 //
 // These cannot be written once and shared, which is the whole reason this
 // function exists. x264 reads -crf and named presets; NVENC reads -cq and pN
@@ -603,13 +735,13 @@ func (t *Tool) isNVENC() bool { return strings.Contains(t.encoder(), "nvenc") }
 // sample clip that measured VMAF 76.0 against 91.6 for the libx264 it
 // replaced, at a third of the bitrate. Nothing fails; the archive just fills
 // up with worse video than it was asked for.
-func (t *Tool) videoArgs(crf int, s speed) []string {
-	if !t.isNVENC() {
+func (t *Tool) videoArgs(encoder string, crf int, s speed) []string {
+	if !isNVENC(encoder) {
 		preset := "medium"
 		if s == speedFast {
 			preset = "veryfast"
 		}
-		return []string{"-c:v", t.encoder(), "-crf", strconv.Itoa(crf), "-preset", preset}
+		return []string{"-c:v", encoder, "-crf", strconv.Itoa(crf), "-preset", preset}
 	}
 
 	// p4 rather than p5/p6: on a saturated queue NVENC is the bottleneck, and
@@ -623,7 +755,7 @@ func (t *Tool) videoArgs(crf int, s speed) []string {
 	// -b:v 0 is what makes -cq a pure quality target; without it NVENC treats
 	// the flags as a bitrate cap and the quality number stops meaning much.
 	return []string{
-		"-c:v", t.encoder(),
+		"-c:v", encoder,
 		"-preset", preset,
 		"-tune", "hq",
 		"-rc", "vbr",
@@ -647,7 +779,7 @@ func (t *Tool) videoArgs(crf int, s speed) []string {
 // landscape with nothing left to tell a player otherwise. Verified, not
 // feared.
 func (t *Tool) decodeArgs() []string {
-	if !t.isNVENC() {
+	if !isNVENC(t.encoder()) {
 		return nil
 	}
 	return []string{"-hwaccel", "cuda"}

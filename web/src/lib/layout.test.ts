@@ -6,10 +6,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  buildDays,
+  countOf,
   dayAt,
   dayIndexOf,
   dayKeyOf,
+  daysFrom,
   frameAt,
   headerY,
   itemAtPoint,
@@ -27,27 +28,20 @@ import {
   type Day,
   type LevelLayout,
 } from "./layout.ts";
-import type { TimelineItem } from "./api.ts";
+import type { DayRun } from "./api.ts";
 
-function item(takenAt: string, offsetMinutes?: number): TimelineItem {
-  return {
-    id: `${takenAt}:${offsetMinutes ?? "local"}`,
-    kind: "image",
-    taken_at: takenAt,
-    offset_minutes: offsetMinutes,
-    state: "ready",
-  };
-}
-
-/** A run of `n` items all on the same day, newest first. */
-function sameDay(n: number): TimelineItem[] {
-  return Array.from({ length: n }, (_, i) =>
-    item(`2026-08-05T${String(23 - (i % 24)).padStart(2, "0")}:${pad(i)}:00Z`),
-  ).map((it, i) => ({ ...it, id: `i${i}` }));
+/**
+ * The day model a server table of these run lengths produces, newest first.
+ * Dates count backwards from August 5th, and are only ever labels here.
+ */
+function model(...counts: number[]): Day[] {
+  return daysFrom(
+    counts.map((count, i): DayRun => ({ day: `2026-08-${pad(5 - i)}`, count })),
+  );
 }
 
 function pad(n: number): string {
-  return String(n % 60).padStart(2, "0");
+  return String(n).padStart(2, "0");
 }
 
 /** The stack of level layouts a live grid would build for one container width. */
@@ -136,14 +130,11 @@ test("a file with no recorded zone falls back to the viewer's day", () => {
   assert.equal(dayKeyOf("2026-08-05T03:50:00Z", null), "2026-08-05");
 });
 
-test("buildDays groups consecutive days and indexes them into the flat list", () => {
-  const items = [
-    item("2026-08-05T12:00:00Z"),
-    item("2026-08-05T11:00:00Z"),
-    item("2026-08-05T10:00:00Z"),
-    item("2026-08-04T12:00:00Z"),
-  ];
-  const days = buildDays(items);
+test("daysFrom turns run lengths into positions in the flat list", () => {
+  const days = daysFrom([
+    { day: "2026-08-05", count: 3 },
+    { day: "2026-08-04", count: 1 },
+  ]);
 
   assert.deepEqual(
     days.map((d) => [d.key, d.start, d.count]),
@@ -154,52 +145,40 @@ test("buildDays groups consecutive days and indexes them into the flat list", ()
   );
 });
 
-test("buildDays splits a day boundary using each file's own offset", () => {
-  // Same instant-ordering, but the offsets put them on different local days.
-  const items = [item("2026-08-05T03:50:00Z", -240), item("2026-08-05T02:00:00Z", 0)];
-  assert.deepEqual(
-    buildDays(items).map((d) => d.key),
-    ["2026-08-04", "2026-08-05"],
-  );
-});
-
 // The ids are React keys for the headings, and a date on both sides of a
-// timezone hop is a date that appears twice.
-test("buildDays gives every run its own id, even when a date recurs", () => {
-  const items = [
-    item("2026-08-05T02:00:00Z", 0),
-    // 21:00 the previous evening in Vermont, taken between the two UTC photos.
-    item("2026-08-05T01:00:00Z", -240),
-    item("2026-08-05T00:30:00Z", 0),
-  ];
-  const days = buildDays(items);
+// timezone hop is a date the server sends twice — as two runs, because that is
+// the shape the timeline has.
+test("daysFrom gives every run its own id, even when a date recurs", () => {
+  const days = daysFrom([
+    { day: "2026-08-05", count: 1 },
+    { day: "2026-08-04", count: 1 },
+    { day: "2026-08-05", count: 1 },
+  ]);
 
   assert.deepEqual(
-    days.map((d) => d.key),
-    ["2026-08-05", "2026-08-04", "2026-08-05"],
+    days.map((d) => [d.key, d.start]),
+    [
+      ["2026-08-05", 0],
+      ["2026-08-04", 1],
+      ["2026-08-05", 2],
+    ],
   );
   assert.equal(new Set(days.map((d) => d.id)).size, days.length);
 });
 
-test("buildDays ids stay put as later pages append", () => {
-  const first = buildDays(sameDay(4));
-  const grown = buildDays([...sameDay(4), item("2026-08-04T12:00:00Z")]);
-
-  assert.deepEqual(
-    grown.slice(0, first.length).map((d) => d.id),
-    first.map((d) => d.id),
-  );
+// The whole grid is laid out from this, so a mismatch with what the server said
+// the total was is a mismatch between the scrollbar and the archive.
+test("countOf agrees with the run lengths it was built from", () => {
+  assert.equal(countOf(model(3, 1, 7)), 11);
+  assert.equal(countOf(model()), 0);
 });
 
-test("buildDays handles an empty timeline", () => {
-  assert.deepEqual(buildDays([]), []);
+test("daysFrom handles an empty collection", () => {
+  assert.deepEqual(daysFrom([]), []);
 });
 
 test("layoutLevel stacks days without gaps and reports an exact height", () => {
-  const days = buildDays([
-    ...sameDay(4),
-    { ...item("2026-08-04T12:00:00Z"), id: "prev" },
-  ]);
+  const days = model(4, 1);
   const metrics = { columns: 3, cellSize: 100, gap: 0, headerHeight: 50 };
   const { tops } = layoutLevel(days, metrics);
 
@@ -208,7 +187,7 @@ test("layoutLevel stacks days without gaps and reports an exact height", () => {
 });
 
 test("dayIndexOf finds the day holding any item", () => {
-  const days = buildDays([...sameDay(5), { ...item("2026-08-04T12:00:00Z"), id: "p" }]);
+  const days = model(5, 1);
   assert.deepEqual(
     [0, 1, 4, 5].map((i) => dayIndexOf(days, i)),
     [0, 0, 0, 1],
@@ -216,7 +195,7 @@ test("dayIndexOf finds the day holding any item", () => {
 });
 
 test("tiles never overlap and rows advance by exactly one cell plus the gap", () => {
-  const days = buildDays(sameDay(9));
+  const days = model(9);
   const levels = stack(days, 1000);
   const frame = frameAt(levels, DEFAULT_ZOOM);
   const columns = frame.a.metrics.columns;
@@ -233,7 +212,7 @@ test("tiles never overlap and rows advance by exactly one cell plus the gap", ()
 });
 
 test("a settled level is drawn exactly, from either side of the blend", () => {
-  const days = buildDays(sameDay(40));
+  const days = model(40);
   const levels = stack(days, 1400);
 
   for (let level = 0; level <= MAX_ZOOM; level++) {
@@ -249,7 +228,7 @@ test("a settled level is drawn exactly, from either side of the blend", () => {
 });
 
 test("geometry is continuous across a level boundary", () => {
-  const days = buildDays([...sameDay(30), { ...item("2026-08-04T12:00:00Z"), id: "p" }]);
+  const days = model(30, 1);
   const levels = stack(days, 1400);
 
   for (let level = 1; level < MAX_ZOOM; level++) {
@@ -269,7 +248,7 @@ test("geometry is continuous across a level boundary", () => {
 });
 
 test("tile tops only ever increase, which is what the binary searches assume", () => {
-  const days = buildDays([...sameDay(37), { ...item("2026-08-04T12:00:00Z"), id: "p" }]);
+  const days = model(37, 1);
   const levels = stack(days, 1400);
 
   for (const z of [0, 0.5, 1.3, 2, 2.75, 3.5, 4]) {
@@ -284,7 +263,7 @@ test("tile tops only ever increase, which is what the binary searches assume", (
 });
 
 test("visibleItems selects exactly the tiles touching the viewport", () => {
-  const days = buildDays(sameDay(60));
+  const days = model(60);
   const levels = stack(days, 1000);
   const frame = frameAt(levels, 1.4);
   const scrollTop = 300;
@@ -303,7 +282,7 @@ test("visibleItems widens by the overscan and clamps at both ends", () => {
   // Long enough that a viewport in the middle has room to overscan both ways
   // at every level, including the one with the tallest rows.
   const count = 400;
-  const days = buildDays(sameDay(count));
+  const days = model(count);
   const levels = stack(days, 1000);
 
   for (let level = 0; level <= MAX_ZOOM; level++) {
@@ -330,7 +309,7 @@ test("visibleItems on an empty timeline renders nothing", () => {
 });
 
 test("itemAtPoint picks the tile under the pointer, column included", () => {
-  const days = buildDays(sameDay(30));
+  const days = model(30);
   const levels = stack(days, 1000);
   const frame = frameAt(levels, DEFAULT_ZOOM);
 
@@ -347,7 +326,7 @@ test("itemAtPoint picks the tile under the pointer, column included", () => {
 test("itemAtPoint stays inside the day whose row it landed in", () => {
   // Four items on the newer day, so its last row is short and a pointer off its
   // right-hand end must not select into the day below.
-  const days = buildDays([...sameDay(4), { ...item("2026-08-04T12:00:00Z"), id: "p" }]);
+  const days = model(4, 1);
   const levels = stack(days, 1000);
   const frame = frameAt(levels, DEFAULT_ZOOM);
   const last = tileRect(frame, 0, 3);
@@ -356,11 +335,7 @@ test("itemAtPoint stays inside the day whose row it landed in", () => {
 });
 
 test("dayAt reports the day covering a scroll position", () => {
-  const days = buildDays([
-    item("2026-08-05T12:00:00Z"),
-    item("2026-08-04T12:00:00Z"),
-    item("2026-08-03T12:00:00Z"),
-  ]);
+  const days = model(1, 1, 1);
   const levels = stack(days, 1000);
   const frame = frameAt(levels, DEFAULT_ZOOM);
 

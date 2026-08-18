@@ -184,3 +184,49 @@ func (s *Store) Adopt(path, ext string, expect Expected) (Result, error) {
 func (s *Store) Open(sha256hex, ext string) (*os.File, error) {
 	return os.Open(s.Path(sha256hex, ext))
 }
+
+// Remove deletes a stored blob, reporting the bytes it freed.
+//
+// The one operation in this package that destroys an original, and it is not
+// called by anything that is merely tidying up: a blob is removed when the
+// asset naming it has been through the trash, served its retention, and been
+// purged by name. Everything else here — a failed upload, a stray temp file, a
+// digest mismatch — leaves the bytes alone and lets `verify` report them.
+//
+// A blob that is already gone is not an error. The row that named it is being
+// deleted either way, and refusing to finish because the file went missing
+// first would leave the archive in the state this call exists to leave.
+func (s *Store) Remove(sha256hex, ext string) (int64, error) {
+	path := s.Path(sha256hex, ext)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("stat blob before removing it: %w", err)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return 0, fmt.Errorf("remove blob: %w", err)
+	}
+	return info.Size(), nil
+}
+
+// PathsFor finds every blob sharing a digest, whatever extension it is under.
+//
+// The one lookup here that is not a pure function of (digest, extension), and
+// it exists for the one caller that has the first and not the second: the vault
+// sweep, which is looking for plaintext left behind by an interrupted hide and
+// is asking about a row whose `ext` column was emptied by that same operation.
+//
+// Content-addressing means a digest identifies at most one file's worth of
+// bytes, so more than one match here would be the same photograph stored twice
+// under different names — which is a thing to remove, not to choose between.
+func (s *Store) PathsFor(sha256hex string) ([]string, error) {
+	dir := filepath.Join(s.root, "blobs", sha256hex[0:2], sha256hex[2:4])
+	matches, err := filepath.Glob(filepath.Join(dir, sha256hex+"*"))
+	if err != nil {
+		return nil, fmt.Errorf("look for blobs of %s: %w", sha256hex, err)
+	}
+	return matches, nil
+}

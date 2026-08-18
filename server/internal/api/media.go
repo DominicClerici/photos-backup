@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/dominicclerici/photos-backup/server/internal/db"
+	"github.com/dominicclerici/photos-backup/server/internal/derive"
 	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 )
 
@@ -23,6 +24,10 @@ const immutable = "public, max-age=31536000, immutable"
 func (s *Server) handleOriginal(w http.ResponseWriter, r *http.Request) {
 	asset, ok := s.lookup(w, r)
 	if !ok {
+		return
+	}
+	if asset.Vault != "" {
+		s.serveVaultOriginal(w, r, asset)
 		return
 	}
 
@@ -76,7 +81,9 @@ func (s *Server) handleThumbSized(w http.ResponseWriter, r *http.Request) {
 	s.serveDerivative(w, r, asset, derivstore.ThumbSuffix(size), "image/webp")
 }
 
-// handlePlayback serves the browser-playable rendition of a video.
+// handlePlayback serves the browser-playable rendition of a video. For a
+// Snapchat memory that is the composite: the caption is in the pixels, because
+// nothing can lay a PNG over a playing video on the client.
 func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 	asset, ok := s.lookup(w, r)
 	if !ok {
@@ -87,6 +94,25 @@ func (s *Server) handlePlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.serveDerivative(w, r, asset, derivstore.Playback, "video/mp4")
+}
+
+// handlePlaybackPlain serves the same video without the caption layer burned
+// in, which is the only way the viewer's toggle can show one of these.
+//
+// It exists only for videos that carry a layer. Anything else gets a 404 rather
+// than a copy of the ordinary playback: there is no second rendition on disk,
+// and answering with the first would pin the composite in a browser's immutable
+// cache under the URL that promises not to be one.
+func (s *Server) handlePlaybackPlain(w http.ResponseWriter, r *http.Request) {
+	asset, ok := s.lookup(w, r)
+	if !ok {
+		return
+	}
+	if asset.MediaKind != db.MediaVideo || asset.OverlayAssetID == nil {
+		writeError(w, http.StatusNotFound, "this video has no overlay to leave out")
+		return
+	}
+	s.serveDerivative(w, r, asset, derivstore.PlaybackPlain, "video/mp4")
 }
 
 // handleLiveThumb serves the base motion rendition the grid plays on hover.
@@ -180,11 +206,17 @@ func (s *Server) renderLivePreview(ctx context.Context, video db.Asset) ([]byte,
 	}
 	defer cleanup()
 
-	info, err := s.Video.Probe(ctx, s.Blobs.Path(video.SHA256, video.Ext))
+	source, release, err := s.assetPath(video)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.Video.LivePreview(ctx, s.Blobs.Path(video.SHA256, video.Ext), staged, info); err != nil {
+	defer release()
+
+	info, err := s.Video.Probe(ctx, source)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Video.LivePreview(ctx, source, staged, info); err != nil {
 		return nil, err
 	}
 	return os.ReadFile(staged)
@@ -218,6 +250,11 @@ func (s *Server) livePair(w http.ResponseWriter, r *http.Request) (db.Asset, boo
 }
 
 func (s *Server) serveDerivative(w http.ResponseWriter, r *http.Request, asset db.Asset, suffix, contentType string) {
+	if asset.Vault != "" {
+		s.serveVaultDerivative(w, r, asset, suffix, contentType)
+		return
+	}
+
 	f, err := s.Derivatives.Open(asset.SHA256, suffix)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -246,20 +283,95 @@ func (s *Server) serveDerivative(w http.ResponseWriter, r *http.Request, asset d
 
 // handlePreview renders the 2048px rendition on demand and stores nothing.
 //
-// The conditional check happens before the conversion, not after: a client that
-// already has these bytes must not cost an ImageMagick process to be told so.
-// That is what makes arrow-keying back through a viewer cheap.
+// For a Snapchat memory it renders the composite — the photograph with its
+// caption layer over it, which is the picture that was actually sent and the
+// only one anybody ever saw. The layer is a second archived asset, so this
+// costs one more row read and one more decode, on the few hundred assets that
+// have one.
 func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	asset, ok := s.lookup(w, r)
 	if !ok {
 		return
 	}
+	over, release, ok := s.previewLayer(w, r, asset)
+	if !ok {
+		return
+	}
+	defer release()
+	s.servePreview(w, r, asset, over)
+}
+
+// handlePreviewPlain renders the same photograph without its caption layer.
+//
+// This is what the viewer's press-and-hold and its overlay toggle reach for. It
+// answers for an asset that has no layer too, with the same bytes /preview
+// would give: the URL means "the photograph itself", and that is a true answer
+// for a photograph nobody drew on.
+func (s *Server) handlePreviewPlain(w http.ResponseWriter, r *http.Request) {
+	asset, ok := s.lookup(w, r)
+	if !ok {
+		return
+	}
+	s.servePreview(w, r, asset, nil)
+}
+
+// previewLayer resolves the caption layer to draw over an asset, if it has one.
+func (s *Server) previewLayer(w http.ResponseWriter, r *http.Request, asset db.Asset) (*derive.Layer, func(), bool) {
+	nothing := func() {}
+	if asset.OverlayAssetID == nil {
+		return nil, nothing, true
+	}
+
+	layer, err := s.Store.Asset(r.Context(), *asset.OverlayAssetID)
+	if errors.Is(err, db.ErrNotFound) {
+		// `on delete set null` means the database cannot get here, so this is
+		// the archive disagreeing with itself. The photograph is worth more than
+		// the caption, so it is drawn without one.
+		s.logger().Warn("overlay is linked but missing", "asset", asset.ID)
+		return nil, nothing, true
+	}
+	if err != nil {
+		s.logger().Error("load overlay", "error", err, "asset", asset.ID)
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return nil, nothing, false
+	}
+
+	// A vaulted layer is decrypted to a staged file, which has to outlive this
+	// call because the render that reads it happens after it returns — so the
+	// cleanup travels back to handlePreview rather than being deferred here.
+	path, release, ok := s.sourcePath(w, layer)
+	if !ok {
+		return nil, nothing, false
+	}
+
+	return &derive.Layer{
+		Path: path,
+		// From the row rather than measured, because the metadata job has
+		// already read them off the file. Null until it runs, which derive
+		// treats as "measure it yourself".
+		Width:  intOr(asset.Width),
+		Height: intOr(asset.Height),
+	}, release, true
+}
+
+// servePreview renders one 2048px rendition, with or without a layer over it.
+//
+// The conditional check happens before the conversion, not after: a client that
+// already has these bytes must not cost an ImageMagick process to be told so.
+// That is what makes arrow-keying back through a viewer cheap. The two
+// renditions carry different ETags because they are different pictures, so a
+// browser holding one is never handed it for the other.
+func (s *Server) servePreview(w http.ResponseWriter, r *http.Request, asset db.Asset, over *derive.Layer) {
 	if asset.MediaKind == db.MediaVideo {
 		writeError(w, http.StatusNotFound, "videos have no preview; use /playback")
 		return
 	}
 
-	etag := etagFor(asset.SHA256, "preview")
+	variant := "preview"
+	if over != nil {
+		variant = "preview-composite"
+	}
+	etag := etagFor(asset.SHA256, variant)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", immutable)
 	if etagMatches(r.Header.Get("If-None-Match"), etag) {
@@ -267,10 +379,16 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	source, release, ok := s.sourcePath(w, asset)
+	if !ok {
+		return
+	}
+	defer release()
+
 	// Buffered rather than streamed: a conversion that fails halfway must
 	// produce an honest status code, not a truncated image with a 200 on it.
 	var buf bytes.Buffer
-	if err := s.Converter.Preview(r.Context(), s.Blobs.Path(asset.SHA256, asset.Ext), &buf); err != nil {
+	if err := s.Converter.Preview(r.Context(), source, over, &buf); err != nil {
 		if r.Context().Err() != nil {
 			return // client went away mid-conversion
 		}
@@ -280,7 +398,14 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "image/webp")
-	http.ServeContent(w, r, asset.SHA256+".preview.webp", asset.UploadedAt, bytes.NewReader(buf.Bytes()))
+	http.ServeContent(w, r, asset.SHA256+"."+variant+".webp", asset.UploadedAt, bytes.NewReader(buf.Bytes()))
+}
+
+func intOr(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 func etagFor(sha256hex, variant string) string {

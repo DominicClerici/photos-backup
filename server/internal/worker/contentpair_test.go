@@ -146,7 +146,7 @@ func TestAVideoWithNoIdentifierIsNeverPaired(t *testing.T) {
 		t.Errorf("PlaybackState = %q, want a transcode queued", got.PlaybackState)
 	}
 
-	page, err := h.store.Timeline(context.Background(), nil, 10)
+	page, err := h.store.Timeline(context.Background(), db.TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}

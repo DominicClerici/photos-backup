@@ -5,8 +5,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -27,9 +30,12 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/livecache"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
+	"github.com/dominicclerici/photos-backup/server/internal/purge"
 	"github.com/dominicclerici/photos-backup/server/internal/tlsca"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
+	"github.com/dominicclerici/photos-backup/server/internal/vault"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
+	"github.com/dominicclerici/photos-backup/server/internal/websession"
 	"github.com/dominicclerici/photos-backup/server/internal/worker"
 )
 
@@ -96,6 +102,39 @@ func run(log *slog.Logger) error {
 	staging := uploads.New(filepath.Join(root, "incoming"))
 	paired := devices.New(store.Pool())
 
+	// The encrypted trees mirror the plaintext ones, one per disk. Hiding a
+	// photograph must not quietly move a 500MB video off the archive drive and
+	// onto the SSD the derivatives live on, so the originals' vault sits beside
+	// the blobs and the renditions' beside the renditions.
+	vaults := &vault.Service{
+		Store:            store,
+		Blobs:            blobs,
+		Derivatives:      derivatives,
+		VaultBlobs:       vault.NewStore(filepath.Join(root, "vault")),
+		VaultDerivatives: vault.NewStore(filepath.Join(derivRoot, "vault")),
+		Manifest:         manifest.New(filepath.Join(root, "manifest.jsonl")),
+		Keeper:           vault.NewKeeper(cfg.VaultIdle),
+		Log:              log,
+	}
+
+	// The browser's way into the archive, and the whole of what it costs this
+	// file. Both are inert unless configured: no GALLERY_PASSWORD means no
+	// browser can sign in, and no WEB_URL means photod serves the API alone and
+	// the gallery is somebody else's process to serve. See
+	// internal/api/websession.go, which is written to be removed whole.
+	sessions := websession.New(cfg.GalleryPassword, cfg.GallerySessionTTL)
+	webApp, err := galleryProxy(cfg, log)
+	if err != nil {
+		return err
+	}
+	switch {
+	case webApp == nil:
+	case cfg.TLSDisabled:
+		log.Warn("serving the gallery from photod with TLS disabled: the gallery password and every session cookie will cross the network in the clear — development only", "web", cfg.WebURL)
+	default:
+		log.Info("serving the gallery from the API listener", "web", cfg.WebURL, "session_idle", cfg.GallerySessionTTL)
+	}
+
 	srv := &api.Server{
 		Store:        store,
 		Blobs:        blobs,
@@ -107,10 +146,32 @@ func run(log *slog.Logger) error {
 		Queue:        queue,
 		Uploads:      staging,
 		Devices:      paired,
+		Vault:        vaults,
+		Sessions:     sessions,
+		WebApp:       webApp,
 		Log:          log,
 	}
 
 	go sweepUploads(ctx, log, staging, cfg.UploadSessionTTL)
+
+	if cfg.PurgeDisabled {
+		log.Warn("the trash sweep is disabled; deleted items will wait indefinitely")
+	} else {
+		go sweepTrash(ctx, purge.Deps{
+			Store:       store,
+			Blobs:       blobs,
+			Derivatives: derivatives,
+			Manifest:    srv.Manifest,
+			Log:         log,
+		}, cfg.PurgeInterval)
+	}
+
+	// On the same timer, and for a reason the trash sweep does not have: a
+	// crash between "this photograph is hidden" and "its plaintext is gone"
+	// leaves the original readable on the archive drive. It is a small window
+	// and it will probably never open, but "probably never" is not the standard
+	// a vault is held to. See vault.Service.Reconcile.
+	go sweepVault(ctx, vaults, cfg.PurgeInterval)
 
 	// Before the worker pools start, because unlike everything below this can
 	// fail: TLS is not optional the way the media tools are. A missing ffmpeg
@@ -250,6 +311,42 @@ func run(log *slog.Logger) error {
 	}
 }
 
+// galleryProxy builds the reverse proxy that puts the Next app and the archive
+// on one origin. Nil, and no error, when WEB_URL is unset.
+//
+// It refuses to start without a gallery password, which is the one hard failure
+// this feature has. Serving the gallery from the listener that answers to the
+// whole LAN, with nothing in front of it, would hand the archive to anyone on
+// the Wi-Fi — and a misconfiguration that opens the library has to be a startup
+// error rather than a log line nobody reads.
+func galleryProxy(cfg config.Config, log *slog.Logger) (http.Handler, error) {
+	if cfg.WebURL == "" {
+		return nil, nil
+	}
+	if cfg.GalleryPassword == "" {
+		return nil, errors.New("WEB_URL is set but GALLERY_PASSWORD is empty: photod will not serve the gallery unauthenticated")
+	}
+
+	target, err := url.Parse(cfg.WebURL)
+	if err != nil {
+		return nil, fmt.Errorf("WEB_URL is not a URL: %w", err)
+	}
+	if target.Scheme != "http" && target.Scheme != "https" || target.Host == "" {
+		return nil, fmt.Errorf("WEB_URL must be an http(s) URL with a host, got %q", cfg.WebURL)
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	// The gallery being down is not the archive being down. Without this the
+	// browser gets Go's default 502 with no body and no log line, which reads
+	// as "photod is broken" when what happened is that a second unit is not
+	// running yet.
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Error("could not reach the gallery", "error", err, "web", cfg.WebURL, "path", r.URL.Path)
+		http.Error(w, "the gallery is not responding; the API is unaffected", http.StatusBadGateway)
+	}
+	return proxy, nil
+}
+
 func serveErr(errs chan<- error, err error) {
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		errs <- err
@@ -276,6 +373,78 @@ func sweepUploads(ctx context.Context, log *slog.Logger, staging *uploads.Store,
 
 	sweep()
 	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
+}
+
+// sweepTrash destroys what the trash has finished holding, once at startup and
+// on a timer after that.
+//
+// It runs here rather than on a systemd timer beside `verify` for the same
+// reason the upload sweep does: the expiry is a property of the archive, not of
+// how somebody chose to deploy it, and a retention that only elapses on hosts
+// where a second unit was installed is not a retention.
+//
+// One bite at a time. Everything due is found by one index probe, but a library
+// that has been deleting for a year could have an unbounded amount of it, and
+// unlinking a hundred thousand files inside one tick is the kind of thing that
+// makes a server look hung.
+func sweepTrash(ctx context.Context, d purge.Deps, every time.Duration) {
+	const perSweep = 1000
+
+	sweep := func() {
+		result, err := purge.Expired(ctx, d, perSweep)
+		if err != nil {
+			// The rows either went or they did not; either way the next tick
+			// asks again, and an hour is a long time to have nothing else to do.
+			d.Log.Warn("could not sweep the trash", "error", err)
+		}
+		if result.Rows > 0 {
+			d.Log.Info("purged expired items from the trash",
+				"items", result.Items, "rows", result.Rows, "bytes", result.Bytes,
+				"retention_days", db.TrashRetentionDays)
+		}
+	}
+
+	sweep()
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
+}
+
+// sweepVault removes plaintext an interrupted hide left behind, once at startup
+// and on a timer after that.
+//
+// Cheap by construction: the question is only asked about rows that are already
+// in the vault, and the answer is a stat per digest.
+func sweepVault(ctx context.Context, vaults *vault.Service, every time.Duration) {
+	sweep := func() {
+		cleaned, err := vaults.Reconcile(ctx)
+		if err != nil {
+			return // already logged, and the next tick asks again
+		}
+		if cleaned > 0 {
+			vaults.Log.Warn("swept plaintext left behind by interrupted vault operations",
+				"files", cleaned)
+		}
+	}
+
+	sweep()
+	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
 		select {

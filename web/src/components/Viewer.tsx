@@ -1,11 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   fetchAsset,
   livePreviewUrl,
   originalUrl,
+  plainPlaybackUrl,
+  plainPreviewUrl,
   playbackUrl,
   previewUrl,
   thumbUrl,
@@ -40,6 +42,14 @@ const MEDIA =
  */
 const HOLD_MS = 150;
 
+/**
+ * The badge over a photo that has something to reveal. Same place and same
+ * shape as the Live Photo's, because it is the same gesture and there is no
+ * reason for someone to learn it twice.
+ */
+const HINT_BADGE =
+  "pointer-events-none absolute top-3 left-3 flex items-center gap-1.5 rounded-full bg-card/70 px-2.5 py-1 text-[11px] font-medium tracking-[0.06em] text-muted-foreground uppercase backdrop-blur-[6px]";
+
 /** Sidebar on a wide screen, bottom sheet under 700px. */
 const PANEL =
   "absolute top-13 right-0 bottom-0 w-80 overflow-y-auto border-l bg-card px-5 pt-[18px] pb-7 max-[700px]:top-auto max-[700px]:left-0 max-[700px]:max-h-[55%] max-[700px]:w-full max-[700px]:border-t max-[700px]:border-l-0";
@@ -47,20 +57,33 @@ const PANEL =
 const PANEL_HINT = "mt-[2px] block text-[11px] text-faint";
 
 interface Props {
-  items: TimelineItem[];
+  /**
+   * The item at a position in the timeline, or undefined while it is still
+   * being fetched. An accessor rather than a list because the timeline is
+   * addressed by position now and holds only the stretch of it that has been
+   * asked for — the photo two along may genuinely not be here yet.
+   */
+  at: (index: number) => TimelineItem | undefined;
+  /** How many items the collection holds, loaded or not. */
+  total: number;
   index: number;
   onClose: () => void;
   onNavigate: (index: number) => void;
 }
 
-export function Viewer({ items, index, onClose, onNavigate }: Props) {
-  const item = items[index];
+export function Viewer({ at, total, index, onClose, onNavigate }: Props) {
+  const item = at(index);
   const [detail, setDetail] = useState<AssetDetail | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  // Kept across navigation rather than reset per photo: Snapchat memories
+  // arrive in runs, and someone who turned the captions off to look at one
+  // photograph almost always wants the next one the same way.
+  const [overlayOn, setOverlayOn] = useState(true);
+  const hasOverlay = detail?.has_overlay ?? false;
 
   const hasPrev = index > 0;
-  const hasNext = index < items.length - 1;
+  const hasNext = index < total - 1;
 
   useEffect(() => {
     if (!item) return;
@@ -78,14 +101,14 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
   // Preloading the neighbours is what makes arrow-keying feel instant. The
   // preview is rendered per request, so this also gets the conversion started
   // before it is needed rather than after.
-  const neighbours = useMemo(
-    () =>
-      [items[index - 1], items[index + 1]]
-        .filter((it): it is TimelineItem => it?.kind === "image")
-        .map((it) => it.id),
-    [items, index],
-  );
-  const neighbourKey = neighbours.join(",");
+  //
+  // Computed on every render rather than memoised: `at` reads a sparse store,
+  // and a neighbour that was not loaded when the viewer opened is exactly the
+  // one worth reacting to when it arrives.
+  const neighbourKey = [at(index - 1), at(index + 1)]
+    .filter((it): it is TimelineItem => it?.kind === "image")
+    .map((it) => it.id)
+    .join(",");
   useEffect(() => {
     for (const id of neighbourKey ? neighbourKey.split(",") : []) {
       const img = new Image();
@@ -109,6 +132,10 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
         case "I":
           setPanelOpen((open) => !open);
           break;
+        case "o":
+        case "O":
+          setOverlayOn((on) => !on);
+          break;
         default:
           return;
       }
@@ -118,12 +145,15 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
     return () => window.removeEventListener("keydown", onKey);
   }, [index, hasPrev, hasNext, onClose, onNavigate]);
 
-  // The page behind must not scroll while the overlay owns the screen.
+  // The page behind must not scroll while the overlay owns the screen, and the
+  // tab bar it covers must not still be reachable by Tab — see globals.css.
   useEffect(() => {
     const previous = document.body.style.overflow;
     document.body.style.overflow = "hidden";
+    document.body.dataset.overlay = "open";
     return () => {
       document.body.style.overflow = previous;
+      delete document.body.dataset.overlay;
     };
   }, []);
 
@@ -148,12 +178,30 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
           <CloseGlyph />
         </Button>
         <span className="flex min-w-0 items-baseline gap-3 text-[13px] tabular-nums">
-          {index + 1} of {items.length}
+          {index + 1} of {total.toLocaleString()}
           {detail ? (
             <em className="truncate not-italic text-faint">{detail.filename}</em>
           ) : null}
         </span>
         <span className="ml-auto flex gap-1">
+          {hasOverlay ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className={cn(
+                BAR_BUTTON,
+                "aria-pressed:bg-muted aria-pressed:text-foreground",
+              )}
+              onClick={() => setOverlayOn((on) => !on)}
+              aria-pressed={overlayOn}
+              aria-label={
+                overlayOn ? "Hide the overlay (O)" : "Show the overlay (O)"
+              }
+            >
+              <OverlayGlyph off={!overlayOn} />
+            </Button>
+          ) : null}
           <Button
             type="button"
             variant="ghost"
@@ -215,7 +263,7 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
           onClick={(e) => e.stopPropagation()}
         >
           {item.kind === "video" ? (
-            <VideoStage item={item} />
+            <VideoStage item={item} plain={hasOverlay && !overlayOn} />
           ) : (
             <>
               {!loaded ? (
@@ -226,6 +274,8 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
                 item={item}
                 alt={detail?.filename ?? ""}
                 loaded={loaded}
+                hasOverlay={hasOverlay}
+                overlayOn={overlayOn}
                 onLoad={() => setLoaded(true)}
               />
             </>
@@ -253,43 +303,50 @@ export function Viewer({ items, index, onClose, onNavigate }: Props) {
 }
 
 /**
- * The photo, and — when it is a Live Photo — the three seconds behind it.
+ * The photo, and whatever is behind it — the three seconds a Live Photo
+ * carries, or the photograph under a Snapchat memory's caption layer.
  *
- * The 1080p rendition is rendered by the server per request, so it is asked for
- * the moment the viewer opens rather than when the press begins: the photo is
- * on screen immediately either way, and by the time anyone has decided to hold
- * down on it, ffmpeg has long since finished.
+ * One gesture reveals both, because they are the same gesture: press and hold,
+ * let go and it goes back. Which one a photo has is a property of the photo and
+ * never of the press, and nothing in this archive has ever had both.
  *
- * The clip dissolves in over the photo once it is really playing and back out as
- * it finishes, so the only thing a hold changes is that the picture starts
- * moving — see useLiveFade.
+ * The rendition being revealed is asked for the moment the viewer opens rather
+ * than when the press begins. For a Live Photo that means the server's ffmpeg
+ * has long finished by the time anyone decides to hold; for a memory it means
+ * the photograph is already in the browser's cache and the hold is instant.
  */
 function PhotoStage({
   item,
   alt,
   loaded,
+  hasOverlay,
+  overlayOn,
   onLoad,
 }: {
   item: TimelineItem;
   alt: string;
   loaded: boolean;
+  hasOverlay: boolean;
+  overlayOn: boolean;
   onLoad: () => void;
 }) {
   const fade = useLiveFade();
   const timer = useRef(0);
   const [playing, setPlaying] = useState(false);
+  const [pressed, setPressed] = useState(false);
   const live = item.live === "ready";
 
   useEffect(() => () => window.clearTimeout(timer.current), []);
 
   /**
-   * Ends the clip, whether it ran out or the press did.
+   * Ends whatever the press started, whether it ran out or the press did.
    *
    * Pausing and rewinding wait for the fade to finish: doing either to a video
    * that is still half on screen is the jump cut the fade is there to hide.
    */
   const stop = () => {
     window.clearTimeout(timer.current);
+    setPressed(false);
     fade.end(() => {
       setPlaying(false);
       const el = fade.ref.current;
@@ -301,7 +358,7 @@ function PhotoStage({
   };
 
   const press = (e: React.PointerEvent) => {
-    if (!live || e.button !== 0) return;
+    if ((!live && !hasOverlay) || e.button !== 0) return;
     // Claims the pointer, so releasing anywhere on the page still ends the
     // press — including the drag that a hold on a photo naturally becomes.
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -311,8 +368,12 @@ function PhotoStage({
 
     window.clearTimeout(timer.current);
     timer.current = window.setTimeout(async () => {
+      // A memory has nothing to start: the photograph is already mounted under
+      // the composite, and the hold is only what makes it visible.
+      setPressed(true);
+
       const el = fade.ref.current;
-      if (!el) return;
+      if (!live || !el) return;
       el.currentTime = 0;
       setPlaying(true);
       try {
@@ -347,6 +408,30 @@ function PhotoStage({
         style={{ opacity: loaded ? 1 : 0 }}
       />
 
+      {hasOverlay ? (
+        <>
+          {/* The photograph Snapchat shipped, over the composite rather than
+              under it: an absolutely positioned sibling paints on top, and the
+              two are the same picture at the same size, so fading this in is
+              the caption disappearing. Mounted from the start, which is what
+              makes the hold instant and what leaves the composite showing for
+              the moment before these bytes arrive. */}
+          <img
+            className={cn(MEDIA, "absolute")}
+            src={plainPreviewUrl(item.id)}
+            alt=""
+            draggable={false}
+            style={{ opacity: !overlayOn || pressed ? 1 : 0 }}
+          />
+          {overlayOn && !pressed ? (
+            <span className={HINT_BADGE}>
+              <OverlayGlyph />
+              Hold to hide
+            </span>
+          ) : null}
+        </>
+      ) : null}
+
       {live ? (
         <>
           <video
@@ -362,7 +447,7 @@ function PhotoStage({
             onError={stop}
           />
           {!playing ? (
-            <span className="pointer-events-none absolute top-3 left-3 flex items-center gap-1.5 rounded-full bg-card/70 px-2.5 py-1 text-[11px] font-medium tracking-[0.06em] text-muted-foreground uppercase backdrop-blur-[6px]">
+            <span className={HINT_BADGE}>
               <LiveGlyph />
               Hold to play
             </span>
@@ -391,17 +476,84 @@ function LiveGlyph() {
   );
 }
 
-function VideoStage({ item }: { item: TimelineItem }) {
+/**
+ * A video, and for a Snapchat memory the choice between the two renditions of
+ * it.
+ *
+ * There is no press-and-hold here and there cannot be: the caption is in the
+ * pixels, because nothing in a browser will composite a PNG over a playing
+ * <video>, so revealing the photograph underneath means fetching a different
+ * file. The toggle swaps the source and the playhead is carried across, which
+ * is as close to the still's gesture as a second download gets.
+ */
+/**
+ * Two stacked sheets: the photograph and the layer somebody drew over it. The
+ * slash is the layer taken away, which is what the button does.
+ */
+function OverlayGlyph({ off = false }: { off?: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+      <path
+        d="M12 3.6 3.4 8 12 12.4 20.6 8 12 3.6Z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M4.6 12.6 12 16.4l7.4-3.8"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      {off ? (
+        <path
+          d="M4 20 20 4"
+          stroke="currentColor"
+          strokeWidth="1.7"
+          strokeLinecap="round"
+        />
+      ) : null}
+    </svg>
+  );
+}
+
+function VideoStage({ item, plain }: { item: TimelineItem; plain: boolean }) {
+  // Sampled from the element as it plays rather than read at the moment of the
+  // swap: by the time React has re-rendered, the element has already been
+  // reset by its new source and its playhead is gone.
+  const at = useRef(0);
+  const [plainBroken, setPlainBroken] = useState(false);
+
   if (item.playback_state === "ready") {
+    // A rendition the transcode has not caught up with yet is a 404, and the
+    // composite is a better answer than a black rectangle.
+    const showPlain = plain && !plainBroken;
     return (
       <video
+        // Keyed by the asset and not by the source: changing the src on the
+        // same element is what lets the playhead be restored, where a remount
+        // would start the clip over.
         key={item.id}
         className={MEDIA}
-        src={playbackUrl(item.id)}
+        src={showPlain ? plainPlaybackUrl(item.id) : playbackUrl(item.id)}
         poster={item.state === "ready" ? thumbUrl(item.id) : undefined}
         controls
         autoPlay
         playsInline
+        onTimeUpdate={(e) => {
+          at.current = e.currentTarget.currentTime;
+        }}
+        onLoadedMetadata={(e) => {
+          if (at.current > 0 && at.current < e.currentTarget.duration) {
+            e.currentTarget.currentTime = at.current;
+          }
+        }}
+        onError={() => {
+          if (showPlain) setPlainBroken(true);
+        }}
       />
     );
   }

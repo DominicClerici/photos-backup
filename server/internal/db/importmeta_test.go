@@ -242,7 +242,7 @@ func TestATrashedItemIsRecordedAsArchived(t *testing.T) {
 		t.Error("Archived = false on a trashed item")
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestAHiddenPhotoIsRecordedAsArchived(t *testing.T) {
 		t.Error("Archived = false on a photo the phone had in the Hidden album")
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}

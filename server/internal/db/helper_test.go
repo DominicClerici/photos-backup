@@ -44,7 +44,10 @@ func testStore(t *testing.T) *Store {
 	}
 	// Every table by name rather than `cascade`, so a future table with a
 	// foreign key here has to be added deliberately instead of silently wiped.
-	if _, err := store.pool.Exec(ctx, "truncate table assets, device_assets, jobs cascade"); err != nil {
+	// albums is named too because it is the one table here that does not hang
+	// off assets: membership cascades away with the photos, but the album row
+	// itself would survive into the next test and be counted by it.
+	if _, err := store.pool.Exec(ctx, "truncate table assets, device_assets, jobs, albums, vault_people, vault_secret cascade"); err != nil {
 		t.Fatalf("truncate assets: %v", err)
 	}
 	return store

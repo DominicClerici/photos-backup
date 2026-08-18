@@ -42,10 +42,10 @@ type ImportOrphan struct {
 // request is refused at the edge rather than stored as a row nothing can read.
 func (o ImportOrphan) Validate() error {
 	switch o.Source {
-	case SourceGoogleTakeout, SourcePhotoKit:
+	case SourceGoogleTakeout, SourcePhotoKit, SourceSnapchat:
 	default:
-		return fmt.Errorf("unknown import source %q; this archive reads %q and %q",
-			o.Source, SourceGoogleTakeout, SourcePhotoKit)
+		return fmt.Errorf("unknown import source %q; this archive reads %q, %q and %q",
+			o.Source, SourceGoogleTakeout, SourcePhotoKit, SourceSnapchat)
 	}
 
 	switch o.Kind {

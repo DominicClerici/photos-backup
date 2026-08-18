@@ -207,6 +207,21 @@ func (r *Runner) execute(ctx context.Context, workerID string, job jobs.Job) {
 		"job", job.ID, "kind", job.Kind, "asset", job.AssetID, "took", time.Since(started))
 }
 
+// vaulted reports that this asset was hidden or archived while its job was in
+// flight, which is the one way a job can find itself holding a row whose
+// original is deliberately not on disk.
+//
+// Hiding deletes the queued work for an asset, but it cannot delete a job that
+// is already running — so a metadata job that started a moment before is still
+// going to look for a plaintext original that has just been encrypted away.
+// Without this it fails, retries four more times, and marks a hidden photograph
+// permanently broken.
+//
+// Done rather than failed, and silently. There is genuinely nothing left to do:
+// the renditions were sealed on the way in, and if any were missing the restore
+// requeues this exact job on the way out.
+func vaulted(asset db.Asset) bool { return asset.Vault != "" }
+
 func (r *Runner) run(ctx context.Context, job jobs.Job) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
@@ -231,6 +246,9 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 	if err != nil {
 		return err
 	}
+	if vaulted(asset) {
+		return nil
+	}
 	src := r.Blobs.Path(asset.SHA256, asset.Ext)
 	if _, err := os.Stat(src); err != nil {
 		return fmt.Errorf("original missing from the blob store: %w", err)
@@ -253,6 +271,14 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 		}
 	}
 
+	// The caption layer, for a Snapchat memory. Read before anything is
+	// rendered, because every rendition below is built from the composite
+	// rather than from the file this job was handed.
+	overlay, err := r.overlay(ctx, asset)
+	if err != nil {
+		return err
+	}
+
 	decodable := true
 	var thumbErr error
 	switch {
@@ -261,16 +287,23 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 			return err
 		}
 	case asset.MediaKind == db.MediaVideo:
-		if decodable, err = r.videoMetadata(ctx, asset, src, &meta); err != nil {
+		if decodable, err = r.videoMetadata(ctx, asset, src, overlay, &meta); err != nil {
 			return err
 		}
 	default:
+		if overlay != nil {
+			// What the file says, not what the row says: the row's width and
+			// height are written by this job, and on a first run they are still
+			// null. Zero leaves derive to measure the file itself, which is
+			// correct and merely slower.
+			overlay.Width, overlay.Height = intOr(meta.Width), intOr(meta.Height)
+		}
 		// Held rather than returned, so the metadata below is stored first. What
 		// exiftool read is good whether or not the render worked, and a job that
 		// parks having written nothing leaves an asset that looks unreadable
 		// when only its thumbnail was — which is exactly how three JPEGs named
 		// .dng came to look like corrupt files.
-		thumbErr = r.writeThumbs(ctx, asset.SHA256, src)
+		thumbErr = r.writeThumbs(ctx, asset.SHA256, src, overlay)
 	}
 
 	if err := r.Store.ApplyMetadata(ctx, assetID, meta); err != nil {
@@ -339,6 +372,44 @@ func (r *Runner) applyContentID(ctx context.Context, assetID, contentID string) 
 	return asset, nil
 }
 
+// overlay resolves the caption layer an asset carries, or nil for the vast
+// majority that carry none.
+//
+// The layer is an ordinary archived asset with its own blob, so this is a row
+// read and a path — no second store, no special case in verify or reindex. A
+// link pointing at a row that is gone is treated as no layer rather than as a
+// failure: `on delete set null` means that cannot happen through the database,
+// and a memory that renders without its caption beats one that never renders.
+func (r *Runner) overlay(ctx context.Context, asset db.Asset) (*derive.Layer, error) {
+	if asset.OverlayAssetID == nil {
+		return nil, nil
+	}
+	layer, err := r.Store.Asset(ctx, *asset.OverlayAssetID)
+	if errors.Is(err, db.ErrNotFound) {
+		r.log().Warn("overlay is linked but missing; rendering without it",
+			"asset", asset.ID, "overlay", *asset.OverlayAssetID)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	path := r.Blobs.Path(layer.SHA256, layer.Ext)
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("overlay missing from the blob store: %w", err)
+	}
+	return &derive.Layer{Path: path}, nil
+}
+
+// intOr reads an optional dimension, and 0 stands for "not known" — which is
+// exactly what derive.Layer's zero size already means.
+func intOr(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
 // videoMetadata fills in what ffprobe knows better than exiftool and builds the
 // poster thumbnail.
 //
@@ -349,7 +420,7 @@ func (r *Runner) applyContentID(ctx context.Context, assetID, contentID string) 
 // It reports whether the video decoded. A false with no error is the degraded
 // case: ffprobe described the file, ffmpeg could not get a frame out of it, and
 // what was readable has still been recorded.
-func (r *Runner) videoMetadata(ctx context.Context, asset db.Asset, src string, meta *db.Metadata) (bool, error) {
+func (r *Runner) videoMetadata(ctx context.Context, asset db.Asset, src string, overlay *derive.Layer, meta *db.Metadata) (bool, error) {
 	info, err := r.Video.Probe(ctx, src)
 	if err != nil {
 		return false, err
@@ -381,7 +452,13 @@ func (r *Runner) videoMetadata(ctx context.Context, asset db.Asset, src string, 
 		}
 		return false, err
 	}
-	return true, r.writeThumbs(ctx, asset.SHA256, poster)
+	// The poster comes out at the video's display size, so the layer is
+	// stretched to that and the tile shows the memory the way it was sent —
+	// caption and all — before anyone opens it.
+	if overlay != nil {
+		overlay.Width, overlay.Height = info.DisplaySize()
+	}
+	return true, r.writeThumbs(ctx, asset.SHA256, poster, overlay)
 }
 
 // liveMetadata handles a Live Photo's paired video: what ffprobe knows about
@@ -441,7 +518,7 @@ func (r *Runner) liveMetadata(ctx context.Context, asset db.Asset, src string, m
 // would leave an asset marked ready whose gallery goes blank at one zoom level
 // and not the others. Staging them all and committing at the end means a failed
 // run leaves exactly what was there before.
-func (r *Runner) writeThumbs(ctx context.Context, sha, src string) error {
+func (r *Runner) writeThumbs(ctx context.Context, sha, src string, overlay *derive.Layer) error {
 	targets := make([]derive.ThumbTarget, 0, len(derivstore.ThumbSizes))
 	for _, size := range derivstore.ThumbSizes {
 		staged, cleanup, err := r.Derivatives.Stage("thumb-*.webp")
@@ -452,7 +529,7 @@ func (r *Runner) writeThumbs(ctx context.Context, sha, src string) error {
 		targets = append(targets, derive.ThumbTarget{Size: size, Path: staged})
 	}
 
-	if err := r.Images.Thumbs(ctx, src, targets); err != nil {
+	if err := r.Images.Thumbs(ctx, src, overlay, targets); err != nil {
 		return err
 	}
 	for _, target := range targets {
@@ -468,6 +545,9 @@ func (r *Runner) runPlayback(ctx context.Context, assetID string) error {
 	asset, err := r.Store.Asset(ctx, assetID)
 	if err != nil {
 		return err
+	}
+	if vaulted(asset) {
+		return nil
 	}
 	if asset.MediaKind != db.MediaVideo {
 		// Nothing to transcode. Not an error — reaching here means someone
@@ -488,6 +568,37 @@ func (r *Runner) runPlayback(ctx context.Context, assetID string) error {
 		return err
 	}
 
+	overlay, err := r.overlay(ctx, asset)
+	if err != nil {
+		return err
+	}
+
+	// The rendition every player gets. For a memory that is the composite, so
+	// the caption is there for anything that just asks for the video — the
+	// phone app, a saved link, the grid's own poster.
+	burned := ""
+	if overlay != nil {
+		burned = overlay.Path
+	}
+	if err := r.transcodeTo(ctx, asset, src, info, burned, derivstore.Playback); err != nil {
+		return err
+	}
+
+	// And the photograph underneath, for the viewer's toggle. Second rather than
+	// instead: this one is the extra, and a failure to build it should cost the
+	// toggle rather than the video. It is written before the state flips to
+	// ready so the two are never briefly out of step.
+	if overlay != nil {
+		if err := r.transcodeTo(ctx, asset, src, info, "", derivstore.PlaybackPlain); err != nil {
+			return err
+		}
+	}
+	return r.Store.SetPlaybackState(ctx, assetID, db.DerivedReady)
+}
+
+// transcodeTo builds one playback rendition and publishes it under the given
+// suffix.
+func (r *Runner) transcodeTo(ctx context.Context, asset db.Asset, src string, info video.Info, overlay, suffix string) error {
 	// Same extension requirement as the poster: ffmpeg reads the container off
 	// the name, and +faststart needs a real seekable file to rewrite at the end.
 	staged, cleanup, err := r.Derivatives.Stage("transcode-*" + derivstore.Playback)
@@ -496,13 +607,10 @@ func (r *Runner) runPlayback(ctx context.Context, assetID string) error {
 	}
 	defer cleanup()
 
-	if err := r.Video.Transcode(ctx, src, staged, info); err != nil {
+	if err := r.Video.Transcode(ctx, src, staged, info, overlay); err != nil {
 		return err
 	}
-	if err := r.Derivatives.Commit(asset.SHA256, derivstore.Playback, staged); err != nil {
-		return err
-	}
-	return r.Store.SetPlaybackState(ctx, assetID, db.DerivedReady)
+	return r.Derivatives.Commit(asset.SHA256, suffix, staged)
 }
 
 // markFailed records a permanently failed job on the asset, which is what turns

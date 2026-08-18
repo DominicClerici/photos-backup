@@ -29,6 +29,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
+	"github.com/dominicclerici/photos-backup/server/internal/vault"
 )
 
 // Kind classifies a finding. The order here is the order they are reported in,
@@ -60,6 +61,12 @@ const (
 	StaleUpload Kind = "stale-upload"
 	// StaleTemp is a leftover staging file from an interrupted write.
 	StaleTemp Kind = "stale-temp"
+	// VaultMissing is an asset in the Archive or Hidden bucket whose encrypted
+	// original is not on disk. Critical, and for a worse reason than
+	// BlobMissing: a plaintext original that goes missing may still exist on
+	// the phone that uploaded it, while this one is content nothing else in the
+	// world has a copy of in this form.
+	VaultMissing Kind = "vault-missing"
 )
 
 // Severity separates "a photo is gone or damaged" from "the bookkeeping needs
@@ -76,7 +83,7 @@ const (
 
 func (k Kind) Severity() Severity {
 	switch k {
-	case BlobMissing, BlobCorrupt, BlobWrongSize, ManifestOrphan:
+	case BlobMissing, BlobCorrupt, BlobWrongSize, ManifestOrphan, VaultMissing:
 		return Critical
 	default:
 		return Warning
@@ -136,9 +143,13 @@ type Deps struct {
 	Store       *db.Store
 	Blobs       *blobstore.Store
 	Derivatives *derivstore.Store
-	Uploads     *uploads.Store
-	Queue       *jobs.Queue
-	PhotosRoot  string
+	// VaultBlobs is the encrypted tree. Optional: without it the vault is
+	// skipped rather than reported as missing, which is the right answer for a
+	// deployment where the vault has never been used.
+	VaultBlobs *vault.Store
+	Uploads    *uploads.Store
+	Queue      *jobs.Queue
+	PhotosRoot string
 }
 
 // Report is the outcome of a run.
@@ -189,11 +200,15 @@ func Run(ctx context.Context, d Deps, opt Options) (Report, error) {
 	// and consumed by the second. One hex string per asset: about 26MB for a
 	// 400,000-item library, which is worth not walking the tree twice.
 	indexed := make(map[string]struct{}, counts.Assets)
+	// And the subset of those that are in the vault, which every pass after the
+	// first has to know about: their bytes are deliberately not in the blob
+	// tree, so a manifest line pointing at one is a fact rather than an orphan.
+	sealed := make(map[string]struct{})
 
-	if err := checkAssets(ctx, d, opt, r, indexed, counts); err != nil {
+	if err := checkAssets(ctx, d, opt, r, indexed, sealed, counts); err != nil {
 		return *r, err
 	}
-	if err := checkManifest(ctx, d, opt, r, indexed); err != nil {
+	if err := checkManifest(ctx, d, opt, r, indexed, sealed); err != nil {
 		return *r, err
 	}
 	if err := checkBlobTree(ctx, d, opt, r, indexed); err != nil {
@@ -218,12 +233,29 @@ func Run(ctx context.Context, d Deps, opt Options) (Report, error) {
 
 // checkAssets walks the database and confirms each row's original is present,
 // the right length, and — with Deep — still hashes to its own name.
-func checkAssets(ctx context.Context, d Deps, opt Options, r *Report, indexed map[string]struct{}, counts db.Counts) error {
+func checkAssets(ctx context.Context, d Deps, opt Options, r *Report, indexed, sealed map[string]struct{}, counts db.Counts) error {
 	return d.Store.EachAsset(ctx, func(a db.Asset) error {
 		r.Checked++
 		indexed[a.SHA256] = struct{}{}
 		if opt.Progress != nil {
 			opt.Progress(r.Checked, counts.Assets)
+		}
+
+		// An asset in the vault has no plaintext anywhere, by design, and no
+		// extension left on its row to look for one under. What can still be
+		// checked without the password is that the ciphertext is there and has
+		// a plausible length — the digest cannot be, because the file on disk
+		// is not the bytes that digest names.
+		//
+		// Deep verification of the vault would mean holding the private key,
+		// which is a thing `verify` deliberately does not do: it runs from a
+		// systemd timer at four in the morning, and a nightly job that can
+		// decrypt the hidden photographs is a nightly job that has to be
+		// trusted with them.
+		if a.Vault != "" {
+			sealed[a.SHA256] = struct{}{}
+			checkVaulted(d, r, a)
+			return nil
 		}
 
 		path := d.Blobs.Path(a.SHA256, a.Ext)
@@ -271,6 +303,42 @@ func checkAssets(ctx context.Context, d Deps, opt Options, r *Report, indexed ma
 	})
 }
 
+// checkVaulted is everything that can be said about a hidden photograph from
+// the outside.
+func checkVaulted(d Deps, r *Report, a db.Asset) {
+	if d.VaultBlobs == nil {
+		return
+	}
+	path := d.VaultBlobs.Path(a.SHA256, "")
+	info, err := os.Stat(path)
+	switch {
+	case os.IsNotExist(err):
+		r.Findings = append(r.Findings, Finding{
+			Kind: VaultMissing, SHA256: a.SHA256, Path: path,
+			Detail: fmt.Sprintf("in the %s vault but the sealed original is not on disk", a.Vault),
+		})
+		return
+	case err != nil:
+		r.Findings = append(r.Findings, Finding{
+			Kind: VaultMissing, SHA256: a.SHA256, Path: path,
+			Detail: fmt.Sprintf("could not read the sealed original: %v", err),
+		})
+		return
+	}
+
+	r.Bytes += info.Size()
+	// The ciphertext is longer than the plaintext by a header and a tag per
+	// chunk, and by exactly that much — so a file that does not decode to the
+	// length the row records is truncated or is not a vault file at all, and
+	// that is knowable without the key.
+	if plain, err := vault.PlaintextSize(info.Size()); err != nil || plain != a.ByteSize {
+		r.Findings = append(r.Findings, Finding{
+			Kind: VaultMissing, SHA256: a.SHA256, Path: path,
+			Detail: fmt.Sprintf("the sealed original does not hold %d bytes", a.ByteSize),
+		})
+	}
+}
+
 // checkDerivatives confirms an asset that claims a thumbnail or a playback
 // rendition actually has one. A missing derivative is repairable by re-running
 // the job that built it, which is what --fix does.
@@ -305,11 +373,29 @@ func checkDerivatives(ctx context.Context, d Deps, opt Options, r *Report, a db.
 		}
 	}
 
-	if a.PlaybackState == db.DerivedReady && !d.Derivatives.Exists(a.SHA256, derivstore.Playback) {
+	if a.PlaybackState != db.DerivedReady {
+		return
+	}
+	if !d.Derivatives.Exists(a.SHA256, derivstore.Playback) {
 		r.Findings = append(r.Findings, Finding{
 			Kind: DerivativeMissing, SHA256: a.SHA256,
 			Path:   d.Derivatives.Path(a.SHA256, derivstore.Playback),
 			Detail: "marked ready but the playback rendition is gone",
+			Fixed:  opt.Fix && requeue(ctx, d, jobs.KindPlayback, a.ID) == nil,
+		})
+		return
+	}
+
+	// A video with a caption layer keeps a second rendition without it, which
+	// is the only thing the viewer's overlay toggle can show. Checked here
+	// rather than backfilled by hand, so a library transcoded before the layer
+	// was linked — or before this rendition existed at all — is repaired by the
+	// `verify --fix` that already runs weekly.
+	if a.OverlayAssetID != nil && !d.Derivatives.Exists(a.SHA256, derivstore.PlaybackPlain) {
+		r.Findings = append(r.Findings, Finding{
+			Kind: DerivativeMissing, SHA256: a.SHA256,
+			Path:   d.Derivatives.Path(a.SHA256, derivstore.PlaybackPlain),
+			Detail: "carries an overlay but has no rendition without it",
 			Fixed:  opt.Fix && requeue(ctx, d, jobs.KindPlayback, a.ID) == nil,
 		})
 	}
@@ -361,7 +447,7 @@ func sizeList(sizes []int) string {
 // the rename and the append leaves a blob with no line. It is the one finding
 // --fix can resolve completely, because the database still holds everything the
 // line needs.
-func checkManifest(ctx context.Context, d Deps, opt Options, r *Report, indexed map[string]struct{}) error {
+func checkManifest(ctx context.Context, d Deps, opt Options, r *Report, indexed, sealed map[string]struct{}) error {
 	path := filepath.Join(d.PhotosRoot, "manifest.jsonl")
 	logged := make(map[string]struct{}, len(indexed))
 
@@ -374,6 +460,18 @@ func checkManifest(ctx context.Context, d Deps, opt Options, r *Report, indexed 
 			return nil
 		}
 		logged[e.SHA256] = struct{}{}
+
+		// A vaulted original is not in the blob tree, on purpose, and the line
+		// above it in this log still describes it correctly. Reporting it as an
+		// orphan would be a Critical finding — the kind that is meant to wake
+		// somebody up — about a photograph that is exactly where it was put.
+		//
+		// The manifest also carries its own `vault` line, which is what a
+		// rebuild with no database reads. This pass has a database, so it uses
+		// the cheaper answer.
+		if _, hidden := sealed[e.SHA256]; hidden {
+			return nil
+		}
 
 		blob := d.Blobs.Path(e.SHA256, e.Ext)
 		if _, err := os.Stat(blob); os.IsNotExist(err) {

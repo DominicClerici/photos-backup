@@ -65,3 +65,61 @@ export function formatCoords(lat: number, lon: number): string {
 export function mapLink(lat: number, lon: number): string {
   return `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=15/${lat}/${lon}`;
 }
+
+/**
+ * The noun a count is rendered in.
+ *
+ * Two words rather than one plus an "s", because the interesting cases are the
+ * ones a rule gets wrong, and because what a thing is called is a decision the
+ * caller is making — a right-click on a video knows it is about a video.
+ */
+export interface Noun {
+  one: string;
+  many: string;
+}
+
+/** What a selection is called when nothing more specific is known. */
+export const ITEMS: Noun = { one: "photo", many: "photos" };
+
+export function nounFor(kind: "image" | "video"): Noun {
+  return kind === "video" ? { one: "video", many: "videos" } : ITEMS;
+}
+
+export function counted(n: number, noun: Noun = ITEMS): string {
+  return `${n.toLocaleString()} ${n === 1 ? noun.one : noun.many}`;
+}
+
+/**
+ * What a destructive or filing action is about, for the words on its button.
+ *
+ * Three shapes rather than a count and a noun, because the three read
+ * differently and only one of them is countable. An album is called "album" and
+ * not by its title — "Archive album" is unambiguous where "Archive Iceland
+ * 2025" reads like a place. A person *is* called by their name, because that is
+ * the only thing that makes "Archive Brody" mean what it means.
+ */
+export type Subject =
+  | { kind: "items"; count: number; noun?: Noun }
+  | { kind: "album" }
+  | { kind: "person"; name: string };
+
+/**
+ * The label a menu item or a button carries, given what it is about.
+ *
+ * One photograph is called what it is — a photo or a video, which the grid
+ * knows — and several are called items, because a selection of eleven
+ * photographs and two videos is not eleven photos and it is not thirteen
+ * photos. Every verb in the gallery goes through here, so Delete, Archive and
+ * Hide cannot end up describing the same selection three different ways.
+ */
+export function describeAction(verb: string, subject: Subject): string {
+  switch (subject.kind) {
+    case "album":
+      return `${verb} album`;
+    case "person":
+      return `${verb} ${subject.name}`;
+    case "items":
+      if (subject.count === 1) return `${verb} ${(subject.noun ?? ITEMS).one}`;
+      return `${verb} ${subject.count.toLocaleString()} items`;
+  }
+}

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dominicclerici/photos-backup/server/internal/db"
 	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
 	"github.com/dominicclerici/photos-backup/server/internal/takeout"
 )
@@ -31,6 +32,12 @@ type importItem struct {
 	isVideo   bool
 	contentID string
 
+	// source is the import source this item is described under, and it is what
+	// says how the archive should read sidecar. Empty means a Google Takeout,
+	// which is the importer this type was written for and still the only one
+	// that fills in albums or reads a content identifier.
+	source string
+
 	// sidecar is the item's Google JSON, verbatim, or nil. A Live Photo's video
 	// half never has one of its own and borrows the still's — see
 	// inheritSidecars.
@@ -39,9 +46,23 @@ type importItem struct {
 	albums  []takeout.Album
 	trashed bool
 
+	// overlayItem is the drawn-on layer this item was exported with, and
+	// overlaySHA256 is what that layer was archived as once it has been sent.
+	// Only a Snapchat memory has either; see snapchatscan.go.
+	//
+	// Two fields rather than one because they are known at different times:
+	// the pairing comes out of the scan, and the hash only exists after the
+	// overlay's bytes are in the archive.
+	overlayItem   *importItem
+	overlaySHA256 string
+
 	md5     string
 	status  string
 	assetID string
+	// sha256 is what the archive stored the bytes under, learned from the
+	// upload's answer. It is how one item names another to the server, since
+	// asset ids are the database's and the hash is the file's.
+	sha256 string
 }
 
 // mediaFile is one candidate file, carrying where it sits inside the export
@@ -213,6 +234,18 @@ func scanExport(ctx context.Context, exif *exifdata.Reader, roots []string, incl
 
 	sortForPairing(result.items)
 	return result, nil
+}
+
+// importSource is what the archive is told this item's sidecar is written in.
+//
+// The zero value means a Google Takeout rather than "unspecified", because this
+// importer predates there being a second kind and every item it builds without
+// saying otherwise is one.
+func (it *importItem) importSource() string {
+	if it.source == "" {
+		return db.SourceGoogleTakeout
+	}
+	return it.source
 }
 
 func (it *importItem) attachSidecar(raw json.RawMessage) {

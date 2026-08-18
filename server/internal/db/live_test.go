@@ -140,7 +140,7 @@ func TestLiveDeclarationIsIgnoredOnAStill(t *testing.T) {
 		t.Errorf("LiveParentLocalID = %q on an image, want it dropped", got.LiveParentLocalID)
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestTimelineHidesPairedVideosAndReportsTheirState(t *testing.T) {
 		t.Fatalf("record paired video: %v", err)
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestTimelineOmitsLiveStateForAnOrdinaryPhoto(t *testing.T) {
 	ctx := context.Background()
 	seedAsset(t, s, 0, time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestTimelineDrawsAStillOnceWhenTwoDevicesAttachMotion(t *testing.T) {
 		t.Fatalf("record the second device's paired video: %v", err)
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}

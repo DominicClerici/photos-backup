@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/dominicclerici/photos-backup/server/internal/photokit"
+	"github.com/dominicclerici/photos-backup/server/internal/snapchat"
 	"github.com/dominicclerici/photos-backup/server/internal/takeout"
 )
 
@@ -58,14 +59,15 @@ type AlbumRef struct {
 
 // The sources whose sidecars this archive can read.
 //
-// Two of them, and they are not the same kind of thing: one is an export of a
-// service, the other is the device the photographs came off. What makes them
-// one mechanism is that both know things the file does not — a heart, an album,
-// a caption — and neither can be asked again once the export is deleted or the
-// phone is wiped.
+// Three of them, and they are not the same kind of thing: two are exports of a
+// service, the third is the device the photographs came off. What makes them
+// one mechanism is that all of them know things the file does not — a heart, an
+// album, a caption, a coordinate a stripped JPEG lost — and none can be asked
+// again once the export is deleted or the phone is wiped.
 const (
 	SourceGoogleTakeout = "google-takeout"
 	SourcePhotoKit      = "ios-photokit"
+	SourceSnapchat      = snapchat.Source
 )
 
 // ImportMetadataFrom interprets a source's own sidecar.
@@ -88,10 +90,12 @@ func ImportMetadataFrom(source string, sidecar []byte, albums []AlbumRef) (Impor
 		return fromTakeout(sidecar, albums)
 	case SourcePhotoKit:
 		return fromPhotoKit(sidecar, albums)
+	case SourceSnapchat:
+		return fromSnapchat(sidecar, albums)
 	default:
 		return ImportMetadata{}, fmt.Errorf(
-			"unknown import source %q; this archive reads %q and %q",
-			source, SourceGoogleTakeout, SourcePhotoKit)
+			"unknown import source %q; this archive reads %q, %q and %q",
+			source, SourceGoogleTakeout, SourcePhotoKit, SourceSnapchat)
 	}
 }
 
@@ -146,6 +150,37 @@ func fromPhotoKit(sidecar []byte, albums []AlbumRef) (ImportMetadata, error) {
 		// archived, still in the timeline, and flagged for whoever wants to
 		// filter on it.
 		Archived: parsed.Hidden,
+		GPSLat:   parsed.GPSLat,
+		GPSLon:   parsed.GPSLon,
+		Subtypes: parsed.Subtypes,
+		Albums:   albums,
+	}, nil
+}
+
+// fromSnapchat reads what a Snapchat export knew about one file.
+//
+// It carries no caption, no heart and no albums: Snapchat records none of the
+// three. What it has that nothing else does is a coordinate and a capture time
+// for a photograph whose own metadata was stripped on the way out — for a still
+// memory this sidecar is not a supplement to the file, it is the only thing
+// that knows where or when the photograph happened.
+//
+// The archived flag is doing real work here rather than recording an opinion
+// the way it does for a Takeout's bin: it is what keeps a memory's overlay —
+// a lone transparent PNG of somebody's handwriting — out of a grid of
+// photographs while its bytes stay archived and linked to the photo it belongs
+// to.
+func fromSnapchat(sidecar []byte, albums []AlbumRef) (ImportMetadata, error) {
+	parsed, err := snapchat.Normalize(sidecar)
+	if err != nil {
+		return ImportMetadata{}, err
+	}
+
+	return ImportMetadata{
+		Source:   SourceSnapchat,
+		Raw:      parsed.Raw,
+		Archived: parsed.Archived,
+		TakenAt:  parsed.TakenAt,
 		GPSLat:   parsed.GPSLat,
 		GPSLon:   parsed.GPSLon,
 		Subtypes: parsed.Subtypes,
@@ -368,6 +403,11 @@ func applyPeople(ctx context.Context, tx pgx.Tx, assetID string, names []string)
 // Albums are keyed by (source, title) rather than by id, because the export has
 // no album ids — a directory name is the whole identity — and because that is
 // what makes running the import twice produce one album rather than two.
+//
+// The key covers live albums only, which is why the conflict target names the
+// predicate as well as the columns. Re-importing after somebody deleted the
+// album by hand makes a new one rather than resurrecting what they threw away.
+// See migration 0013.
 func applyAlbums(ctx context.Context, tx pgx.Tx, assetID, source string, albums []AlbumRef) error {
 	for _, album := range albums {
 		if album.Title == "" {
@@ -377,7 +417,7 @@ func applyAlbums(ctx context.Context, tx pgx.Tx, assetID, source string, albums 
 		const upsert = `
 			insert into albums (source, title, description)
 			values ($1, $2, $3)
-			on conflict (source, title) do update
+			on conflict (source, title) where deleted_at is null do update
 				set description = coalesce(nullif(excluded.description, ''), albums.description)
 			returning id::text`
 		if err := tx.QueryRow(ctx, upsert, source, album.Title, album.Description).Scan(&albumID); err != nil {
@@ -407,7 +447,7 @@ func (s *Store) AssetExtras(ctx context.Context, assetID string) (AssetExtras, e
 	const albums = `
 		select a.title from album_assets m
 		join albums a on a.id = m.album_id
-		where m.asset_id = $1::uuid
+		where m.asset_id = $1::uuid and a.deleted_at is null
 		order by a.title`
 	if err := collect(ctx, s, albums, assetID, &out.Albums); err != nil {
 		return out, fmt.Errorf("load albums for %s: %w", assetID, err)

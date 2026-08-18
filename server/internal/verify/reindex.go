@@ -41,7 +41,11 @@ type ReindexResult struct {
 	// Orphans counts what an import could not attach, restored to the table it
 	// was recorded in rather than onto an asset — see db.ImportOrphan.
 	Orphans int64
-	Elapsed time.Duration
+	// Retracted counts assets a purge line took back out. See KindPurge: the
+	// manifest records deliberate destruction as well as arrival, and a rebuild
+	// that ignored those lines would resurrect everything ever deleted.
+	Retracted int64
+	Elapsed   time.Duration
 }
 
 // Reindex rebuilds the database from manifest.jsonl and the blob tree.
@@ -61,6 +65,13 @@ func Reindex(ctx context.Context, d Deps, opt ReindexOptions) (ReindexResult, er
 
 	seen := make(map[string]struct{})
 	var pending []manifest.Entry
+	// Digests a purge line has taken back, and the line that took them. Held
+	// rather than acted on, because the log is replayed in the order it was
+	// written and a purge line is always after the asset line it retracts —
+	// and, for content that was purged and later archived again, before the
+	// asset line that reinstates it. The last line about a digest wins, which
+	// is what this map ends up holding.
+	retracted := make(map[string]manifest.Entry)
 	path := filepath.Join(d.PhotosRoot, "manifest.jsonl")
 
 	err := manifest.Scan(path, func(e manifest.Entry) error {
@@ -81,6 +92,14 @@ func Reindex(ctx context.Context, d Deps, opt ReindexOptions) (ReindexResult, er
 		if e.SHA256 == "" {
 			return nil
 		}
+		if e.Type == manifest.KindPurge {
+			retracted[e.SHA256] = e
+			// Marked as accounted for, so that a blob whose unlink failed —
+			// or one restored from a backup taken before the purge — is not
+			// adopted straight back into the library by the orphan pass.
+			seen[e.SHA256] = struct{}{}
+			return nil
+		}
 		if !e.IsAsset() {
 			// A line describing an asset rather than recording one. Held back
 			// and applied at the end, because the asset it names may be
@@ -91,6 +110,9 @@ func Reindex(ctx context.Context, d Deps, opt ReindexOptions) (ReindexResult, er
 			return nil
 		}
 		seen[e.SHA256] = struct{}{}
+		// This content is in the archive again after having been thrown away,
+		// which is the one thing that un-retracts a digest.
+		delete(retracted, e.SHA256)
 
 		asset, ok, err := assetFromEntry(d, e)
 		if err != nil {
@@ -120,10 +142,14 @@ func Reindex(ctx context.Context, d Deps, opt ReindexOptions) (ReindexResult, er
 	}
 
 	if !opt.DryRun {
+		if err := applyPurges(ctx, d, retracted, &result); err != nil {
+			return result, err
+		}
 		if err := replayImports(ctx, d, pending, &result); err != nil {
 			return result, err
 		}
 	} else {
+		result.Retracted = int64(len(retracted))
 		for _, e := range pending {
 			if e.Type == manifest.KindImportOrphan {
 				result.Orphans++
@@ -386,4 +412,39 @@ func headOf(path string) []byte {
 		return nil
 	}
 	return buf[:n]
+}
+
+// applyPurges takes back what the log says was deliberately destroyed, and
+// restores the tombstones that keep it from being uploaded again.
+//
+// Done at the end rather than as the lines arrive because a purge line is a
+// statement about a digest, not a position: it may be read long after the asset
+// line it retracts, and the rows the replay has been inserting are the ones it
+// has to reach.
+func applyPurges(ctx context.Context, d Deps, retracted map[string]manifest.Entry, result *ReindexResult) error {
+	if len(retracted) == 0 {
+		return nil
+	}
+
+	shas := make([]string, 0, len(retracted))
+	tombstones := make([]db.Purged, 0, len(retracted))
+	for sha, e := range retracted {
+		shas = append(shas, sha)
+		tombstones = append(tombstones, db.Purged{
+			SHA256: sha, MD5: e.MD5, ByteSize: e.Size, Filename: e.Filename,
+		})
+	}
+
+	// The tombstones go in first. A row that is gone and a content key that was
+	// never recorded is a photograph the next backup uploads again, and if this
+	// is interrupted the harmless half is the one already done.
+	if err := d.Store.RecordPurged(ctx, tombstones); err != nil {
+		return fmt.Errorf("record purged content: %w", err)
+	}
+	dropped, err := d.Store.DropBySHA256(ctx, shas)
+	if err != nil {
+		return fmt.Errorf("drop purged assets: %w", err)
+	}
+	result.Retracted = int64(dropped)
+	return nil
 }

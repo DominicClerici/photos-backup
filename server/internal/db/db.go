@@ -79,6 +79,30 @@ type Asset struct {
 	// "google-takeout". Empty on anything a device uploaded directly.
 	ImportSource string
 
+	// OverlayAssetID is the archived caption layer drawn over this one, for a
+	// Snapchat memory. Nil on everything else, which is nearly everything: it
+	// is the whole of what tells the derivative pipeline to render a composite
+	// rather than the file it was handed. See LinkOverlay.
+	OverlayAssetID *string
+	// IsOverlay is set on the layer itself and keeps it out of the timeline. It
+	// is a component of another asset's picture, not a picture.
+	IsOverlay bool
+
+	// DeletedAt is when this asset was moved to the trash, and nil for the
+	// whole live library. PurgeAfter is when it stops being recoverable. See
+	// trash.go — nothing else in this package reads them, because everything
+	// else asks the timeline's scope rather than the row.
+	DeletedAt  *time.Time
+	PurgeAfter *time.Time
+
+	// Vault is "archive", "hidden", or empty for the library.
+	//
+	// Unlike DeletedAt this one *is* read outside the scope predicates, by the
+	// media endpoints: an asset in the vault has no plaintext on disk and no
+	// extension left on its row, so every path that would have opened a file
+	// has to know to go and ask for the key instead. See internal/vault.
+	Vault string
+
 	// SortTime is the generated column the timeline orders on:
 	// exif capture time, else the phone's, else arrival.
 	SortTime time.Time
@@ -245,6 +269,8 @@ const assetColumns = `id, sha256, md5, byte_size, original_filename, ext,
 	gps_lat, gps_lon, exif_captured_at, exif_offset_minutes,
 	live_parent_local_id, live_parent_asset_id::text, live_state, content_id,
 	coalesce(description, ''), favorite, archived, import_source,
+	overlay_asset_id::text, is_overlay,
+	deleted_at, purge_after, vault,
 	sort_time, derived_state, playback_state`
 
 // RecordAsset stores an asset and the mapping from the local asset that
@@ -490,6 +516,8 @@ func scanAsset(s scanner) (Asset, error) {
 		&a.GPSLat, &a.GPSLon, &a.ExifCapturedAt, &a.ExifOffsetMinutes,
 		&a.LiveParentLocalID, &a.LiveParentAssetID, &a.LiveState, &a.ContentID,
 		&a.Description, &a.Favorite, &a.Archived, &a.ImportSource,
+		&a.OverlayAssetID, &a.IsOverlay,
+		&a.DeletedAt, &a.PurgeAfter, &a.Vault,
 		&a.SortTime, &a.DerivedState, &a.PlaybackState)
 	return a, err
 }

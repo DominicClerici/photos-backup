@@ -87,8 +87,18 @@ func (h *harness) ingest(t *testing.T, fixture, mediaKind string) db.Asset {
 	if err != nil {
 		t.Fatalf("read fixture %s: %v", fixture, err)
 	}
+	return h.ingestBytes(t, fixture, mediaKind, body)
+}
+
+// ingestBytes is the same path for content that is generated rather than
+// checked in — a Snapchat caption layer, whose whole job is to be a shape and a
+// size no fixture happens to be.
+func (h *harness) ingestBytes(t *testing.T, name, mediaKind string, body []byte) db.Asset {
+	t.Helper()
+
 	sum := md5.Sum(body)
-	ext := filepath.Ext(fixture)
+	ext := filepath.Ext(name)
+	fixture := name
 
 	res, err := h.Blobs.Put(bytes.NewReader(body), ext, blobstore.Expected{
 		MD5:  hex.EncodeToString(sum[:]),

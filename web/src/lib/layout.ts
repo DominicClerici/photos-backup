@@ -12,8 +12,18 @@
 // which makes any tile's position a couple of multiply-adds and keeps the total
 // scroll height exact from the first frame: the scrollbar never jumps as pages
 // load, and any scroll position resolves to an item with a binary search.
+//
+// "From the first frame" is meant literally. The day model is built from the
+// server's day table — every heading in the collection and how many tiles hang
+// under it — rather than from the items that happen to have arrived, so the
+// grid is laid out at full size before a single photograph has been fetched.
+// Everything below therefore describes positions the timeline *has*, whether or
+// not anything is drawn in them yet, and an index into it is a stable address
+// for a photo the client may not be holding. That is what lets a placeholder
+// and the tile that replaces it occupy exactly the same square, and what a
+// selection spanning off-screen photos will eventually be expressed in.
 
-import type { TimelineItem } from "./api";
+import type { DayRun } from "./api";
 
 export const DEFAULT_GAP = 4;
 export const DEFAULT_HEADER_HEIGHT = 52;
@@ -88,14 +98,13 @@ export interface GridMetrics {
 /** A run of consecutive items sharing a calendar day, as indices into the list. */
 export interface Day {
   /**
-   * Identity of the run, unique across the list and stable as pages append.
+   * Identity of the run, unique across the list.
    *
-   * The date is not unique on its own. Items arrive ordered by instant but are
-   * filed under their own local day, so a photo taken across a timezone
-   * boundary can put a date either side of another one and leave that date
-   * split into two runs — which as a React key means two siblings claiming to
-   * be the same node. The start index disambiguates them, and paging only ever
-   * appends, so it never changes once assigned.
+   * The date is not unique on its own. Items are ordered by instant but filed
+   * under their own local day, so a photo taken across a timezone boundary can
+   * put a date either side of another one and leave that date split into two
+   * runs — which as a React key means two siblings claiming to be the same
+   * node. The start index disambiguates them.
    */
   id: string;
   /** The YYYY-MM-DD this run falls under; shared by every item in it. */
@@ -184,21 +193,6 @@ function pad(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-// buildDays runs again on every page append, so without this a full scroll
-// through a large library re-parses every timestamp it has already seen —
-// quadratic work for a list that only ever grows at the end. Item objects are
-// stable across rebuilds, so keying on identity hits nearly always.
-const dayKeyCache = new WeakMap<TimelineItem, string>();
-
-function cachedDayKey(it: TimelineItem): string {
-  let key = dayKeyCache.get(it);
-  if (key === undefined) {
-    key = dayKeyOf(it.taken_at, it.offset_minutes);
-    dayKeyCache.set(it, key);
-  }
-  return key;
-}
-
 /** Renders a YYYY-MM-DD key for display, in UTC so the key cannot drift. */
 export function dayLabelOf(dayKey: string, now: Date = new Date()): string {
   const [y, m, d] = dayKey.split("-").map(Number);
@@ -214,31 +208,40 @@ export function dayLabelOf(dayKey: string, now: Date = new Date()): string {
 }
 
 /**
- * Splits an already-sorted item list into days.
+ * Turns the server's day table into the grid's day model.
  *
- * Items must arrive newest-first, which is the order the timeline endpoint
- * returns. Days are detected by scanning for a change in day key rather than by
- * bucketing into a map, so paging in more items only ever appends — and an
- * item's day index and its offset inside that day never change once assigned,
- * which is what lets the render loop cache them on the DOM.
+ * The only thing added is `start`, the running total — which is what turns a
+ * table of counts into an address space. Every item in the collection has an
+ * index in it before any of them are loaded, so a heading, a placeholder and
+ * the photograph that eventually fills it all agree on where they belong.
+ *
+ * Runs arrive in timeline order and are never re-sorted. A date can appear more
+ * than once and the dates need not descend: items are ordered by instant and
+ * filed under their own local day, so a photo taken either side of a timezone
+ * hop can put a date on both sides of another one. The table describes the
+ * timeline's shape rather than tidying it.
  */
-export function buildDays(items: TimelineItem[]): Day[] {
-  const days: Day[] = [];
-  let i = 0;
-  while (i < items.length) {
-    const key = cachedDayKey(items[i]);
-    let end = i;
-    while (end < items.length && cachedDayKey(items[end]) === key) end++;
-    days.push({
-      id: `${key}#${i}`,
-      key,
-      label: dayLabelOf(key),
-      start: i,
-      count: end - i,
-    });
-    i = end;
+export function daysFrom(runs: DayRun[]): Day[] {
+  const days: Day[] = new Array(runs.length);
+  let start = 0;
+  for (let i = 0; i < runs.length; i++) {
+    days[i] = {
+      id: `${runs[i].day}#${start}`,
+      key: runs[i].day,
+      label: dayLabelOf(runs[i].day),
+      start,
+      count: runs[i].count,
+    };
+    start += runs[i].count;
   }
   return days;
+}
+
+/** How many items the day model accounts for. */
+export function countOf(days: Day[]): number {
+  if (days.length === 0) return 0;
+  const last = days[days.length - 1];
+  return last.start + last.count;
 }
 
 /** Stacks the days into one column of headings and tile rows at a fixed cell size. */

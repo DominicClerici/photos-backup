@@ -53,7 +53,9 @@ export function ZoomSlider({ zoom }: { zoom: Zoom }) {
   return (
     <div
       className={cn(
-        "fixed bottom-7 left-1/2 z-20 -translate-x-1/2",
+        // Above the tab bar, which holds the bottom of the screen permanently;
+        // this one comes and goes, so it is the one that moves out of the way.
+        "fixed bottom-24 left-1/2 z-20 -translate-x-1/2",
         phase === "hidden" && "pointer-events-none",
       )}
       style={{

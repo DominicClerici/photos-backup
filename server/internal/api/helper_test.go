@@ -30,6 +30,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/livecache"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
+	"github.com/dominicclerici/photos-backup/server/internal/vault"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
 )
 
@@ -106,8 +107,18 @@ func newHarness(t *testing.T) *harness {
 		Queue:        jobs.NewQueue(store.Pool()),
 		Uploads:      uploads.New(filepath.Join(root, "incoming")),
 		Devices:      h.devices,
-		Nudge:        func() { h.nudges.Add(1) },
-		Log:          slog.New(slog.DiscardHandler),
+		Vault: &vault.Service{
+			Store:            store,
+			Blobs:            blobstore.New(root),
+			Derivatives:      derivstore.New(derivRoot),
+			VaultBlobs:       vault.NewStore(filepath.Join(root, "vault")),
+			VaultDerivatives: vault.NewStore(filepath.Join(derivRoot, "vault")),
+			Manifest:         manifest.New(manifestPath),
+			Keeper:           vault.NewKeeper(time.Minute),
+			Log:              slog.New(slog.DiscardHandler),
+		},
+		Nudge: func() { h.nudges.Add(1) },
+		Log:   slog.New(slog.DiscardHandler),
 	}
 
 	ts := httptest.NewServer(h.srv.Handler())
@@ -170,7 +181,7 @@ func (h *harness) derive(t *testing.T, assetID string) {
 		defer cleanup()
 		targets = append(targets, derive.ThumbTarget{Size: size, Path: staged})
 	}
-	if err := h.srv.Converter.Thumbs(ctx, src, targets); err != nil {
+	if err := h.srv.Converter.Thumbs(ctx, src, nil, targets); err != nil {
 		t.Fatalf("write thumbs: %v", err)
 	}
 	for _, target := range targets {
@@ -389,6 +400,9 @@ func truncateAssets(t *testing.T, ctx context.Context, url string) {
 	}
 	defer conn.Close(ctx)
 	// Named rather than `cascade`, so a future table with a foreign key here has
-	// to be added deliberately instead of silently wiped.
-	_, _ = conn.Exec(ctx, "truncate table assets, device_assets, jobs, pairing_codes, devices cascade")
+	// to be added deliberately instead of silently wiped. albums and
+	// purged_content are named too because they are the two tables that do not
+	// hang off assets: membership and tombstones would otherwise survive into
+	// the next test and be counted by it.
+	_, _ = conn.Exec(ctx, "truncate table assets, device_assets, jobs, pairing_codes, devices, albums, purged_content, vault_people, vault_secret cascade")
 }

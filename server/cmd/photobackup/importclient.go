@@ -232,9 +232,10 @@ func (c *importClient) describe(assetID string, it *importItem) error {
 	}
 
 	resp, err := c.postJSON("/v1/assets/"+assetID+"/import-metadata", map[string]any{
-		"source":  "google-takeout",
-		"sidecar": it.sidecar,
-		"albums":  albums,
+		"source":        it.importSource(),
+		"sidecar":       it.sidecar,
+		"albums":        albums,
+		"overlaySha256": it.overlaySHA256,
 	})
 	if err != nil {
 		return err
@@ -254,9 +255,9 @@ func (c *importClient) describe(assetID string, it *importItem) error {
 // something and I could not tell you what". Both have to reach the archive,
 // because the export is deleted afterwards and only one of them can be
 // recovered by looking at the files again.
-func (c *importClient) orphan(kind, locator, assetID string, sidecar json.RawMessage, albums []takeout.Album, reason string) error {
+func (c *importClient) orphan(source, kind, locator, assetID string, sidecar json.RawMessage, albums []takeout.Album, reason string) error {
 	payload := map[string]any{
-		"source":  "google-takeout",
+		"source":  source,
 		"kind":    kind,
 		"locator": locator,
 		"reason":  reason,

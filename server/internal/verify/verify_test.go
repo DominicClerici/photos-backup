@@ -370,3 +370,60 @@ func TestEmptyArchiveIsClean(t *testing.T) {
 		t.Error("an empty archive reported critical")
 	}
 }
+
+// A Snapchat memory's video keeps two renditions: the one with the caption
+// burned in that everything plays by default, and the one without it that the
+// viewer's toggle shows. The second is invisible to every other check — the
+// asset is marked ready and its playback file is right there — so it is checked
+// on its own, which is what makes `verify --fix` the backfill for a library
+// transcoded before the layer was linked.
+func TestAVideoWithAnOverlayIsRequeuedForTheRenditionWithoutIt(t *testing.T) {
+	a := newArchive(t)
+	ctx := context.Background()
+
+	clip := a.add(t, "clip.mov", fixture(t, "clip.mov"), captured)
+	layer := a.add(t, "2017-09-02_abc-overlay.png", fixture(t, "photo.jpg"), captured)
+	if err := a.store.LinkOverlay(ctx, clip.ID, layer.SHA256); err != nil {
+		t.Fatalf("LinkOverlay: %v", err)
+	}
+
+	for _, suffix := range []string{derivstore.Thumb, derivstore.Playback} {
+		if err := a.derivs.Write(clip.SHA256, suffix, func(w io.Writer) error {
+			_, err := w.Write([]byte("a rendition"))
+			return err
+		}); err != nil {
+			t.Fatalf("write %s: %v", suffix, err)
+		}
+	}
+	if err := a.store.SetPlaybackState(ctx, clip.ID, db.DerivedReady); err != nil {
+		t.Fatalf("set playback state: %v", err)
+	}
+
+	report := a.run(t, verify.Options{Fix: true})
+	var found *verify.Finding
+	for i, f := range report.Findings {
+		if f.Kind == verify.DerivativeMissing && f.SHA256 == clip.SHA256 {
+			found = &report.Findings[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("the missing plain rendition was not reported: %v", report.Findings)
+	}
+	if !strings.Contains(found.Detail, "overlay") {
+		t.Errorf("finding does not say what is missing: %s", found.Detail)
+	}
+	if !found.Fixed {
+		t.Error("--fix did not requeue the transcode")
+	}
+
+	var pending int
+	err := a.store.Pool().QueryRow(ctx,
+		`select count(*) from jobs where asset_id = $1 and kind = 'playback' and state = 'pending'`,
+		clip.ID).Scan(&pending)
+	if err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if pending != 1 {
+		t.Errorf("%d pending playback jobs, want 1", pending)
+	}
+}

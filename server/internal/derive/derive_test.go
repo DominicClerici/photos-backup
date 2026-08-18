@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"path/filepath"
 	"sync"
@@ -54,7 +57,7 @@ func TestThumbsAreAlwaysSquareAtEverySize(t *testing.T) {
 	// letterboxing, and 512 is past the original — the small sizes must not
 	// inherit anything from that.
 	want := targets(t, 96, 256, 512)
-	if err := New().Thumbs(context.Background(), fixture("sample.heic"), want); err != nil {
+	if err := New().Thumbs(context.Background(), fixture("sample.heic"), nil, want); err != nil {
 		t.Fatalf("Thumbs: %v\n\nIs ImageMagick installed with the libheif delegate?", err)
 	}
 
@@ -70,7 +73,7 @@ func TestThumbsAreAlwaysSquareAtEverySize(t *testing.T) {
 // one aspect ratio, the grid's fixed row height would break.
 func TestThumbsSquareARealIPhonePortrait(t *testing.T) {
 	want := targets(t, 96, 256, 512)
-	if err := New().Thumbs(context.Background(), fixture("iphone-portrait.heic"), want); err != nil {
+	if err := New().Thumbs(context.Background(), fixture("iphone-portrait.heic"), nil, want); err != nil {
 		t.Fatalf("Thumbs: %v", err)
 	}
 
@@ -86,7 +89,7 @@ func TestThumbsSquareARealIPhonePortrait(t *testing.T) {
 // order has to mean the same thing.
 func TestThumbsDoNotDependOnTheOrderAskedFor(t *testing.T) {
 	want := targets(t, 256, 512, 96)
-	if err := New().Thumbs(context.Background(), fixture("iphone-portrait.heic"), want); err != nil {
+	if err := New().Thumbs(context.Background(), fixture("iphone-portrait.heic"), nil, want); err != nil {
 		t.Fatalf("Thumbs: %v", err)
 	}
 
@@ -100,7 +103,7 @@ func TestThumbsDoNotDependOnTheOrderAskedFor(t *testing.T) {
 
 func TestThumbsHonorAnyRequestedSize(t *testing.T) {
 	want := targets(t, 64)
-	if err := New().Thumbs(context.Background(), fixture("sample.heic"), want); err != nil {
+	if err := New().Thumbs(context.Background(), fixture("sample.heic"), nil, want); err != nil {
 		t.Fatalf("Thumbs: %v", err)
 	}
 
@@ -115,7 +118,7 @@ func TestPreviewPreservesAspectRatio(t *testing.T) {
 	c.PreviewSize = 100
 
 	var out bytes.Buffer
-	if err := c.Preview(context.Background(), fixture("sample.heic"), &out); err != nil {
+	if err := c.Preview(context.Background(), fixture("sample.heic"), nil, &out); err != nil {
 		t.Fatalf("Preview: %v", err)
 	}
 
@@ -129,7 +132,7 @@ func TestPreviewPreservesAspectRatio(t *testing.T) {
 // blown up into a larger, blurrier file than the source.
 func TestPreviewDoesNotUpscaleASmallOriginal(t *testing.T) {
 	var out bytes.Buffer
-	if err := New().Preview(context.Background(), fixture("sample.heic"), &out); err != nil {
+	if err := New().Preview(context.Background(), fixture("sample.heic"), nil, &out); err != nil {
 		t.Fatalf("Preview: %v", err)
 	}
 
@@ -146,7 +149,7 @@ func TestPreviewRotatesAccordingToOrientation(t *testing.T) {
 	c.PreviewSize = 800
 
 	var out bytes.Buffer
-	if err := c.Preview(context.Background(), fixture("iphone-portrait.heic"), &out); err != nil {
+	if err := c.Preview(context.Background(), fixture("iphone-portrait.heic"), nil, &out); err != nil {
 		t.Fatalf("Preview: %v", err)
 	}
 
@@ -195,7 +198,7 @@ func TestPreviewRunsConcurrentlyUpToTheCap(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			var out bytes.Buffer
-			if err := c.Preview(context.Background(), fixture("sample.heic"), &out); err != nil {
+			if err := c.Preview(context.Background(), fixture("sample.heic"), nil, &out); err != nil {
 				errs <- err
 			}
 		}()
@@ -223,7 +226,7 @@ func TestThumbsRenderAJPEGThatKeptARawExtension(t *testing.T) {
 	}
 
 	want := targets(t, 96, 512)
-	if err := New().Thumbs(context.Background(), mislabeled, want); err != nil {
+	if err := New().Thumbs(context.Background(), mislabeled, nil, want); err != nil {
 		t.Fatalf("Thumbs on a JPEG named .dng: %v", err)
 	}
 	for _, target := range want {
@@ -280,12 +283,151 @@ func TestSourceKeepsTheFrameSelectorWithACoder(t *testing.T) {
 }
 
 func TestConversionReportsTheFailingInput(t *testing.T) {
-	err := New().Thumbs(context.Background(), fixture("does-not-exist.heic"), targets(t, 256))
+	err := New().Thumbs(context.Background(), fixture("does-not-exist.heic"), nil, targets(t, 256))
 	if err == nil {
 		t.Fatal("Thumbs succeeded on a missing file, want an error")
 	}
 	// The error text lands in jobs.last_error, so it has to identify the file.
 	if !bytes.Contains([]byte(err.Error()), []byte("does-not-exist.heic")) {
 		t.Errorf("error does not mention the failing input: %v", err)
+	}
+}
+
+// layerFixture writes a PNG that is opaque red over its left half and fully
+// transparent over its right, deliberately at a size and aspect ratio that
+// match no fixture: a Snapchat caption layer is the phone's screen and the
+// photograph is what the camera captured to fill it, and across this archive
+// the two never once agree.
+func layerFixture(t *testing.T, width, height int) string {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	for y := range height {
+		for x := range width / 2 {
+			img.Set(x, y, color.NRGBA{R: 255, A: 255})
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "overlay.png")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create layer: %v", err)
+	}
+	defer f.Close()
+	if err := png.Encode(f, img); err != nil {
+		t.Fatalf("encode layer: %v", err)
+	}
+	return path
+}
+
+// at reads one pixel out of a rendition, as 8-bit RGB.
+func at(t *testing.T, out *bytes.Buffer, x, y int) (r, g, b uint8) {
+	t.Helper()
+	img, err := webp.Decode(bytes.NewReader(out.Bytes()))
+	if err != nil {
+		t.Fatalf("output is not decodable WebP: %v", err)
+	}
+	cr, cg, cb, _ := img.At(x, y).RGBA()
+	return uint8(cr >> 8), uint8(cg >> 8), uint8(cb >> 8)
+}
+
+// The layer is stretched to the photograph's frame rather than placed at its
+// own size, so a caption written across the middle of a phone screen lands
+// across the middle of the picture whatever resolution either file happens to
+// be. Half the layer is transparent, which is the half that proves it is being
+// composed rather than drawn over.
+func TestPreviewComposesALayerOverThePhotograph(t *testing.T) {
+	c := New()
+	// The fixture is 400x300; the layer is a different size and a different
+	// shape, which is the whole point.
+	layer := &Layer{Path: layerFixture(t, 101, 253), Width: 400, Height: 300}
+
+	var plain bytes.Buffer
+	if err := c.Preview(context.Background(), fixture("sample.heic"), nil, &plain); err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	var composed bytes.Buffer
+	if err := c.Preview(context.Background(), fixture("sample.heic"), layer, &composed); err != nil {
+		t.Fatalf("Preview with a layer: %v", err)
+	}
+
+	if w, h := decode(t, &composed); w != 400 || h != 300 {
+		t.Errorf("composite is %dx%d, want the photograph's own 400x300", w, h)
+	}
+
+	if r, g, b := at(t, &composed, 100, 150); r < 200 || g > 60 || b > 60 {
+		t.Errorf("the layer's own half reads rgb(%d,%d,%d), want it drawn in red", r, g, b)
+	}
+
+	// And the transparent half is untouched, to the tolerance two lossy
+	// encodes of the same pixels can be expected to agree to.
+	wantR, wantG, wantB := at(t, &plain, 300, 150)
+	gotR, gotG, gotB := at(t, &composed, 300, 150)
+	for _, d := range []struct {
+		name     string
+		got, was uint8
+	}{{"red", gotR, wantR}, {"green", gotG, wantG}, {"blue", gotB, wantB}} {
+		if diff := int(d.got) - int(d.was); diff > 8 || diff < -8 {
+			t.Errorf("the layer's transparent half changed the %s channel: %d, was %d",
+				d.name, d.got, d.was)
+		}
+	}
+}
+
+// A caller that has not read the photograph yet — a preview requested while the
+// metadata job that records width and height is still queued — leaves the size
+// at zero and gets the same picture, one `magick identify` later.
+func TestPreviewMeasuresThePhotographWhenTheLayerDoesNotSayHowBig(t *testing.T) {
+	layer := &Layer{Path: layerFixture(t, 101, 253)}
+
+	var out bytes.Buffer
+	if err := New().Preview(context.Background(), fixture("sample.heic"), layer, &out); err != nil {
+		t.Fatalf("Preview with an unmeasured layer: %v", err)
+	}
+	if w, h := decode(t, &out); w != 400 || h != 300 {
+		t.Errorf("composite is %dx%d, want the photograph's own 400x300", w, h)
+	}
+	if r, g, b := at(t, &out, 100, 150); r < 200 || g > 60 || b > 60 {
+		t.Errorf("the layer's own half reads rgb(%d,%d,%d), want it drawn in red", r, g, b)
+	}
+}
+
+// The layer goes on before the square crop, so the grid's tile shows the same
+// picture the viewer does rather than a caption in a different place.
+func TestThumbsComposeTheLayerBeforeCropping(t *testing.T) {
+	layer := &Layer{Path: layerFixture(t, 101, 253), Width: 400, Height: 300}
+
+	want := targets(t, 256)
+	if err := New().Thumbs(context.Background(), fixture("sample.heic"), layer, want); err != nil {
+		t.Fatalf("Thumbs with a layer: %v", err)
+	}
+	if w, h := decodeFile(t, want[0].Path); w != 256 || h != 256 {
+		t.Errorf("thumb is %dx%d, want 256x256", w, h)
+	}
+
+	data, err := os.ReadFile(want[0].Path)
+	if err != nil {
+		t.Fatalf("read thumb: %v", err)
+	}
+	buf := bytes.NewBuffer(data)
+	// A 400x300 photograph cropped square keeps its middle 300 columns, so the
+	// layer's red half covers the left 50 of the 256 that survive.
+	if r, g, b := at(t, buf, 20, 128); r < 200 || g > 60 || b > 60 {
+		t.Errorf("the cropped thumb reads rgb(%d,%d,%d) where the layer is, want red", r, g, b)
+	}
+}
+
+// A layer naming a file that is not there must fail loudly rather than
+// silently rendering the photograph alone: a memory quietly missing its caption
+// looks exactly like a memory that never had one.
+func TestConversionReportsAMissingLayer(t *testing.T) {
+	layer := &Layer{Path: filepath.Join(t.TempDir(), "gone.png"), Width: 400, Height: 300}
+
+	var out bytes.Buffer
+	err := New().Preview(context.Background(), fixture("sample.heic"), layer, &out)
+	if err == nil {
+		t.Fatal("Preview succeeded with a missing layer, want an error")
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("gone.png")) {
+		t.Errorf("error does not mention the missing layer: %v", err)
 	}
 }

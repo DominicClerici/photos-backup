@@ -63,7 +63,7 @@ func TestRecordAssetIsIdempotentOnSHA256(t *testing.T) {
 		t.Errorf("duplicate returned id %q, want the original %q", secondID, firstID)
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}
@@ -424,7 +424,7 @@ func TestTimelineOrdersNewestFirst(t *testing.T) {
 		seedAsset(t, s, i, ts)
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestTimelinePrefersTheCaptureTimeReadFromTheFile(t *testing.T) {
 		t.Fatalf("ApplyMetadata: %v", err)
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}
@@ -490,7 +490,7 @@ func TestTimelineCarriesTheFilesUTCOffset(t *testing.T) {
 		t.Fatalf("ApplyMetadata: %v", err)
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}
@@ -531,7 +531,7 @@ func TestTimelinePagesWithoutSkippingOrRepeating(t *testing.T) {
 	var seen []string
 	var cursor *Cursor
 	for range total { // bounded so a broken cursor cannot spin forever
-		page, err := s.Timeline(ctx, cursor, 3)
+		page, err := s.Timeline(ctx, TimelineFilter{}, cursor, 3)
 		if err != nil {
 			t.Fatalf("Timeline: %v", err)
 		}
@@ -574,7 +574,7 @@ func TestTimelinePagesThroughAssetsSharingATimestamp(t *testing.T) {
 	unique := make(map[string]bool)
 	var cursor *Cursor
 	for range 5 {
-		page, err := s.Timeline(ctx, cursor, 2)
+		page, err := s.Timeline(ctx, TimelineFilter{}, cursor, 2)
 		if err != nil {
 			t.Fatalf("Timeline: %v", err)
 		}
@@ -611,7 +611,7 @@ func TestTimelineIncludesAssetsWhoseDerivativesAreNotReady(t *testing.T) {
 		t.Fatalf("SetDerivedState: %v", err)
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}

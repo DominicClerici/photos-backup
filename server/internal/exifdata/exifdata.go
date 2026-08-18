@@ -649,14 +649,30 @@ func (r *Reader) ScanTree(ctx context.Context, root string, fn func(Scanned) err
 	// Decoded a record at a time. The whole-tree JSON for a large export is
 	// tens of megabytes, and there is no reason for any of it to be resident
 	// once the caller has been handed it.
-	scanErr := scanTree(bufio.NewReaderSize(stdout, 64*1024), fn)
+	var read int
+	scanErr := scanTree(bufio.NewReaderSize(stdout, 64*1024), func(s Scanned) error {
+		read++
+		return fn(s)
+	})
 
 	// Drained either way: a decoder that stopped early leaves exiftool blocked
 	// on a write to a pipe nobody is reading, and Wait would never return.
 	_, _ = io.Copy(io.Discard, stdout)
-	if err := cmd.Wait(); err != nil && scanErr == nil {
-		// Exit status 1 with no output at all is "found nothing to read",
-		// which an empty or media-free directory legitimately produces.
+	if err := cmd.Wait(); err != nil && scanErr == nil && read == 0 {
+		// Anything it could describe, it described, so a non-zero exit after a
+		// tree it did describe is exiftool reporting the files it could not
+		// read — which is the documented contract of this function and not a
+		// reason to abandon the ones it could.
+		//
+		// It has to be tolerated rather than merely tidy: a Snapchat export's
+		// chat media contains encrypted blobs that nothing has the key for —
+		// 15 of 4,142 in the real one — and exiting non-zero for those was
+		// enough to refuse the other 4,127. The same was true, unnoticed, of
+		// any single corrupt file anywhere in a 50,000-file Takeout.
+		//
+		// Nothing read at all is the case still worth failing on: an empty
+		// directory produces it, and so does a bad binary or an unreadable
+		// path, and the difference between those is in the message.
 		return fmt.Errorf("exiftool %s: %w: %s", root, err, bytes.TrimSpace(stderr.Bytes()))
 	}
 	return scanErr

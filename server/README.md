@@ -34,6 +34,8 @@ proxies `/api/*` here; see its README to bring the browser side up.
 | `VIDEO_ENCODER` | `libx264` | ffmpeg encoder for playback renditions; `h264_nvenc` on an NVIDIA host |
 | `MAGICK_BIN` / `FFMPEG_BIN` / `FFPROBE_BIN` / `EXIFTOOL_BIN` | on `PATH` | binary overrides |
 | `UPLOAD_SESSION_TTL` | `24h` | how long an abandoned partial upload is kept |
+| `PURGE_INTERVAL` | `1h` | how often the trash is swept for items past their 365 days |
+| `PURGE_DISABLED` | unset | never destroy anything on a timer; the trash grows without bound |
 | `MDNS_DISABLED` | unset | stop advertising; publish via Avahi instead |
 
 Moving to the archive machine is `PHOTOS_ROOT=/mnt/photos` plus a
@@ -48,7 +50,9 @@ rebuilt from the blobs.
 ## Endpoints
 
 Everything under **auth** requires `Authorization: Bearer <device token>` and is
-served on the HTTPS listener only. Everything else is open, on both listeners.
+served on the HTTPS listener only. Everything else is open, on both listeners —
+including the **gallery** group, which writes. See [Two listeners](#two-listeners)
+for what that costs.
 
 ```
 POST /v1/pair                    redeem a pairing code for a device token
@@ -64,7 +68,9 @@ DELETE /v1/uploads/{id}          abandon
 POST /v1/assets/{id}/import-metadata   an export's sidecar for an archived asset
 
 open:
-GET  /v1/timeline                JSON page, newest first, keyset cursor
+GET  /v1/timeline                JSON page, newest first; keyset cursor or row offset
+GET  /v1/timeline/days           every heading in the collection and its size
+GET  /v1/timeline/locate         where one asset sits, for a link that names an id
 POST /v1/timeline/states         re-read derivative state for specific ids
 GET  /v1/assets/{id}             JSON metadata for the viewer panel
 GET  /v1/assets/{id}/original    exact stored bytes
@@ -72,11 +78,35 @@ GET  /v1/assets/{id}/thumb       stored 256px square WebP
 GET  /v1/assets/{id}/thumb/{px}  the same square at 96, 256 or 512
 GET  /v1/assets/{id}/preview     2048px WebP, rendered per request
 GET  /v1/assets/{id}/playback    H.264 MP4, Range-capable
+GET  /v1/assets/{id}/preview/plain    the same still without its Snapchat overlay
+GET  /v1/assets/{id}/playback/plain   the same video without it burned in
 GET  /v1/assets/{id}/live/thumb[/{px}]  a Live Photo's motion, same sizes
 GET  /v1/assets/{id}/live/preview       1080p with audio, rendered per request
 GET  /v1/jobs                    queue depth and the failure list
 GET  /health                     also reports pending and failed job counts
+
+gallery (writes, but no device token — see below):
+POST /v1/trash                   move a selection to Recently Deleted
+POST /v1/trash/restore           put a batch, or a selection of the trash, back
+POST /v1/trash/purge             destroy a selection of the trash outright
+DELETE /v1/collections/albums/{id}[?photos=true]   drop an album, optionally its photos
 ```
+
+The three trash endpoints take the same body: `ids`, `ranges`, or both, plus one
+of `album`/`person`/`category` naming the timeline those ranges are positions in.
+A range is `{"start": n, "end": m}`, end exclusive, counted in exactly the units
+`GET /v1/timeline?skip=` offsets by — which is what lets the gallery act on a
+selection of forty thousand photographs it has never fetched. Which half of the
+archive a position is counted in is the endpoint's to decide, not the request's:
+a delete only ever reaches the library, a restore or a purge only ever reaches
+the trash.
+
+A delete answers `{"batch": "<uuid>", "deleted": n}`. The batch is the undo —
+`POST /v1/trash/restore {"batch": ...}` — and it is what the gallery's toast
+carries, because by the time anybody clicks Undo every position in the timeline
+has moved. `deleted` counts items rather than rows: a Live Photo is one of the
+first and two of the second, and the number worth showing somebody is the one
+they can count on screen.
 
 Upload headers: `X-Photo-Filename`, `X-Photo-Md5`, `X-Photo-Size` and
 `X-Photo-Local-Id` are required; `X-Photo-Captured-At` and `X-Photo-Modified-At`
@@ -88,7 +118,9 @@ rather than a silent correction.
 
 Every media response is content-addressed, so it carries a strong `ETag` and
 `Cache-Control: immutable`. `/preview` checks `If-None-Match` *before*
-converting, which is what keeps paging back through a viewer free.
+converting, which is what keeps paging back through a viewer free. `/preview`
+and `/preview/plain` are two different pictures of one asset and carry different
+tags, so a browser holding one is never handed it for the other.
 
 The unsized `/thumb` is the 256px rendition and is the only one every asset is
 guaranteed to have; a size that has not been rendered yet is a `404`, never the
@@ -150,7 +182,7 @@ changing it is a decision rather than an accident.
 | | serves | who reaches it |
 |---|---|---|
 | `LISTEN_ADDR` (HTTPS) | everything | the phone |
-| `PLAINTEXT_ADDR` (HTTP) | the read path and `/health` | the Next app, the browser, the CLI |
+| `PLAINTEXT_ADDR` (HTTP) | the read path, the gallery's writes, `/health` | the Next app, the browser, the CLI |
 
 The plaintext listener exists so the gallery does not have to trust a private CA
 to load a thumbnail. Pairing is absent from its routing table and every
@@ -159,6 +191,14 @@ travel unencrypted regardless of where that listener is bound**. That is a
 property of the routes rather than of a check inside a handler, which is what
 makes widening `PLAINTEXT_ADDR` to the LAN — something the gallery may
 legitimately want — safe for credentials, whatever it does for the read path.
+
+The gallery's own writes are served here, and that is a widening rather than an
+exception. They carry no credential and name no device, so nothing about them can
+leak one; what they do mean is that anyone who can reach `PLAINTEXT_ADDR` can now
+move photographs to the trash as well as look at them. Undoable for a year is not
+the same as harmless, so this is one more reason `PLAINTEXT_ADDR` stays on
+loopback. Authenticating the gallery is the fix, and it is exactly the piece of
+work it was before deletion existed.
 
 `TLS_DISABLED=1` collapses both onto one cleartext listener, tokens and all. It
 exists for development, it logs a warning saying exactly that, and it is the one
@@ -320,6 +360,15 @@ machine's configuration; the defaults stay portable.
 Stored on disk: `<sha>.thumb.webp`, and `<sha>.mp4` for video. The 2048px
 preview is rendered per request and never stored; the browser's cache does the
 caching a derivative file would.
+
+A Snapchat memory is the other exception. Its renditions are built from the
+photograph and its caption layer composed, not from the file the job was handed
+— see [Overlays](#overlays) — so every row above reads one extra blob for the
+few hundred assets that carry one. Stills compose per rendition, which costs a
+second decode. Video cannot: nothing in a browser will lay a transparent PNG
+over a playing `<video>`, so the layer is burned into the pixels, and those
+videos keep a second rendition, `<sha>.plain.mp4`, without it. That one exists
+only so the viewer's toggle has something to show.
 
 A Live Photo's paired video is the exception to both rows. It queues no
 transcode and gets no poster — the tile it appears in belongs to the still it is
@@ -532,6 +581,173 @@ the signal the rules have changed again.
 skipped unless `--include-trash`; `archived` and `favorited` are recorded and
 not acted on, because the gallery has nowhere to show them yet.
 
+## Importing a Snapchat export
+
+```sh
+# The memories, which is the half worth having. Pass every unzipped directory:
+# the history document is in exactly one of them and the media is in the others.
+photobackup import-snapchat --half memories \
+  --from ~/Downloads/snapchat_1 --from ~/Downloads/snapchat_2 \
+  --from ~/Downloads/snapchat_3 --from ~/Downloads/snapchat_4 \
+  --from ~/Downloads/snapchat_5 --from ~/Downloads/snapchat_6
+
+# The chat media, separately, because it is a different population.
+photobackup import-snapchat --half chat \
+  --from ~/Downloads/snapchat_1 --from ~/Downloads/snapchat_2
+```
+
+A Snapchat export is not a Takeout wearing a hat. A Takeout writes a JSON
+document per photograph and puts it beside the file. Snapchat writes
+`json/memories_history.json` — one document for the whole account — whose rows
+are a `Date`, a `Media Type` and a `Location`, and **nothing in it names a
+file**. There is no identifier, no title, no path. The real export has 3,237
+rows and 2,791 media files and not one declared link between them.
+
+**The join is the modification time.** Snapchat sets each exported file's mtime
+to the memory's capture instant, in UTC, to the second, and that is the only
+thing relating a photograph to the record of when and where it was taken. Both
+sides are truncated to the second — a zip's extended timestamp carries
+nanoseconds the document never will — and against the real export it places all
+2,791 files with none left over.
+
+The consequence is worth stating plainly: **a copy that does not preserve mtimes
+destroys the metadata of the entire export**, silently and unrecoverably. Import
+from where the zips were unzipped, not from a copy made with something that
+rewrites times.
+
+This matters more than the equivalent does for Google, because Snapchat strips
+the JPEGs completely. A still memory has no EXIF at all — no capture time, no
+coordinates, nothing — so the history row is not a supplement to the file's own
+metadata, it is the whole of it. The MP4s keep a QuickTime creation date.
+
+Where several memories share a capture second, Snapchat's own `Image`/`Video`
+split separates them; two stills in the same second cannot be separated at all,
+and those matches are recorded as `"historyMatch": "ambiguous"` rather than
+presented as facts. The run reports how many of those chose between rows that
+actually *disagreed* about the location, which is the number that says what the
+ambiguity costs — in the real export, 13 files out of 404 ambiguous ones.
+
+### Overlays
+
+A memory is two files and one photograph. `-main.jpg` is the frame the camera
+captured; `-overlay.png` beside it is a transparent layer holding the caption,
+the drawings, the stickers, the timestamp. **The image anybody actually saw is
+in neither file** — Snapchat exports the layers, not the picture.
+
+Both are archived. The overlay becomes an ordinary asset — same blob tree, same
+manifest line, same `verify` — and `assets.overlay_asset_id` on the photograph
+points at it, so the composite is rebuildable for as long as the archive exists.
+The overlay is kept out of the gallery by `assets.is_overlay`, which is a term in
+the timeline's visibility predicate exactly as the Live Photo pairing is; the
+`archived` flag rides along to record that Snapchat never showed the layer alone.
+
+They are related only by sharing a stem in a filename, in an export that is
+deleted after the import, so the link is written down at import time. It travels
+in the manifest as `import_overlay_sha256` — by content hash rather than asset
+id, because a reindex generates new ids and the hash is the bytes.
+
+**Every rendition is of the composite.** The thumbnails in the grid, the poster
+on a video tile, the 2048px preview, and for video the playback rendition
+itself: all of them are the two files composed, because that is the picture that
+was sent. Anything that just asks for a preview — the phone app, a saved link —
+gets it without knowing any of this exists.
+
+The layer is stretched to the photograph's own frame rather than fitted into it.
+Across this archive's 439 memories the two files never once agree on
+dimensions — Snapchat's layer is the phone's screen and the media is what filled
+it — but their aspect ratios agree to within about 2%, so stretching lands the
+caption where the person put it and fitting would leave it drifting off the
+edge. Stills are composed by ImageMagick at full resolution *before* the square
+crop, so the tile and the viewer cut the caption in the same place. Video goes
+through an ffmpeg `overlay` filter, with `eof_action=repeat` holding the single
+still for the length of the clip and audio mapped by hand — `-filter_complex`
+turns automatic stream selection off, and forgetting that produces a perfectly
+valid silent video and no error at all.
+
+**Do not loop the layer's input.** `-loop 1` is the obvious way to make one
+still cover a whole clip and it is a trap: it makes the layer an input with no
+end, and ffmpeg then bounds the encode only by whatever *other* finite output
+stream it has. On a clip with an audio track it stops at the right moment and
+every test passes. On a silent one it never stops — a 7.6-second memory here ran
+for thirteen minutes, held sixteen cores, and wrote 300MB of a video that would
+have filled the disk. `-shortest` does not save it. `eof_action=repeat` is the
+filter doing the same job with a finite graph.
+
+Two routes serve the photograph without the layer, which is what the viewer's
+press-and-hold and its overlay toggle reach for:
+
+| route | what |
+|---|---|
+| `GET /v1/assets/{id}/preview/plain` | the still, uncomposed; answers for an asset with no layer too |
+| `GET /v1/assets/{id}/playback/plain` | `<sha>.plain.mp4`; 404 for a video with nothing to leave out |
+
+`GET /v1/assets/{id}` reports `has_overlay`, which is the whole of what the
+gallery needs to offer the toggle.
+
+A library imported before this existed has thumbnails of half a picture, and
+nothing on disk can tell them apart from finished ones — a thumbnail of the
+photograph alone is a valid thumbnail of the right asset at the right size. So
+migration 0010 requeues both jobs for every asset carrying a layer, once. The
+missing `.plain.mp4` *is* detectable, and `verify` reports it as an ordinary
+missing derivative, so `photobackup verify --fix` is the backfill for that half.
+
+### Labelling
+
+Everything lands under `import_source = 'snapchat'`, and the `subtypes` column
+carries which kind of thing it is:
+
+| subtype | what |
+|---|---|
+| `snapchat:memory` | a saved Memory, with a history row behind it |
+| `snapchat:chat` | media from a conversation, which no document describes |
+| `snapchat:overlay` | a drawn-on layer |
+| `snapchat:thumbnail` | chat media shipped as a thumbnail of something else |
+| `snapchat:discover` | publisher content, proven by a metadata document beside it |
+
+### What is kept rather than imported
+
+Three things reach `import_orphans` instead of becoming assets, because all
+three are facts that die with the export:
+
+- **History rows with no file.** Snapchat lists a memory, leaves the download
+  link empty, and ships nothing — 446 of 3,237 in the real export. A UTC instant
+  and a pair of coordinates is all that survives of each photograph.
+- **Files the archive will not store.** Chat media contains voice notes
+  (`audio/mp4`), which `media_kind` has no value for, and blobs Snapchat shipped
+  still encrypted that nothing has the key for. Recorded with their MIME type,
+  size and reason, so "the archive could not hold audio yet" is a decision that
+  can be revisited against a list.
+- **Overlays whose memory is missing.** They import on their own rather than
+  being dropped; the handwriting is somebody's even without the photo under it.
+
+### Sidecar shape
+
+Snapchat's own row is stored verbatim under `history`, and every field beside it
+is this importer's reading of the export — never merged into Snapchat's copy:
+
+```json
+{
+  "export": "snapchat", "kind": "memory",
+  "file": "2017-09-02_4c148b50-…-main.jpg", "mediaId": "4c148b50-…",
+  "role": "main", "overlay": "2017-09-02_4c148b50-…-overlay.png",
+  "capturedAt": "2017-09-02T06:55:44Z", "capturedAtSource": "history",
+  "historyMatch": "exact",
+  "history": { "Date": "2017-09-02 06:55:44 UTC", "Media Type": "Image",
+               "Location": "Latitude, Longitude: 39.161533, -86.532104" }
+}
+```
+
+`capturedAtSource` is not bookkeeping. For a stripped JPEG this timestamp is the
+only one that exists anywhere, so how it was arrived at — `history`,
+`file-modification-time`, `filename-date` — is a question somebody will need
+answered.
+
+The two halves upload as separate devices (`snapchat memories import`,
+`snapchat chat media import`), so each re-runs and audits independently. Local
+ids are `memories/<name>` and `chat_media/<name>` with the delivery directory
+deliberately left out: Snapchat's zip numbering is an artifact of one download,
+and a second download splits the same files differently.
+
 ## Commit ordering
 
 An upload is committed blob first, then the manifest line, then the database
@@ -546,6 +762,48 @@ The one known gap — a crash between the rename and the manifest append leaves 
 blob with no manifest line — is what `photobackup verify --fix` reconciles, and
 what `photobackup reindex --adopt-orphans` recovers if the database is also gone.
 
+## Deleting
+
+Two steps, and only the second one is real.
+
+**The trash.** `assets.deleted_at` is set, and nothing else happens: the row, the
+blob, the derivatives, the album membership and the face tags all stay exactly as
+they were. That one column is a term in the timeline's visibility predicate — the
+same string pasted into the pages, the day table, the album covers and the
+category counts — so a deleted photograph leaves the whole gallery at once, and a
+restore is one `UPDATE`. Recently Deleted is the same predicate with the term
+flipped, which is why it is a scope on `TimelineFilter` rather than a table.
+
+A still takes its Live Photo motion and its Snapchat overlay with it. Those are
+components rather than items: invisible in every timeline, addressable by
+nothing, and half a photograph on their own. `db.family` is the one place that
+relationship is expanded, and every operation here goes through it.
+
+**The purge**, 365 days later or when somebody asks:
+
+1. The rows are deleted and the content key is written to `purged_content`, in
+   one statement. A row that is gone without a tombstone is a photograph the
+   next backup uploads again, and the two must not be able to come apart.
+2. A `purge` line goes in the manifest, so a rebuild knows this was a decision
+   rather than a loss. `reindex` takes the retraction back out and restores the
+   tombstone — the last line about a digest wins, so content purged and later
+   archived again survives a rebuild.
+3. The blob and every derivative are unlinked. Last, because it is the only step
+   that rerunning the ones before it cannot repair: a file left behind is a
+   finding `verify` reports, where a row deleted before its file would be an
+   asset the archive can no longer produce.
+
+`sync/check` answers `have` for tombstoned content, with no asset id. It is not
+literally true — the archive threw those bytes away — and it is what makes a
+permanent delete permanent: the phone still holds the photograph, and without it
+the delete would survive until the app was next opened.
+
+The sweep runs inside photod, hourly (`PURGE_INTERVAL`), a thousand rows at a
+time. It is not a systemd timer beside `verify` because a retention that only
+elapses on hosts where somebody installed a second unit is not a retention.
+`PURGE_DISABLED=1` turns it off; the trash then waits indefinitely and nothing
+removes an original unless it is asked to by hand.
+
 ## photobackup
 
 The maintenance CLI. Reads the same environment photod does.
@@ -555,6 +813,8 @@ photobackup verify [--deep] [--fix]     audit the archive against itself
 photobackup export --to DIR [--copy]    materialize a date tree of hardlinks
 photobackup reindex [--adopt-orphans]   rebuild the database from manifest.jsonl
 photobackup import --from DIR [--from…] ingest a Google Photos export
+photobackup import-snapchat --from DIR  ingest a Snapchat export, one half at a
+  [--half memories|chat] [--from…]      time; --from once per unzipped zip
 photobackup pair [--ttl 10m]            mint a single-use code to pair a device
 photobackup devices [--revoke ID]       list paired devices, or unpair one
 photobackup ca [--serve]                the CA to install on a device, and how

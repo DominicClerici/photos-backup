@@ -104,7 +104,7 @@ func runImport(ctx context.Context, args []string) (int, error) {
 		return exitOK, nil
 	}
 
-	client, err := importClientFor(ctx, cfg, *server, *token, *insecure, *workers)
+	client, err := importClientFor(ctx, cfg, *server, *token, *insecure, *workers, importDeviceName)
 	if err != nil {
 		return fail(err)
 	}
@@ -287,7 +287,7 @@ func describeOne(client *importClient, item *importItem) error {
 		// archive's verbatim copy, which is the one thing that copy must never
 		// contain — so this is recorded as an orphan instead, with the asset it
 		// belongs to named, and left for a decision rather than guessed at.
-		return client.orphan(orphanAlbum, item.localID, item.assetID,
+		return client.orphan(db.SourceGoogleTakeout, orphanAlbum, item.localID, item.assetID,
 			nil, item.albums,
 			"the item is in an album folder but no sidecar matched it, "+
 				"and album membership exists nowhere else in an export")
@@ -310,7 +310,7 @@ func recordOrphanSidecars(ctx context.Context, client *importClient, export scan
 		if ctx.Err() != nil {
 			break
 		}
-		err := client.orphan(orphanSidecar, sidecar.locator, "", sidecar.raw, nil,
+		err := client.orphan(db.SourceGoogleTakeout, orphanSidecar, sidecar.locator, "", sidecar.raw, nil,
 			"no media file in this export matched the sidecar; "+
 				"it describes a photograph that is somewhere else")
 		if err != nil {
@@ -453,7 +453,7 @@ func each(ctx context.Context, items []*importItem, workers int, fn func(*import
 // for: the address photod listens on, the CA photod issued itself, and a device
 // row this command creates. Importing an export that is sitting on the archive
 // machine should not require pairing ceremony against localhost.
-func importClientFor(ctx context.Context, cfg config.Config, server, token string, insecure bool, workers int) (*importClient, error) {
+func importClientFor(ctx context.Context, cfg config.Config, server, token string, insecure bool, workers int, deviceName string) (*importClient, error) {
 	base := server
 	if base == "" {
 		base = localServerURL(cfg)
@@ -493,7 +493,7 @@ func importClientFor(ctx context.Context, cfg config.Config, server, token strin
 		store.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	device, minted, err := devices.New(store.Pool()).Provision(ctx, importDeviceName, "import")
+	device, minted, err := devices.New(store.Pool()).Provision(ctx, deviceName, "import")
 	store.Close()
 	if err != nil {
 		return nil, err

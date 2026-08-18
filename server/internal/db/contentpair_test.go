@@ -115,7 +115,7 @@ func TestAPairedVideoWithNoStillStaysOnTheTimeline(t *testing.T) {
 		t.Error("an orphan video counted as a Live Photo's half, so it would get no poster and no playback")
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestAnOrphanVideoLeavesTheTimelineWhenItsStillArrives(t *testing.T) {
 		t.Fatalf("record still: %v", err)
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestSetContentIDUndoesAPairingTheFileDoesNotSupport(t *testing.T) {
 		t.Error("the pairing survived an identifier the file turned out not to carry")
 	}
 
-	page, err := s.Timeline(ctx, nil, 10)
+	page, err := s.Timeline(ctx, TimelineFilter{}, nil, 10)
 	if err != nil {
 		t.Fatalf("Timeline: %v", err)
 	}

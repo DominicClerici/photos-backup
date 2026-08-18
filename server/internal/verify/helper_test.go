@@ -22,6 +22,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/mediatype"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
+	"github.com/dominicclerici/photos-backup/server/internal/vault"
 	"github.com/dominicclerici/photos-backup/server/internal/verify"
 )
 
@@ -40,6 +41,7 @@ type archive struct {
 	store      *db.Store
 	blobs      *blobstore.Store
 	derivs     *derivstore.Store
+	vaultBlobs *vault.Store
 	root       string
 	derivRoot  string
 	manifest   *manifest.Log
@@ -75,6 +77,7 @@ func newArchive(t *testing.T) *archive {
 		store:      store,
 		blobs:      blobstore.New(root),
 		derivs:     derivstore.New(derivRoot),
+		vaultBlobs: vault.NewStore(filepath.Join(root, "vault")),
 		root:       root,
 		derivRoot:  derivRoot,
 		manifest:   manifest.New(manifestAt),
@@ -84,6 +87,7 @@ func newArchive(t *testing.T) *archive {
 		Store:       store,
 		Blobs:       a.blobs,
 		Derivatives: a.derivs,
+		VaultBlobs:  a.vaultBlobs,
 		Uploads:     uploads.New(filepath.Join(root, "incoming")),
 		Queue:       jobs.NewQueue(store.Pool()),
 		PhotosRoot:  root,
@@ -257,6 +261,9 @@ func truncate(t *testing.T, ctx context.Context, dbURL string) {
 	defer conn.Close(ctx)
 	// devices and pairing_codes go too. Reset's whole claim is about what
 	// survives it, and a device left behind by an earlier test would make that
-	// assertion pass for the wrong reason.
-	_, _ = conn.Exec(ctx, "truncate table assets, device_assets, jobs, devices, pairing_codes cascade")
+	// assertion pass for the wrong reason. purged_content goes for the same
+	// reason: a tombstone from an earlier test would let "the rebuild restored
+	// it" pass without the rebuild having done anything.
+	_, _ = conn.Exec(ctx,
+		"truncate table assets, device_assets, jobs, devices, pairing_codes, albums, purged_content, vault_people, vault_secret cascade")
 }

@@ -59,6 +59,25 @@ type ThumbTarget struct {
 	Path string
 }
 
+// Layer is a second image drawn over the source before anything is rendered
+// from it. Nil everywhere except a Snapchat memory, where the photograph and
+// the handwriting over it are two archived files and the picture anybody
+// actually saw is the two composed.
+//
+// Width and Height are the base's own dimensions, after orientation. The layer
+// is stretched to exactly them rather than fitted, because the two files are
+// the same frame photographed at different resolutions: across this archive's
+// 439 memories the aspect ratios differ by at most 2%, and the overlay is
+// registered to the frame edge, so stretching lands the caption where the
+// person put it while fitting would leave it drifting a few pixels off. They
+// are optional — a zero pair costs one `magick identify` to recover, which is
+// the price of a caller that has not read the file yet.
+type Layer struct {
+	Path   string
+	Width  int
+	Height int
+}
+
 // keepColour drops EXIF, IPTC, and XMP but keeps the colour profile. A blanket
 // -strip would take the ICC profile with it, and iPhone photos are Display P3:
 // stripped and reinterpreted as sRGB, every rendition comes out visibly
@@ -83,7 +102,7 @@ var keepColour = []string{"+profile", "!icc,icm"}
 // roughly triple the job to produce a third more bytes. The chain renders the
 // largest size first and steps down through it, which is also why the small
 // sizes come out of an already-cropped square rather than repeating the crop.
-func (c *Converter) Thumbs(ctx context.Context, src string, targets []ThumbTarget) error {
+func (c *Converter) Thumbs(ctx context.Context, src string, over *Layer, targets []ThumbTarget) error {
 	if len(targets) == 0 {
 		return nil
 	}
@@ -91,7 +110,16 @@ func (c *Converter) Thumbs(ctx context.Context, src string, targets []ThumbTarge
 		return b.Size - a.Size
 	})
 
+	// The layer goes on at full resolution, before the square crop rather than
+	// after: the crop then takes the same bite out of both, so a caption near
+	// the edge is cut exactly where it would be cut in the picture.
+	compose, err := c.compose(ctx, src, over)
+	if err != nil {
+		return err
+	}
+
 	args := []string{"-auto-orient"}
+	args = append(args, compose...)
 	args = append(args, keepColour...)
 	args = append(args,
 		"-quality", fmt.Sprint(c.thumbQuality()),
@@ -127,16 +155,22 @@ func (c *Converter) Thumbs(ctx context.Context, src string, targets []ThumbTarge
 }
 
 // Preview writes a WebP bounded by PreviewSize on its longest edge.
-func (c *Converter) Preview(ctx context.Context, src string, w io.Writer) error {
+func (c *Converter) Preview(ctx context.Context, src string, over *Layer, w io.Writer) error {
 	if err := c.acquire(ctx); err != nil {
 		return err
 	}
 	defer c.release()
 
+	compose, err := c.compose(ctx, src, over)
+	if err != nil {
+		return err
+	}
+
 	// The trailing > means "shrink only": a photo smaller than the box is left
 	// alone rather than blown up into a blurry larger file.
 	resize := fmt.Sprintf("%dx%d>", c.previewSize(), c.previewSize())
 	ops := []string{"-auto-orient"}
+	ops = append(ops, compose...)
 	ops = append(ops, keepColour...)
 	ops = append(ops,
 		"-resize", resize,
@@ -144,6 +178,59 @@ func (c *Converter) Preview(ctx context.Context, src string, w io.Writer) error 
 		"webp:-",
 	)
 	return c.run(ctx, w, src, ops...)
+}
+
+// compose renders a layer as the ImageMagick operators that draw it over the
+// image already in hand, or nothing at all when there is no layer.
+//
+// The parentheses are literal argv words, not shell syntax: they open a
+// sub-sequence so the -resize inside applies to the layer alone and leaves the
+// photograph underneath at full resolution. Everything after -composite sees a
+// single image again, which is why the thumbnail and preview pipelines need no
+// other change to draw a memory rather than a photograph.
+func (c *Converter) compose(ctx context.Context, src string, over *Layer) ([]string, error) {
+	if over == nil || over.Path == "" {
+		return nil, nil
+	}
+
+	width, height := over.Width, over.Height
+	if width <= 0 || height <= 0 {
+		var err error
+		if width, height, err = c.dimensions(ctx, src); err != nil {
+			return nil, err
+		}
+	}
+
+	return []string{
+		"(", source(over.Path), "-auto-orient",
+		"-resize", fmt.Sprintf("%dx%d!", width, height), ")",
+		"-compose", "over", "-composite",
+	}, nil
+}
+
+// dimensions asks ImageMagick how big an image is once its orientation has been
+// applied, which is the size a layer has to be stretched to.
+//
+// A second process, and the reason Layer carries the numbers: every caller in
+// the worker has just read them out of the file anyway, and this is here for
+// the one that has not — a preview requested while the metadata job that fills
+// in width and height is still queued.
+func (c *Converter) dimensions(ctx context.Context, src string) (width, height int, err error) {
+	cmd := exec.CommandContext(ctx, c.binary(), source(src), "-auto-orient", "-format", "%w %h", "info:")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return 0, 0, fmt.Errorf("measure %s: %w: %s", src, err, bytes.TrimSpace(stderr.Bytes()))
+	}
+	if _, err := fmt.Sscan(stdout.String(), &width, &height); err != nil {
+		return 0, 0, fmt.Errorf("measure %s: %q is not a size", src, stdout.String())
+	}
+	if width <= 0 || height <= 0 {
+		return 0, 0, fmt.Errorf("measure %s: reported %dx%d", src, width, height)
+	}
+	return width, height, nil
 }
 
 // run drives one ImageMagick, with ops carrying its own output specification —

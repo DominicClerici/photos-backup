@@ -108,12 +108,27 @@ func validateCheckRequest(req syncCheckRequest) error {
 //  2. no digest was supplied, so nothing more can be said    -> unknown
 //  3. exactly one archived asset matches (md5, byte size)    -> have, recording
 //     the mapping so the next run answers at step 1
-//  4. anything else, ambiguous content matches included      -> want
+//  4. this content was purged from the archive on purpose    -> have
+//  5. anything else, ambiguous content matches included      -> want
 //
 // Step 3 is the only place the server claims to hold content it has not hashed
 // on this request, so it is deliberately narrow. An md5 and size that match two
 // different assets identify nothing, and fall through to want: the bytes come
 // over the wire and the real sha256 settles it.
+//
+// Step 4 is the one answer here that is not literally true — the archive does
+// not have those bytes, it threw them away — and it is the answer that makes a
+// permanent delete permanent. Without it the phone would offer the photograph
+// again on the very next run and the server, having genuinely never seen it,
+// would take it: the delete would survive until the app was next opened. "Have"
+// rather than a status of its own because it means the same thing to the phone,
+// which is "stop offering me this", and because inventing a fourth status would
+// need an app release to be understood.
+//
+// It is deliberately a wall rather than a decision. Deciding which purged
+// photographs may come back is a thing to do in the gallery, where somebody can
+// see what they are choosing between; until that exists, the archive's answer
+// to "shall I upload this again" is no.
 func (s *Server) checkItems(ctx context.Context, deviceID string, items []syncCheckItem) ([]syncCheckResult, error) {
 	// Normalized to the same precision the upload path stores, or the equality
 	// this lookup depends on could never hold. See normalizeTime.
@@ -147,6 +162,20 @@ func (s *Server) checkItems(ctx context.Context, deviceID string, items []syncCh
 		return nil, err
 	}
 
+	// Only the keys nothing archived answered for. An ordinary backup matches
+	// nearly everything it asks about, so the tombstone table is read for a
+	// handful of keys per batch rather than all of them.
+	var unmatched []db.ContentKey
+	for _, key := range keys {
+		if matches[key].Matches == 0 {
+			unmatched = append(unmatched, key)
+		}
+	}
+	purged, err := s.Store.PurgedContent(ctx, unmatched)
+	if err != nil {
+		return nil, err
+	}
+
 	results := make([]syncCheckResult, len(items))
 	var learned []db.Mapping
 	recorded := make(map[string]bool, len(items))
@@ -172,6 +201,10 @@ func (s *Server) checkItems(ctx context.Context, deviceID string, items []syncCh
 					ModifiedAt: normalizeTime(item.ModifiedAt),
 				})
 			}
+		case purged[key]:
+			// No asset id: there is nothing left to point at, and the phone
+			// already treats a "have" without one as "nothing more to do".
+			result.Status = statusHave
 		default:
 			result.Status = statusWant
 		}

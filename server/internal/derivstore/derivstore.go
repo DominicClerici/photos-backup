@@ -21,6 +21,12 @@ import (
 const (
 	Thumb    = ".thumb.webp"
 	Playback = ".mp4"
+	// PlaybackPlain is the same rendition of a Snapchat memory's video without
+	// its caption layer burned in. It exists only for the few hundred videos
+	// that carry one: everything else has nothing to leave out, and the toggle
+	// that reaches for this falls back to the ordinary playback when it is
+	// absent.
+	PlaybackPlain = ".plain.mp4"
 	// LiveThumb is a Live Photo's three seconds at thumbnail size, cropped
 	// square to sit exactly where the still it replaces sat. It is the only
 	// rendition a paired video keeps: the viewer's larger one is rendered per
@@ -171,4 +177,43 @@ func (s *Store) Remove(sha256hex, suffix string) error {
 		return fmt.Errorf("remove derivative: %w", err)
 	}
 	return nil
+}
+
+// Suffixes is every rendition this store can hold for one original: the stills
+// at each size, the motion at each size, and the two video renditions.
+//
+// Written as a function rather than a var because it is derived from
+// ThumbSizes, and a list that had to be kept in step with that one by hand is a
+// list that would be wrong the first time a size was added — which is exactly
+// the moment a purge would start leaving files behind.
+func Suffixes() []string {
+	out := make([]string, 0, len(ThumbSizes)*2+2)
+	for _, size := range ThumbSizes {
+		out = append(out, ThumbSuffix(size), LiveSuffix(size))
+	}
+	return append(out, Playback, PlaybackPlain)
+}
+
+// RemoveAll deletes every rendition of an original, reporting how many files
+// there were and the bytes they took.
+//
+// Missing files are the ordinary case rather than a failure: most assets have
+// three of these and no asset has all eight.
+func (s *Store) RemoveAll(sha256hex string) (files int, bytes int64, err error) {
+	for _, suffix := range Suffixes() {
+		path := s.Path(sha256hex, suffix)
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			continue
+		}
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			// Reported, but the rest are still attempted: one undeletable
+			// thumbnail should not strand the other seven files.
+			err = fmt.Errorf("remove derivative %s: %w", path, rmErr)
+			continue
+		}
+		files++
+		bytes += info.Size()
+	}
+	return files, bytes, err
 }

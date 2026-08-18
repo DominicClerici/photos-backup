@@ -12,8 +12,11 @@ import (
 // the disaster this whole path exists for.
 func (a *archive) dropIndex(t *testing.T) {
 	t.Helper()
+	// purged_content stays: it is a fact about what the archive threw away, not
+	// an index of what it holds, and losing it is what the manifest's purge
+	// lines exist to repair. Truncating it here is what makes that testable.
 	if _, err := a.store.Pool().Exec(context.Background(),
-		"truncate table assets, device_assets, jobs cascade"); err != nil {
+		"truncate table assets, device_assets, jobs, purged_content cascade"); err != nil {
 		t.Fatalf("drop index: %v", err)
 	}
 }

@@ -3,11 +3,17 @@ package video
 import (
 	"context"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func fixture(name string) string { return filepath.Join("..", "..", "testdata", name) }
@@ -221,7 +227,7 @@ func TestTranscodeRejectsAnUnplayableResult(t *testing.T) {
 	ctx := context.Background()
 
 	info := Info{Width: 640, Height: 480, DurationSeconds: 1}
-	err := tool.Transcode(ctx, fixture("undecodable.mov"), filepath.Join(t.TempDir(), "playback.mp4"), info)
+	err := tool.Transcode(ctx, fixture("undecodable.mov"), filepath.Join(t.TempDir(), "playback.mp4"), info, "")
 	if err == nil {
 		t.Fatal("Transcode reported success on a file with no decodable frames")
 	}
@@ -261,7 +267,7 @@ func TestTranscodeProducesAPlayableMP4(t *testing.T) {
 	}
 
 	dst := filepath.Join(t.TempDir(), "playback.mp4")
-	if err := tool.Transcode(ctx, fixture("clip.mov"), dst, info); err != nil {
+	if err := tool.Transcode(ctx, fixture("clip.mov"), dst, info, ""); err != nil {
 		t.Fatalf("Transcode: %v", err)
 	}
 
@@ -291,7 +297,7 @@ func TestTranscodeScalesDownOversizedVideo(t *testing.T) {
 	info := Info{Width: 3840, Height: 2160, DurationSeconds: 1}
 
 	dst := filepath.Join(t.TempDir(), "playback.mp4")
-	if err := tool.Transcode(ctx, fixture("clip.mov"), dst, info); err != nil {
+	if err := tool.Transcode(ctx, fixture("clip.mov"), dst, info, ""); err != nil {
 		t.Fatalf("Transcode: %v", err)
 	}
 
@@ -312,7 +318,7 @@ func TestTranscodeScalesDownOversizedVideo(t *testing.T) {
 func TestTranscodeReportsFFmpegStderr(t *testing.T) {
 	dst := filepath.Join(t.TempDir(), "playback.mp4")
 
-	err := New().Transcode(context.Background(), fixture("nope.mov"), dst, Info{})
+	err := New().Transcode(context.Background(), fixture("nope.mov"), dst, Info{}, "")
 	if err == nil {
 		t.Fatal("Transcode succeeded on a missing file")
 	}
@@ -338,7 +344,7 @@ func assertCodec(t *testing.T, path, want string) {
 }
 
 func TestVideoArgsTranslateTheQualityTargetForEachEncoder(t *testing.T) {
-	x264 := New().videoArgs(22, speedBalanced)
+	x264 := New().videoArgs("libx264", 22, speedBalanced)
 	if !slices.Contains(x264, "-crf") {
 		t.Errorf("libx264 args carry no -crf: %v", x264)
 	}
@@ -348,7 +354,7 @@ func TestVideoArgsTranslateTheQualityTargetForEachEncoder(t *testing.T) {
 
 	tool := New()
 	tool.Encoder = "h264_nvenc"
-	nv := tool.videoArgs(22, speedBalanced)
+	nv := tool.videoArgs("h264_nvenc", 22, speedBalanced)
 
 	// The whole point. NVENC ignores -crf without saying so, which is how a
 	// backfill ends up at its stock 2Mbps VBR instead of the quality asked for.
@@ -365,6 +371,99 @@ func TestVideoArgsTranslateTheQualityTargetForEachEncoder(t *testing.T) {
 	}
 	if i := slices.Index(nv, "-preset"); i < 0 || !strings.HasPrefix(nv[i+1], "p") {
 		t.Errorf("NVENC preset = %v, want one of NVENC's own pN presets", nv)
+	}
+}
+
+// The bug this guards: NVENC refuses a frame smaller than nvencMinDimension
+// outright, and the 96px motion thumbnail is one. Because every stored size
+// comes out of a single ffmpeg, that refusal took the 256 and the 512 with it
+// and every Live Photo in the archive ended up marked failed.
+func TestEncoderFallsBackBelowTheHardwareMinimum(t *testing.T) {
+	tool := New()
+	tool.Encoder = "h264_nvenc"
+
+	if got := tool.encoderFor(96); got != softwareEncoder {
+		t.Errorf("encoder for a 96px frame = %q, want %q — NVENC cannot encode one", got, softwareEncoder)
+	}
+	if got := tool.encoderFor(nvencMinDimension - 1); got != softwareEncoder {
+		t.Errorf("encoder for a %dpx frame = %q, want %q", nvencMinDimension-1, got, softwareEncoder)
+	}
+	// Everything the card can take still goes to the card. Falling back further
+	// than necessary is the expensive mistake in the other direction.
+	for _, size := range []int{nvencMinDimension, 256, 512, 1920} {
+		if got := tool.encoderFor(size); got != "h264_nvenc" {
+			t.Errorf("encoder for a %dpx frame = %q, want the configured h264_nvenc", size, got)
+		}
+	}
+	// An unknown size is not a small one.
+	if got := tool.encoderFor(0); got != "h264_nvenc" {
+		t.Errorf("encoder for an unknown size = %q, want the configured h264_nvenc", got)
+	}
+	// A software encoder has no such floor and must not be second-guessed.
+	if got := New().encoderFor(96); got != "libx264" {
+		t.Errorf("libx264 encoder for a 96px frame = %q, want libx264", got)
+	}
+}
+
+func TestOutputMinEdgeFollowsTheScaler(t *testing.T) {
+	cases := []struct {
+		name string
+		info Info
+		want int
+	}{
+		{"inside the box, untouched", Info{Width: 640, Height: 480}, 480},
+		{"scaled down to the long edge", Info{Width: 3840, Height: 2160}, 1080},
+		{"portrait, rotation applied", Info{Width: 1920, Height: 1080, Rotation: 90}, 1080},
+		// The case a naive min(w, h) gets wrong: a wide clip's short edge
+		// shrinks well below the encoder minimum on the way down.
+		{"letterboxed wide", Info{Width: 4000, Height: 200}, 96},
+		{"unknown", Info{}, 0},
+	}
+	for _, c := range cases {
+		if got := outputMinEdge(c.info, PlaybackMaxEdge); got != c.want {
+			t.Errorf("%s: outputMinEdge = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// The end-to-end version of the same bug, run against whichever encoders this
+// machine can actually use: every stored size must arrive, including the ones
+// below the hardware minimum.
+func TestLiveThumbsWriteEverySizeOnEveryEncoder(t *testing.T) {
+	ctx := context.Background()
+	for _, encoder := range encodersUnderTest(t) {
+		t.Run(encoder, func(t *testing.T) {
+			tool := New()
+			tool.Encoder = encoder
+
+			src := fixture("clip.mov")
+			info, err := tool.Probe(ctx, src)
+			if err != nil {
+				t.Fatalf("Probe: %v", err)
+			}
+
+			dir := t.TempDir()
+			// The sizes the archive stores. 96 is the one NVENC refuses.
+			sizes := []int{96, 256, 512}
+			targets := make([]LiveThumbTarget, len(sizes))
+			for i, size := range sizes {
+				targets[i] = LiveThumbTarget{Size: size, Path: filepath.Join(dir, strconv.Itoa(size)+".mp4")}
+			}
+
+			if err := tool.LiveThumbs(ctx, src, targets, info); err != nil {
+				t.Fatalf("LiveThumbs: %v", err)
+			}
+			for _, target := range targets {
+				out, err := tool.Probe(ctx, target.Path)
+				if err != nil {
+					t.Fatalf("probe the %dpx motion thumbnail: %v", target.Size, err)
+				}
+				if out.Width != target.Size || out.Height != target.Size {
+					t.Errorf("%dpx motion thumbnail is %dx%d, want square at its own size",
+						target.Size, out.Width, out.Height)
+				}
+			}
+		})
 	}
 }
 
@@ -433,7 +532,7 @@ func TestTranscodeBakesInTheRotation(t *testing.T) {
 			}
 
 			dst := filepath.Join(t.TempDir(), "playback.mp4")
-			if err := tool.Transcode(ctx, src, dst, info); err != nil {
+			if err := tool.Transcode(ctx, src, dst, info, ""); err != nil {
 				t.Fatalf("Transcode: %v", err)
 			}
 
@@ -465,7 +564,7 @@ func TestTranscodeHonoursTheQualityTargetOnEveryEncoder(t *testing.T) {
 				tool.Encoder = encoder
 				tool.CRF = crf
 				dst := filepath.Join(t.TempDir(), "playback.mp4")
-				if err := tool.Transcode(ctx, fixture("clip.mov"), dst, info); err != nil {
+				if err := tool.Transcode(ctx, fixture("clip.mov"), dst, info, ""); err != nil {
 					t.Fatalf("Transcode at CRF %d: %v", crf, err)
 				}
 				stat, err := os.Stat(dst)
@@ -484,5 +583,215 @@ func TestTranscodeHonoursTheQualityTargetOnEveryEncoder(t *testing.T) {
 					high, low, encoder)
 			}
 		})
+	}
+}
+
+// overlayFixture writes a PNG that is opaque red over its left half and
+// transparent over its right, at neither the size nor the shape of any video
+// fixture — which is the situation every Snapchat memory is in.
+func overlayFixture(t *testing.T, width, height int) string {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	for y := range height {
+		for x := range width / 2 {
+			img.Set(x, y, color.NRGBA{R: 255, A: 255})
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "overlay.png")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create overlay: %v", err)
+	}
+	defer f.Close()
+	if err := png.Encode(f, img); err != nil {
+		t.Fatalf("encode overlay: %v", err)
+	}
+	return path
+}
+
+// frameColour reads one pixel out of a rendered frame, which is the only way to
+// tell a burn that happened from one that quietly did not.
+func frameColour(t *testing.T, path string, at float64, x, y int) (r, g, b uint8) {
+	t.Helper()
+	frame := filepath.Join(t.TempDir(), "frame.png")
+	cmd := exec.Command("ffmpeg", "-nostdin", "-y", "-v", "error",
+		"-ss", strconv.FormatFloat(at, 'f', 3, 64), "-i", path, "-frames:v", "1", frame)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("extract a frame at %.3fs: %v: %s", at, err, out)
+	}
+
+	f, err := os.Open(frame)
+	if err != nil {
+		t.Fatalf("open frame: %v", err)
+	}
+	defer f.Close()
+	img, err := png.Decode(f)
+	if err != nil {
+		t.Fatalf("decode frame: %v", err)
+	}
+	cr, cg, cb, _ := img.At(x, y).RGBA()
+	return uint8(cr >> 8), uint8(cg >> 8), uint8(cb >> 8)
+}
+
+// silentFixture is clip.mov with its audio track dropped. Half the memories in
+// this archive are silent, and a silent video is the only shape that catches
+// the bug in TestTranscodeTerminatesOnASilentVideo.
+func silentFixture(t *testing.T) string {
+	t.Helper()
+	dst := filepath.Join(t.TempDir(), "silent.mp4")
+	cmd := exec.Command("ffmpeg", "-nostdin", "-y", "-v", "error",
+		"-i", fixture("clip.mov"), "-an", "-c:v", "copy", dst)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("strip the audio track: %v: %s", err, out)
+	}
+	return dst
+}
+
+// The bug this exists for: the layer was an input with no end — `-loop 1` — and
+// ffmpeg bounded the encode only by whatever other finite output stream it had.
+// A clip with an audio track stopped at the right moment and every test here
+// passed. A silent one never stopped: a 7.6-second memory ran for thirteen
+// minutes, held sixteen cores, and wrote 300MB of a video that would eventually
+// have filled the disk. Nothing failed; it simply never came back.
+//
+// So the deadline is the assertion. An encode of a one-second clip that has not
+// finished in thirty seconds has not finished at all.
+func TestTranscodeTerminatesOnASilentVideo(t *testing.T) {
+	tool := New()
+	tool.CRF = 30
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	src := silentFixture(t)
+	info, err := tool.Probe(ctx, src)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "playback.mp4")
+	if err := tool.Transcode(ctx, src, dst, info, overlayFixture(t, 337, 601)); err != nil {
+		if ctx.Err() != nil {
+			t.Fatal("the encode never terminated: the overlay input has no end")
+		}
+		t.Fatalf("Transcode: %v", err)
+	}
+
+	out, err := tool.Probe(ctx, dst)
+	if err != nil {
+		t.Fatalf("probe the transcode: %v", err)
+	}
+	if out.DurationSeconds > 2 {
+		t.Errorf("transcode is %.2fs long, want about the source's 1s", out.DurationSeconds)
+	}
+}
+
+// The layer is drawn into every frame, not just the first: one still image is
+// held for the length of the clip by the filter's eof_action, which is what
+// replaced looping the input.
+func TestTranscodeBurnsInAnOverlay(t *testing.T) {
+	tool := New()
+	tool.CRF = 30
+	ctx := context.Background()
+
+	info, err := tool.Probe(ctx, fixture("clip.mov"))
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	overlay := overlayFixture(t, 337, 601)
+
+	dst := filepath.Join(t.TempDir(), "playback.mp4")
+	if err := tool.Transcode(ctx, fixture("clip.mov"), dst, info, overlay); err != nil {
+		t.Fatalf("Transcode with an overlay: %v", err)
+	}
+
+	out, err := tool.Probe(ctx, dst)
+	if err != nil {
+		t.Fatalf("probe the transcode: %v", err)
+	}
+	if out.Width != 640 || out.Height != 480 {
+		t.Errorf("transcode is %dx%d, want the source's 640x480", out.Width, out.Height)
+	}
+	// -shortest, or the looped still runs until the disk fills.
+	if out.DurationSeconds > 2 {
+		t.Errorf("transcode is %.2fs long, want about the source's 1s", out.DurationSeconds)
+	}
+
+	if r, g, b := frameColour(t, dst, 0.7, 100, 240); r < 180 || g > 80 || b > 80 {
+		t.Errorf("a late frame reads rgb(%d,%d,%d) where the overlay is, want red", r, g, b)
+	}
+	if r, _, _ := frameColour(t, dst, 0.7, 540, 240); r > 180 {
+		t.Errorf("the overlay's transparent half was painted over: red = %d", r)
+	}
+}
+
+// -filter_complex turns ffmpeg's automatic stream selection off, so the audio
+// has to be mapped by hand. Forgetting it produces a perfectly valid silent
+// video and no error at all.
+func TestTranscodeKeepsAudioThroughTheOverlayFilter(t *testing.T) {
+	tool := New()
+	tool.CRF = 30
+	ctx := context.Background()
+
+	info, err := tool.Probe(ctx, fixture("clip.mov"))
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "playback.mp4")
+	if err := tool.Transcode(ctx, fixture("clip.mov"), dst, info, overlayFixture(t, 337, 601)); err != nil {
+		t.Fatalf("Transcode with an overlay: %v", err)
+	}
+
+	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "a:0",
+		"-show_entries", "stream=codec_name", "-of", "csv=p=0", dst)
+	out, err := cmd.Output()
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		t.Errorf("the burned rendition has no audio stream (ffprobe: %q, %v)", out, err)
+	}
+}
+
+// A video whose size ffprobe could not report cannot be composed at all: the
+// layer would be stretched to a frame nobody knows the shape of. Refusing says
+// so, where guessing would produce a rendition that is wrong and looks
+// deliberate.
+func TestTranscodeRefusesToBurnWithoutDimensions(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "playback.mp4")
+	err := New().Transcode(context.Background(), fixture("clip.mov"), dst,
+		Info{DurationSeconds: 1}, overlayFixture(t, 337, 601))
+	if err == nil {
+		t.Fatal("Transcode burned an overlay without knowing the frame size")
+	}
+	if !strings.Contains(err.Error(), "dimensions") {
+		t.Errorf("error does not say what was missing: %v", err)
+	}
+}
+
+// The oversized branch and the overlay branch both decide the output frame, and
+// they have to agree — a burn that ignored the cap would write a 4K rendition
+// where every other video writes 1080p.
+func TestTranscodeScalesDownWhileBurningIn(t *testing.T) {
+	tool := New()
+	tool.CRF = 30
+	ctx := context.Background()
+
+	// Claim the source is 4K, as the plain scaling test does.
+	info := Info{Width: 3840, Height: 2160, DurationSeconds: 1}
+
+	dst := filepath.Join(t.TempDir(), "playback.mp4")
+	if err := tool.Transcode(ctx, fixture("clip.mov"), dst, info, overlayFixture(t, 337, 601)); err != nil {
+		t.Fatalf("Transcode: %v", err)
+	}
+
+	out, err := tool.Probe(ctx, dst)
+	if err != nil {
+		t.Fatalf("probe the transcode: %v", err)
+	}
+	if out.Width > PlaybackMaxEdge || out.Height > PlaybackMaxEdge {
+		t.Errorf("transcode is %dx%d, want both edges within %d", out.Width, out.Height, PlaybackMaxEdge)
+	}
+	if out.Width%2 != 0 || out.Height%2 != 0 {
+		t.Errorf("transcode is %dx%d, want even dimensions", out.Width, out.Height)
 	}
 }

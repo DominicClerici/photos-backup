@@ -27,6 +27,36 @@ const (
 	// usually deleted the week after the import, and an unmatched sidecar is
 	// then the only copy of what Google knew about that photograph.
 	KindImportOrphan = "import-orphan"
+	// KindPurge records that a blob was deliberately destroyed.
+	//
+	// It is the one line here that takes something away, and it is what makes
+	// the manifest still a true account of the archive after a purge. Without
+	// it a rebuild would read the asset line above it, find the bytes gone, and
+	// either resurrect a row for a photograph that no longer exists or report a
+	// loss that was somebody's decision.
+	//
+	// It carries the content key as well as the digest, so a rebuild can put
+	// back the tombstone that keeps the phone from uploading it again — see
+	// db.PurgedContent. That tombstone lives in the database, and the database
+	// is exactly what a rebuild does not have.
+	KindPurge = "purge"
+	// KindVault records that a blob was encrypted into the Archive or the
+	// Hidden bucket, and KindUnvault that it came back out.
+	//
+	// Neither takes anything away, so unlike a purge line these are not what
+	// makes the log true — the asset line above them still describes a real
+	// archived photograph. What they record is *where the bytes are*: a rebuild
+	// walking the blob tree will not find a vaulted original there, and without
+	// these lines the only reading available to it is that the file was lost.
+	//
+	// They carry no metadata beyond the bucket, and cannot: everything a
+	// metadata line would have said about a hidden photograph is the thing
+	// being withheld. A rebuild from the log alone therefore recovers a vaulted
+	// asset as a row in the right bucket with a sealed document it needs the
+	// password to open, which is exactly the state the vault is supposed to
+	// leave a stranger in.
+	KindVault   = "vault"
+	KindUnvault = "unvault"
 )
 
 // Entry is one line of manifest.jsonl: everything needed to rebuild a database
@@ -43,7 +73,8 @@ const (
 // either buffering it in the upload path or rewriting a line in an append-only
 // log.
 type Entry struct {
-	// Type is KindAsset (or empty, which means the same) or KindMetadata.
+	// Type is KindAsset (or empty, which means the same), KindMetadata,
+	// KindImportOrphan or KindPurge.
 	Type string `json:"type,omitempty"`
 
 	SHA256 string `json:"sha256"`
@@ -91,6 +122,15 @@ type Entry struct {
 	ImportSource  string          `json:"import_source,omitempty"`
 	ImportSidecar json.RawMessage `json:"import_sidecar,omitempty"`
 	ImportAlbums  []AlbumRef      `json:"import_albums,omitempty"`
+	// ImportOverlaySHA256 names the blob holding this item's drawn-on layer,
+	// for a Snapchat memory. By hash rather than by asset id because a rebuild
+	// from this log generates new ids and the hash is the bytes — see
+	// db.LinkOverlay.
+	//
+	// It is the one thing about a memory that no amount of re-reading the
+	// blobs could recover: the two files are related by sharing a stem in a
+	// filename, in an export that is deleted after the import.
+	ImportOverlaySHA256 string `json:"import_overlay_sha256,omitempty"`
 
 	// The orphan line's payload, on top of the three fields above.
 	//
@@ -103,6 +143,11 @@ type Entry struct {
 	OrphanKind   string `json:"orphan_kind,omitempty"`
 	Locator      string `json:"locator,omitempty"`
 	OrphanReason string `json:"orphan_reason,omitempty"`
+
+	// Bucket is "archive" or "hidden" on a vault line, and empty everywhere
+	// else. It is the whole payload of one: which of the two a photograph went
+	// into is not a secret, and nothing else about it is sayable here.
+	Bucket string `json:"bucket,omitempty"`
 
 	StoredAt time.Time `json:"stored_at"`
 }

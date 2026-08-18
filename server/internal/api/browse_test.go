@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -48,6 +49,191 @@ func TestTimelineIsEmptyArrayNotNull(t *testing.T) {
 	}
 	if raw.Items == nil {
 		t.Error("items is null on an empty archive, want []")
+	}
+}
+
+// The day table is what the gallery lays its whole grid out from, so the
+// numbers in it have to describe the pages the same endpoint will serve.
+func TestTimelineDaysDescribesThePagesItWillServe(t *testing.T) {
+	h := newHarness(t)
+
+	for _, name := range []string{"sample.heic", "photo.jpg", "bare.jpg"} {
+		h.upload(t, loadNamedFixture(t, name), map[string]string{
+			"X-Photo-Filename": name,
+			"X-Photo-Local-Id": name,
+		})
+	}
+
+	var table db.DayTable
+	decodeJSON(t, h.get(t, "/v1/timeline/days?tz=UTC"), &table)
+
+	if table.Zone != "UTC" {
+		t.Errorf("tz = %q, want UTC", table.Zone)
+	}
+	var counted int
+	for _, day := range table.Days {
+		counted += day.Count
+	}
+	if counted != table.Total {
+		t.Errorf("run lengths sum to %d, total says %d", counted, table.Total)
+	}
+
+	var page db.TimelinePage
+	decodeJSON(t, h.get(t, "/v1/timeline?limit=500"), &page)
+	if table.Total != len(page.Items) {
+		t.Errorf("total = %d, timeline served %d items", table.Total, len(page.Items))
+	}
+}
+
+// A timezone the server cannot resolve must not take the page down with it.
+// The days it produces are then wrong by a few hours for files that recorded no
+// zone of their own, which is a far smaller failure than a gallery that will
+// not open.
+func TestTimelineDaysFallsBackOnAnUnknownTimezone(t *testing.T) {
+	h := newHarness(t)
+	h.upload(t, loadFixture(t), nil)
+
+	var table db.DayTable
+	decodeJSON(t, h.get(t, "/v1/timeline/days?tz=Nowhere%2FAtlantis"), &table)
+
+	if table.Zone != "UTC" {
+		t.Errorf("tz = %q, want the UTC fallback", table.Zone)
+	}
+	if table.Total != 1 {
+		t.Errorf("total = %d, want 1", table.Total)
+	}
+}
+
+func TestTimelineDaysRejectsTwoCollections(t *testing.T) {
+	h := newHarness(t)
+	resp := h.get(t, "/v1/timeline/days?album=x&category=videos")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// A fling into the middle of the library asks for a row offset rather than a
+// cursor, and has to land on the row the day table counted.
+func TestTimelineSkipsToARowOffset(t *testing.T) {
+	h := newHarness(t)
+
+	for _, name := range []string{"sample.heic", "photo.jpg", "bare.jpg"} {
+		h.upload(t, loadNamedFixture(t, name), map[string]string{
+			"X-Photo-Filename": name,
+			"X-Photo-Local-Id": name,
+		})
+	}
+
+	var whole db.TimelinePage
+	decodeJSON(t, h.get(t, "/v1/timeline?limit=500"), &whole)
+
+	var jumped db.TimelinePage
+	decodeJSON(t, h.get(t, "/v1/timeline?skip=2&limit=500"), &jumped)
+
+	if len(jumped.Items) != len(whole.Items)-2 {
+		t.Fatalf("skipped page holds %d items, want %d", len(jumped.Items), len(whole.Items)-2)
+	}
+	if jumped.Items[0].ID != whole.Items[2].ID {
+		t.Errorf("skip=2 landed on %q, want %q", jumped.Items[0].ID, whole.Items[2].ID)
+	}
+}
+
+// The two ways of saying where a page starts mean different things and cannot
+// both be honoured, so naming both is a mistake worth reporting rather than one
+// to resolve by precedence.
+func TestTimelineRefusesACursorAndASkipTogether(t *testing.T) {
+	h := newHarness(t)
+	for _, name := range []string{"sample.heic", "photo.jpg"} {
+		h.upload(t, loadNamedFixture(t, name), map[string]string{
+			"X-Photo-Filename": name,
+			"X-Photo-Local-Id": name,
+		})
+	}
+
+	var page db.TimelinePage
+	decodeJSON(t, h.get(t, "/v1/timeline?limit=1"), &page)
+	if page.NextCursor == "" {
+		t.Fatal("no cursor to pair the skip with")
+	}
+
+	resp := h.get(t, "/v1/timeline?skip=1&cursor="+page.NextCursor)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestTimelineRejectsANegativeSkip(t *testing.T) {
+	h := newHarness(t)
+	resp := h.get(t, "/v1/timeline?skip=-1")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// A shared link carries an id and the grid is addressed by position, so this is
+// the translation between them — and the number it gives back has to be a
+// position in the very pages the gallery fetches.
+func TestTimelineLocateGivesAPositionInTheTimeline(t *testing.T) {
+	h := newHarness(t)
+
+	for _, name := range []string{"sample.heic", "photo.jpg", "bare.jpg"} {
+		h.upload(t, loadNamedFixture(t, name), map[string]string{
+			"X-Photo-Filename": name,
+			"X-Photo-Local-Id": name,
+		})
+	}
+
+	var whole db.TimelinePage
+	decodeJSON(t, h.get(t, "/v1/timeline?limit=500"), &whole)
+
+	for want := range whole.Items {
+		var found struct {
+			Index int `json:"index"`
+		}
+		decodeJSON(t, h.get(t, "/v1/timeline/locate?id="+whole.Items[want].ID), &found)
+		if found.Index != want {
+			t.Errorf("item %d located at %d", want, found.Index)
+		}
+
+		// And the position resolves back to the same asset through the pages.
+		var page db.TimelinePage
+		decodeJSON(t, h.get(t, fmt.Sprintf("/v1/timeline?skip=%d&limit=1", found.Index)), &page)
+		if len(page.Items) != 1 || page.Items[0].ID != whole.Items[want].ID {
+			t.Errorf("skip=%d did not land back on item %d", found.Index, want)
+		}
+	}
+}
+
+// A link to a photo that is not in the collection being browsed is the ordinary
+// case — an album page handed a library link — and it is a 404 rather than a
+// position in some other timeline.
+func TestTimelineLocateRefusesWhatIsNotInTheCollection(t *testing.T) {
+	h := newHarness(t)
+	up := decodeUpload(t, h.upload(t, loadFixture(t), nil))
+
+	resp := h.get(t, "/v1/timeline/locate?id="+up.ID+"&category=videos")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestTimelineLocateRejectsAMissingID(t *testing.T) {
+	h := newHarness(t)
+	if resp := h.get(t, "/v1/timeline/locate"); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// Both an unknown asset and an unparseable one mean the same thing to the
+// caller: there is no position here to go to.
+func TestTimelineLocateAnswers404ForAnythingItCannotPlace(t *testing.T) {
+	h := newHarness(t)
+
+	for _, id := range []string{"6b3e2c1a-0000-4000-8000-000000000000", "not-a-uuid"} {
+		resp := h.get(t, "/v1/timeline/locate?id="+id)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("id %q gave %d, want 404", id, resp.StatusCode)
+		}
 	}
 }
 

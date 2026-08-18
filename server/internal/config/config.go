@@ -42,6 +42,27 @@ type Config struct {
 	// to trust a private CA. Empty disables it.
 	PlaintextAddr string
 
+	// GalleryPassword is the browser's credential: one shared password, and the
+	// only thing standing between a laptop on the LAN and the archive when the
+	// gallery is served from the TLS listener. Empty disables browser sessions
+	// entirely, which leaves that listener token-only as it was before.
+	//
+	// In the clear in the env file, deliberately. Hashing it here would be
+	// theatre: the process needs it in memory to compare against, so a hash on
+	// disk protects nothing that the file's own 0640 root:photod does not
+	// already protect — and that file holds the database password too.
+	GalleryPassword string
+	// GallerySessionTTL is how long a browser stays signed in without being
+	// used. Idle time, pushed out by every request, so it is "how long a
+	// borrowed laptop stays useful" rather than "how often you type it".
+	GallerySessionTTL time.Duration
+	// WebURL is the gallery, for photod to reverse-proxy. Setting it puts the
+	// Next app and the photographs on one origin, which is what lets the
+	// session cookie authenticate a thumbnail — see internal/api/websession.go.
+	// Empty serves the API alone and is right in development, where Next
+	// proxies to PlaintextAddr instead.
+	WebURL string
+
 	// MDNSInstance is the advertised service name. Empty means "derive it from
 	// the hostname".
 	MDNSInstance string
@@ -86,6 +107,24 @@ type Config struct {
 	// enough that abandoned transfers do not accumulate on the archive drive.
 	UploadSessionTTL time.Duration
 
+	// PurgeInterval is how often the trash is swept for items that have served
+	// their retention. Frequent is cheap — the question is one index probe and
+	// the answer is almost always "nothing" — and the resolution it buys is not
+	// worth much either way against a year-long window.
+	PurgeInterval time.Duration
+	// PurgeDisabled stops the sweep entirely. The trash then grows without
+	// bound, which is a coherent thing to want on a machine where nothing
+	// should ever delete an original without somebody typing.
+	PurgeDisabled bool
+
+	// VaultIdle is how long the Archive and Hidden buckets stay unlocked
+	// without being used. See vault.DefaultIdle for why fifteen minutes.
+	//
+	// The encrypted trees themselves are not configurable: they are `vault/`
+	// under PhotosRoot and under DerivativesRoot, so the same "originals on the
+	// slow disk, renditions on the SSD" split holds on both sides of the lock.
+	VaultIdle time.Duration
+
 	// Binary overrides for hosts where the tools are not on PATH.
 	MagickBin   string
 	FFmpegBin   string
@@ -107,6 +146,14 @@ func FromEnv() Config {
 		// documented consequence: the read path has no authentication yet.
 		PlaintextAddr: or(os.Getenv("PLAINTEXT_ADDR"), "127.0.0.1:8788"),
 
+		GalleryPassword: os.Getenv("GALLERY_PASSWORD"),
+		// Fourteen days. A phone is in a pocket and a laptop is in a house, so
+		// this is far longer than the vault's fifteen minutes and answers a
+		// different question: not "is somebody still here" but "is this still
+		// the same laptop".
+		GallerySessionTTL: duration(os.Getenv("GALLERY_SESSION_TTL"), 14*24*time.Hour),
+		WebURL:            os.Getenv("WEB_URL"),
+
 		MDNSInstance: os.Getenv("MDNS_INSTANCE"),
 		MDNSDisabled: truthy(os.Getenv("MDNS_DISABLED")),
 
@@ -121,6 +168,11 @@ func FromEnv() Config {
 		VideoEncoder: or(os.Getenv("VIDEO_ENCODER"), "libx264"),
 
 		UploadSessionTTL: duration(os.Getenv("UPLOAD_SESSION_TTL"), 24*time.Hour),
+
+		VaultIdle: duration(os.Getenv("VAULT_IDLE"), 15*time.Minute),
+
+		PurgeInterval: duration(os.Getenv("PURGE_INTERVAL"), time.Hour),
+		PurgeDisabled: truthy(os.Getenv("PURGE_DISABLED")),
 
 		MagickBin:   or(os.Getenv("MAGICK_BIN"), "magick"),
 		FFmpegBin:   or(os.Getenv("FFMPEG_BIN"), "ffmpeg"),

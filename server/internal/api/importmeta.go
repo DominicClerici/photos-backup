@@ -25,6 +25,15 @@ type importMetadataRequest struct {
 	// directory layout rather than from the sidecar, so only the importer
 	// walking that layout can supply them.
 	Albums []albumRef `json:"albums"`
+	// OverlaySHA256 names an already-uploaded blob as this item's drawn-on
+	// layer: a Snapchat memory's captions, stickers and handwriting, which the
+	// export ships as a separate transparent PNG.
+	//
+	// Here rather than in the sidecar for the same reason Albums is: it is a
+	// relationship between two files that only the importer walking the export
+	// can see, and it names an asset by content hash, which is a fact about
+	// this archive rather than about the export.
+	OverlaySHA256 string `json:"overlaySha256"`
 }
 
 type albumRef struct {
@@ -82,6 +91,7 @@ func (s *Server) handleImportMetadata(w http.ResponseWriter, r *http.Request, _ 
 			entry.ImportAlbums = append(entry.ImportAlbums,
 				manifest.AlbumRef{Title: album.Title, Description: album.Description})
 		}
+		entry.ImportOverlaySHA256 = req.OverlaySHA256
 		if err := s.Manifest.Append(entry); err != nil {
 			s.logger().Error("append import metadata to manifest", "error", err, "sha256", asset.SHA256)
 			writeError(w, http.StatusInternalServerError, "could not record the metadata")
@@ -97,6 +107,23 @@ func (s *Server) handleImportMetadata(w http.ResponseWriter, r *http.Request, _ 
 		s.logger().Error("apply import metadata", "error", err, "asset", asset.ID)
 		writeError(w, http.StatusServiceUnavailable, "metadata recorded but not indexed; retry to reconcile")
 		return
+	}
+
+	// After the sidecar, and separately, because the two fail differently and
+	// only one of them can be retried by re-running the import. A missing
+	// overlay is an importer that sent a hash for a blob it never uploaded, and
+	// saying so is more use than a 204 that hid it.
+	if req.OverlaySHA256 != "" {
+		if err := s.Store.LinkOverlay(r.Context(), asset.ID, req.OverlaySHA256); err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				writeError(w, http.StatusBadRequest,
+					"the overlay named by overlaySha256 is not archived: "+err.Error())
+				return
+			}
+			s.logger().Error("link overlay", "error", err, "asset", asset.ID, "overlay", req.OverlaySHA256)
+			writeError(w, http.StatusServiceUnavailable, "metadata recorded but the overlay was not linked; retry to reconcile")
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

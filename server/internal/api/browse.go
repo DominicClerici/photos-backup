@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -18,9 +19,17 @@ const (
 )
 
 // handleTimeline returns one page of the timeline, newest first.
+//
+// Two ways to say where the page starts, and never both. A cursor continues
+// from the page before it, which is what a scroll down the grid does and what
+// keeps sequential paging a keyset walk. An offset names a position in the day
+// table, which is what a fling into the middle of the library does — see
+// db.TimelineAt for why that one is allowed to be an OFFSET.
 func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+
 	limit := defaultTimelineLimit
-	if raw := r.URL.Query().Get("limit"); raw != "" {
+	if raw := query.Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n <= 0 || n > maxTimelineLimit {
 			writeError(w, http.StatusBadRequest, "limit must be between 1 and 500")
@@ -30,7 +39,7 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var after *db.Cursor
-	if raw := r.URL.Query().Get("cursor"); raw != "" {
+	if raw := query.Get("cursor"); raw != "" {
 		cursor, err := db.DecodeCursor(raw)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "malformed cursor")
@@ -39,16 +48,160 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 		after = &cursor
 	}
 
-	page, err := s.Store.Timeline(r.Context(), after, limit)
+	skip := 0
+	if raw := query.Get("skip"); raw != "" {
+		if after != nil {
+			writeError(w, http.StatusBadRequest, "name at most one of cursor, skip")
+			return
+		}
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "skip must be a row offset")
+			return
+		}
+		skip = n
+	}
+
+	filter, ok := timelineFilter(w, r)
+	if !ok {
+		return
+	}
+
+	var (
+		page db.TimelinePage
+		err  error
+	)
+	if skip > 0 {
+		page, err = s.Store.TimelineAt(r.Context(), filter, skip, limit)
+	} else {
+		page, err = s.Store.Timeline(r.Context(), filter, after, limit)
+	}
 	if err != nil {
-		s.logger().Error("read timeline", "error", err)
-		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		s.writeFilterError(w, err, "read timeline")
 		return
 	}
 	if page.Items == nil {
 		page.Items = []db.TimelineItem{}
 	}
 	writeJSON(w, http.StatusOK, page)
+}
+
+// handleTimelineDays returns the shape of the whole filtered timeline: every
+// heading it will draw and how many tiles hang under each.
+//
+// The gallery asks for this once, before the first page, and lays the entire
+// grid out from it — so the scrollbar is the right height from the first frame
+// and nothing moves as pages land. See db.DayTable.
+//
+// The timezone is a query parameter because the fallback for a file that
+// recorded no UTC offset is the *viewer's* day, and the server has no way to
+// know what that is. Absent or unrecognised, it is UTC.
+func (s *Server) handleTimelineDays(w http.ResponseWriter, r *http.Request) {
+	filter, ok := timelineFilter(w, r)
+	if !ok {
+		return
+	}
+
+	table, err := s.Store.TimelineDays(r.Context(), filter, r.URL.Query().Get("tz"))
+	if err != nil {
+		s.writeFilterError(w, err, "read timeline days")
+		return
+	}
+	writeJSON(w, http.StatusOK, table)
+}
+
+// timelinePosition is where one asset sits in a timeline.
+type timelinePosition struct {
+	Index int `json:"index"`
+}
+
+// handleTimelineLocate answers where a linked asset is, so the gallery can go
+// straight there instead of paging until it appears.
+//
+// It exists because the timeline is addressed by position and a shared link is
+// not. Everything else the gallery needs — the geometry, the pages, the
+// placeholders — is a position; this is the one translation, and without it a
+// link to a five-year-old photograph costs a request per two hundred items
+// ahead of it.
+//
+// The index is a position in the same day table the grid is drawn from, so the
+// answer is something to scroll to and fetch, not just something to display.
+func (s *Server) handleTimelineLocate(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "name an asset with id")
+		return
+	}
+
+	filter, ok := timelineFilter(w, r)
+	if !ok {
+		return
+	}
+
+	index, err := s.Store.TimelinePosition(r.Context(), filter, id)
+	if err != nil {
+		// An id that is not a uuid arrives as a failed cast rather than as a
+		// missing row, and both mean the same thing here — whichever of the two
+		// ids was malformed, this timeline holds no position to go to. Answering
+		// 400 for one and 404 for the other would be a distinction the caller
+		// has no use for.
+		if errors.Is(err, db.ErrNotFound) || isBadUUID(err) {
+			writeError(w, http.StatusNotFound, "this timeline holds no such asset")
+			return
+		}
+		s.writeFilterError(w, err, "locate asset in timeline")
+		return
+	}
+	writeJSON(w, http.StatusOK, timelinePosition{Index: index})
+}
+
+// timelineFilter reads the collection a request narrows to.
+//
+// One collection at a time. Accepting two would be an intersection nothing asks
+// for, and refusing it here keeps the query's shape a thing the gallery can
+// reason about.
+func timelineFilter(w http.ResponseWriter, r *http.Request) (db.TimelineFilter, bool) {
+	filter := db.TimelineFilter{
+		AlbumID:  r.URL.Query().Get("album"),
+		Person:   r.URL.Query().Get("person"),
+		Category: r.URL.Query().Get("category"),
+		// Not counted below, because it is not a collection. It replaces the
+		// rule that says what the timeline is over rather than narrowing it, so
+		// asking for the trash *and* an album is a coherent question — "what of
+		// this album have I deleted" — even though nothing asks it yet.
+		Trash: truthy(r.URL.Query().Get("trash")),
+	}
+	if named(filter) > 1 {
+		writeError(w, http.StatusBadRequest, "name at most one of album, person, category")
+		return db.TimelineFilter{}, false
+	}
+	return filter, true
+}
+
+// writeFilterError answers for the two queries that share a filter. Both can
+// fail on what the request named rather than on the archive, and both should
+// say so with a 400 instead of blaming the database.
+func (s *Server) writeFilterError(w http.ResponseWriter, err error, what string) {
+	switch {
+	case errors.Is(err, db.ErrUnknownCategory):
+		writeError(w, http.StatusBadRequest, "unknown category")
+	case isBadUUID(err):
+		writeError(w, http.StatusBadRequest, "malformed album id")
+	default:
+		s.logger().Error(what, "error", err)
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+	}
+}
+
+// named counts how many collections a filter picks out.
+func named(f db.TimelineFilter) int {
+	n := 0
+	for _, v := range []string{f.AlbumID, f.Person, f.Category} {
+		if v != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // handleTimelineStates re-reports the state of specific assets, which is how
@@ -127,6 +280,12 @@ type assetDetail struct {
 	Albums      []string `json:"albums,omitempty"`
 	People      []string `json:"people,omitempty"`
 
+	// HasOverlay says the renditions above are composites, and that the plain
+	// routes will answer for this asset. It is the whole of what the viewer
+	// needs to offer the toggle, which is why the overlay's own id is not here:
+	// the layer is never addressed directly by anything.
+	HasOverlay bool `json:"has_overlay,omitempty"`
+
 	State         string `json:"state"`
 	PlaybackState string `json:"playback_state,omitempty"`
 }
@@ -134,6 +293,16 @@ type assetDetail struct {
 func (s *Server) handleAssetDetail(w http.ResponseWriter, r *http.Request) {
 	asset, ok := s.lookup(w, r)
 	if !ok {
+		return
+	}
+
+	// A hidden photograph opens into the same viewer with the same panel, so
+	// the panel has to be filled from the sealed document rather than from the
+	// row the scrub emptied. It is the one handler where the two halves of the
+	// archive answer from different places, and it is worth it: a panel that
+	// went blank on hidden photographs would be a second viewer by omission.
+	if asset.Vault != "" {
+		s.vaultDetail(w, r, asset)
 		return
 	}
 
@@ -170,6 +339,7 @@ func (s *Server) handleAssetDetail(w http.ResponseWriter, r *http.Request) {
 		Archived:        asset.Archived,
 		Albums:          extras.Albums,
 		People:          extras.People,
+		HasOverlay:      asset.OverlayAssetID != nil,
 		State:           asset.DerivedState,
 		PlaybackState:   asset.PlaybackState,
 	})

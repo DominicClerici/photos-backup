@@ -8,8 +8,14 @@ import { cn } from "@/lib/utils"
 function ScrollArea({
   className,
   children,
+  // Which bar to draw. Base UI scrolls in whichever direction the content
+  // overflows either way; this only decides which scrollbar is rendered, and
+  // stock shadcn assumes that is always the vertical one.
+  orientation = "vertical",
   ...props
-}: ScrollAreaPrimitive.Root.Props) {
+}: ScrollAreaPrimitive.Root.Props & {
+  orientation?: ScrollAreaPrimitive.Scrollbar.Props["orientation"]
+}) {
   return (
     <ScrollAreaPrimitive.Root
       data-slot="scroll-area"
@@ -22,7 +28,7 @@ function ScrollArea({
       >
         {children}
       </ScrollAreaPrimitive.Viewport>
-      <ScrollBar />
+      <ScrollBar orientation={orientation} />
       <ScrollAreaPrimitive.Corner />
     </ScrollAreaPrimitive.Root>
   )

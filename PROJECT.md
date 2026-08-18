@@ -27,7 +27,7 @@ browsing, ML search, USB ingest, mirroring phone deletions.
 
 | Area | Decision |
 |---|---|
-| Sync model | One-way archive. The server never deletes. |
+| Sync model | One-way archive. Sync never deletes; the gallery can. |
 | iOS app | Expo / React Native, custom dev client |
 | Core server | Go |
 | Web app | Next.js (App Router), separate process |
@@ -38,6 +38,7 @@ browsing, ML search, USB ingest, mirroring phone deletions.
 | Transport | LAN via mDNS, Tailscale when away |
 | Redundancy | Single drive for now, designed for rsync |
 | USB ingest | Deferred to v2 |
+| Archive / Hidden | Per-file AES-256-GCM under an X25519 vault key; password wraps the private half |
 
 ### Why one-way
 
@@ -45,6 +46,19 @@ The phone produces photos; the server archives them. Deleting on the phone does
 **not** delete on the server. This removes every destructive edge case, and it is
 what a backup should actually do. It also makes freeing up phone space safe later,
 because the archive is authoritative.
+
+What that rule was always protecting is the *sync path*, and it still holds there:
+nothing the phone does, and no sequence of runs, retries or reconnections, can
+remove an original. What changed in Phase 10 is that a person looking at the
+gallery can — deliberately, by hand, with a year to change their mind. See
+[Deletion](#phase-10--deletion). The property worth keeping was never "nothing is
+ever removed"; it was "nothing is removed by accident".
+
+Phase 11 bends it once more, and less far. An archived or hidden photograph is
+not removed at all: it is on the same drive, verified by the same `verify`, and
+one password away from being back in the timeline. What is gone is the ability
+of anything except that password to read it — including this server, most of the
+time. See [Archive and Hidden](#phase-11--archive-and-hidden).
 
 ### Why Expo, given the constraints
 
@@ -107,7 +121,8 @@ of hardlinks on demand, costing no extra bytes.
         |    PUT  /v1/assets/:id/chunk   resumable upload    |
         |    GET  /v1/assets/...     originals + derivatives |
         |    GET  /v1/timeline       paged gallery JSON      |
-        |    enqueues jobs                                   |
+        |    POST /v1/trash          delete, restore, purge  |
+        |    enqueues jobs + hourly trash sweep              |
         +----------+---------------------------+------------+
                    |                           |
                    v                           v
@@ -157,6 +172,8 @@ thumbnails are `libheif` and `ffmpeg` subprocess calls. Go only orchestrates.
   blobs/
     ab/cd/abcd1234....HEIC          originals, sha256-addressed, immutable
     3f/9a/3f9a77b2....MOV
+  vault/
+    5e/71/5e71c0de....enc           an original in Archive or Hidden, encrypted
   manifest.jsonl                    append-only recovery log
 
 $DERIVATIVES_ROOT/                  the SSD; defaults to /mnt/photos/derivatives
@@ -168,6 +185,10 @@ $DERIVATIVES_ROOT/                  the SSD; defaults to /mnt/photos/derivatives
   7c/21/7c21ba05.live.mp4           256px square, a Live Photo's motion
   7c/21/7c21ba05.live96.mp4         the same three seconds at the other sizes
   7c/21/7c21ba05.live512.mp4
+
+$DERIVATIVES_ROOT/vault/
+  5e/71/5e71c0de.thumb.webp.enc     every rendition of a hidden item, encrypted
+  5e/71/5e71c0de.mp4.enc            — a thumbnail is the photograph
 ```
 
 Three thumbnail sizes because the grid zooms across a range no single size
@@ -345,6 +366,8 @@ back to the Tailscale address when away. No ports are exposed to the internet.
 | Upload interrupted | Resumes from last acked offset |
 | Bit rot on disk | Caught by `photobackup verify` |
 | Database lost | Rebuilt by replaying `manifest.jsonl` |
+| Deleted by mistake | In Recently Deleted for 365 days; one Undo, or restore later |
+| Purged, but still on the phone | Tombstoned by content key, so sync answers "have" |
 
 ---
 
@@ -383,9 +406,25 @@ split because a handful of 4K transcodes would otherwise take every worker slot
 and starve the thumbnails behind them, which during a backfill looks exactly
 like a gallery that has stopped working.
 
-Not built, deliberately: a date scrubber. The timeline pages on a keyset cursor,
-so jumping to an arbitrary date means either loading everything in between or a
-second index; neither is worth it before the archive is real.
+Not built at the time, deliberately: a date scrubber. The timeline paged on a
+keyset cursor, so jumping to an arbitrary date meant either loading everything in
+between or a second index, and neither was worth it before the archive was real.
+
+The archive is real now, and the second index turned out to be worth building for
+a different reason. `/v1/timeline/days` returns every heading a collection will
+draw and how many tiles hang under it — one ordered pass over the filtered rows,
+79KB for 18,101 items and 9KB once gzipped — which lets the gallery lay the whole
+grid out, at full height, before it fetches a photograph. Scrolling stops hitting
+a wall, the scrollbar stops shrinking as pages land, and positions in that table
+double as row offsets the timeline can be asked to start at, so a fling into the
+middle of the library is one request rather than a walk. `/v1/timeline/locate`
+runs the mapping the other way, turning the id in a shared link into a position
+with a single count — the last place in the gallery that walked. A date scrubber
+is now a small thing on top of all this rather than the reason for it.
+
+It is also the address space a mass selection will be expressed in: "everything
+in August 2021" is a range of indices the client already knows the bounds of,
+whether or not it holds a single one of those photos.
 
 ### Phase 4 — Real-load hardening
 
@@ -654,6 +693,283 @@ Left deliberately: the read path. Every column here is written and none is serve
 — deciding what the gallery shows is the next question, and it is a much easier
 one to change your mind about than what was captured.
 
+### Phase 10 — Deletion
+
+The archive learns to forget, in two steps, because the interesting problem is
+not removing a photograph but making sure nothing removes one by accident.
+
+**The trash is a scope, not a place.** `assets.deleted_at` is one column, and the
+timeline's visibility predicate — the one pasted into the pages, the day table,
+the album covers, the category counts and its own partial index — grows one term.
+Recently Deleted is that predicate with the term flipped, which means it is the
+same query, the same keyset cursor, the same day table and the same grid, so the
+page is a route and a header rather than a second gallery to keep in step with
+the first. A deleted photograph leaves its albums, its people and every category
+on the same statement, because all of them were already asking the same question.
+
+**A selection is positions, so an operation is too.** The grid addresses the
+timeline by index — that is what lets a drag cover eleven thousand photographs
+the browser has never fetched — so `POST /v1/trash` takes runs of positions plus
+the filter they were counted in, and resolves them server-side in one statement.
+Ids are accepted beside them for the tile under a right-click, which is exact.
+The alternative, resolving ranges to ids in the client first, is a second round
+trip that widens the same race it was meant to close.
+
+**The undo is a batch, not a list.** Each delete stamps a uuid on the rows it
+touched, and the toast carries that. By the time anybody clicks Undo the timeline
+has been redrawn and every position in it means something else — the batch is the
+only handle that still means what it meant. It also settles the two edge cases a
+list would get wrong: the paired videos and caption layers that were carried
+along are in it, and anything already in the trash when the delete ran is not.
+
+**Two clicks beat a dialog, except on the keyboard.** Every delete in a menu or
+the selection pill is an armed button: it says "Delete", and only once it says
+"Confirm" does it delete anything. A modal to ask the same question is a third
+surface and a focus trap. Delete and Backspace get the dialog instead, because a
+keystroke has no first click to spend.
+
+**Purging is the only operation that is real, so it is the only one that is
+hard.** Rows and the content tombstone go in one statement — a row deleted
+without a tombstone is a photograph the next backup uploads again, and the two
+must not be able to come apart. Then the manifest line, so a rebuild knows this
+was a decision rather than a loss. Then the bytes, last, because they are the one
+step rerunning the others cannot repair. `verify` reports a file left behind;
+nothing reports an asset the archive can no longer produce.
+
+**A delete that the next backup undoes is not a delete.** The phone still holds
+the photograph, and sync/check asks by content key, so a purge leaves that key
+behind in `purged_content` and the answer to "shall I upload this again" is a
+truthful-enough "have". It is a wall rather than a decision on purpose: choosing
+which purged photographs may come back is a thing to do in the gallery, where
+somebody can see what they are choosing between.
+
+**Deleting an album is not deleting photographs.** An album is a grouping an
+import produced, so the default drops the row and leaves every picture where it
+was; "Delete album and photos" is the other reading and has to be aimed at. Both
+share one batch, so the undo puts the album and its contents back together — an
+album restored empty would be a worse outcome than either half.
+
+The expiry runs inside photod on an hourly sweep rather than on a systemd timer
+beside `verify`, for the same reason the upload sweep does: a retention that only
+elapses on hosts where somebody installed a second unit is not a retention.
+
+### Phase 11 — Archive and Hidden
+
+Two buckets a photograph can be put into, and the first thing in this project
+that is kept from somebody holding the disk rather than merely from the timeline.
+
+**They are one mechanism and two destinations, on purpose.** Archive and Hidden
+do exactly the same thing; what differs is the reason a person has for reaching
+for one. "I have seen enough of this" and "this is nobody else's business" are
+not the same sentence, and a single destination with a checkbox on it would be
+the kind of tidiness that makes a product worse. Everything in the code says
+`vault` when it means either.
+
+**Putting something in must not need the password. Taking anything out must.**
+This is the constraint the whole design is bent around. Hiding a photograph
+happens at a right-click in a gallery that has been open all afternoon, and a
+password prompt there teaches people to leave the vault unlocked — which costs
+more than every property the password was buying. So the vault is an X25519
+keypair rather than a password-derived key: the public half sits in the clear
+and anything may encrypt to it, the private half is sealed under Argon2id and
+nothing reads a byte back without it. Archiving forty photographs on a locked
+vault works, and produces forty files this server cannot open.
+
+**A thumbnail is the photograph.** The original is encrypted, and so is every
+rendition made from it — the three thumbnail sizes, the playback file, the Live
+Photo's motion. Encrypting a 12-megapixel HEIC and leaving a 256px copy of the
+same picture on the SSD would be a vault with a window in it. The renditions are
+decrypted straight into the response, chunk by chunk, and never touch a disk in
+the clear; the three that are rendered on demand — the 2048px preview, a Live
+Photo's 1080p clip, a composited caption layer — are the exception, because
+ImageMagick and ffmpeg want a seekable path, and they get a staged copy that
+lasts as long as the render.
+
+**And the metadata is the photograph too.** A row saying `IMG_5874.HEIC`,
+`iPhone 15 Pro`, 41.78N 122.58W, "at the border", album *Iceland 2025*, people
+*Brody, Dominic* describes the picture well enough that not having the picture
+is a detail. So the row is scrubbed: forty-odd columns emptied into a sealed
+document, and the album and face rows deleted outright — which is also the
+feature's own requirement that a hidden photograph leaves its albums, its people
+and every category. The categories need no statement at all, because every one
+of them is a predicate over columns the scrub has just emptied, inside a scope
+the row has just left.
+
+Two things deliberately stay in the clear, and the second is a real cost. The
+structural columns — what is a paired video, what is a caption layer — because
+they are what says this row is part of another one. And the content key, because
+`sync/check` answers "have I got this?" from `(md5, size)`: without it the phone
+would offer the photograph again on the next backup and the archive, having
+genuinely forgotten it, would take it. Hiding a photograph would restore it.
+What that leaks is that somebody holding the database can test whether a file
+they already have is in the vault; they learn nothing they did not already know.
+
+**The vault's gallery is computed in memory, because it has to be.**
+`order by sort_time` over a column that no longer holds a capture time is not a
+query that can be fixed, and keeping a plaintext index to sort the encrypted
+rows by would be encrypting nothing. So unlocking builds an index: every sealed
+document opened, sorted, grouped into albums and people and categories, and
+served back in exactly the shapes the library's own endpoints use — same page,
+same cursor, same day table. The client cannot tell which half of the archive it
+is drawing, which is the point: there is one grid, one viewer, one zoom, and
+encrypting half the archive did not earn a second one. It is affordable because
+a vault is not a library — the library grows by itself, a vault is what somebody
+went and hid, one gesture at a time.
+
+**Hiding creates before it destroys, which is the opposite of a purge.** A purge
+commits the database first and takes the bytes last, because a file left behind
+is a finding and a row without a file is a loss. Hiding goes the other way: the
+ciphertext is written while the plaintext is still there, then the transaction,
+then the unlink. The window that leaves — a crash after the commit and before
+the unlink, which is a hidden photograph still readable on the drive — is the
+one failure here that is a security bug rather than an inconvenience, so it is
+not left to chance. An hourly sweep looks for it, beside the trash's expiry.
+
+**A restore puts a photograph back where it was, and says nothing when it
+cannot.** The albums travel in the sealed document as ids and titles, so the
+restore rejoins the ones that still exist and drops the ones that do not. No
+warning, no resurrected album: the album was deleted on purpose, weeks ago, and
+being told about it at the moment of a restore would be a notification about
+somebody else's decision. The photograph goes back to the gallery either way.
+
+**There is no delete inside the vault.** Taking a photograph out and then
+deleting it is two decisions, and one button that decrypted a file in order to
+throw it away would be spending the password on the only operation that does not
+need it. The vault's menu offers Unarchive or Unhide and nothing else.
+
+**The word on the button says what the button is about.** One photograph is a
+photo or a video, because the grid knows which; several are *items*, because a
+selection of eleven photographs and two videos is neither eleven photos nor
+thirteen. An album is called "album" and not by its title — "Archive Iceland
+2025" reads like a sentence about Iceland — and a person *is* called by their
+name, because "Hide person" would be asking somebody to remember which circle
+they right-clicked. Delete goes through the same function, so the three verbs
+cannot end up describing the same selection three different ways.
+
+**The old "Archived" is not this.** Google's export carries an archive flag,
+imported since Phase 8 and stored on `assets.archived`. It is a category like
+any other, over photographs that are otherwise entirely ordinary members of this
+library, and nothing about it is encrypted or was decided here. It keeps the
+past tense it was imported with and stays where it was, above the two new rows;
+the new one takes the plain noun. They have nothing in common but a word.
+
+### Phase 12 — The gallery on the network
+
+A browser anywhere in the house can now open the archive, behind one shared
+password, over the same TLS listener the phone has used since Phase 5.
+
+**The cookie was the whole obstacle, and it turned out to be a door rather than
+a wall.** Phase 5 wrote the problem down as a choice between two bad options:
+give up pointing `<img>` straight at photod, or mint HMAC-signed media URLs into
+the timeline JSON. Phase 6 closed the phone's half by putting the token on every
+request React Native makes, and said the browser's half was untouched. It was —
+but the answer was never a signed URL. A browser attaches a **same-origin
+cookie** to a subresource without being asked, which is exactly the thing it
+refuses to do with a bearer header. So photod serves the gallery itself: the
+Next app, the JSON and the thumbnails all arrive from one origin, and one cookie
+authenticates all three. No second credential, no expiry to manage, and still no
+URL that is itself a secret.
+
+**One origin means photod reverse-proxies Next.** `/v1/*` is the API, `/api/*`
+is the same routing table with the prefix stripped on arrival, and everything
+else is the gallery. The alias is what keeps a single build of the web app
+working in both places: in development `next.config.ts` rewrites `/api/*` away
+to the loopback listener, and in production photod strips it instead. The client
+never learns which world it is in.
+
+**The gate is on the API, not on the app.** The bundle, the HTML and the CSS are
+served to anyone on the network who asks for them, because they are not the
+archive — every photograph and every row of every timeline is behind `/v1`, and
+therefore behind the guard. Gating the shell as well would buy a redirect to
+write and a login page to serve twice.
+
+**A house key, not an account system.** One password, no usernames, no roles, no
+reset, and sessions that exist only in this process's memory — a photod restart
+signs every browser out. There is no table, no migration and no file on disk
+that records a session, which is deliberate: the whole feature is written to be
+deleted whole if it is ever replaced by something real. `internal/websession`
+lists what deletion means, and the four lines it needs in `api.go` are each
+marked. It is a strict widening while it is there: with no `GALLERY_PASSWORD`
+set, no session can be created, and the guard is the Phase 6 guard exactly.
+
+**Two passwords, and they are not the same kind of thing.** The vault password
+is never written down anywhere a machine can use, because what it protects the
+photographs from is *this server*. The gallery password sits in the clear in
+`photod.env` beside `DATABASE_URL`, because a lock the server has to be able to
+check is a lock the server has to hold the answer to. Hashing it there would be
+theatre — the process needs the plaintext in memory to compare against either
+way. The two are separate on purpose, and the sign-in prompt says so.
+
+**A misconfiguration that opens the library is a startup error.** `WEB_URL` set
+with `GALLERY_PASSWORD` empty does not start. The failure it prevents is the
+quiet one: a gallery that works perfectly, for everybody on the Wi-Fi.
+
+What this does *not* change is worth being as clear about. `PLAINTEXT_ADDR` is
+still loopback and still unauthenticated — it is what `next dev` talks to, and
+widening it is the same mistake it always was, now with a locked front door
+beside the open back one. The vault's unlock is still server-wide, so one
+signed-in browser unlocking it unlocks it for every signed-in browser; that is
+the same property Phase 11 shipped, reaching further than it used to. And a
+laptop still has to install the CA once, exactly as the phone did.
+
+### Phase 13 — Albums you can make
+
+Until this, the only thing in the archive that could create an album was an
+import. The gallery could browse one, hide one and delete one; it could not make
+one, and it could not put a photograph into one. Three writes, and almost
+nothing new underneath them — the table, the membership and the timeline filter
+have been there since Phase 8.
+
+**An album is a title and a membership list, and nothing else.** No ordering of
+its own, no cover somebody picked, no per-album settings. Every question about
+what is *in* one is answered by the timeline with an album filter, which already
+pages, virtualizes, zooms and selects. Adding a second way to look at an album
+would be adding a worse one.
+
+**A selection is positions here too.** `POST /v1/collections/albums/{id}/items`
+takes the same runs-plus-filter body the trash and the vault take, resolved by
+the same `Selection.pick`. Removing is the same body on `DELETE`, because a
+selection *is* a body and the verb that says "take these out" has nowhere else
+to carry what to take out.
+
+**Making and filling are one request.** The usual way an album comes into
+existence is out of a selection — right-click, Add to album, Create "Iceland" —
+and splitting that in half leaves a failure mode where the album exists and is
+empty and somebody has to notice.
+
+**The name is unique among the albums that still exist.** The constraint an
+import relies on counted rows the gallery cannot see, so deleting "Iceland" held
+its name hostage for the 365 days it sat in Recently Deleted. Migration 0013
+scopes it to the live rows. It is deliberately *not* scoped by bucket: a hidden
+album's title still occupies the name, which leaks one bit — you can learn that
+*some* hidden album is called that by being told the name is taken — and buys
+the thing that matters more, which is that hiding an album is an update of one
+column and can therefore never fail on a uniqueness check.
+
+**The vault gets the same three writes and shares none of their code.** A hidden
+photograph's albums live inside its sealed document, so filing one is opening
+that document, adding a line, and sealing it again — `POST
+/v1/vault/{bucket}/albums/{id}/items`, with the bucket in the path so no request
+can put an archived photograph into a hidden album. Two things follow. This is
+the first operation in the feature that a locked vault cannot do, and not by
+policy: a document has to be opened to be added to. And an album made inside a
+bucket is an archived album from the moment it exists, because the alternative —
+make it in the library, then hide it — puts its title on the collections page in
+between.
+
+**Removing from an album is armed, and is not red.** Two clicks, because "remove
+these forty" is a thing to have meant rather than a thing to discover. Not the
+delete's colour, because nothing is destroyed: every photograph stays in the
+library, in its other albums and in the timeline, and the toast carries an Undo
+whenever the request named exact ids.
+
+**The menu searches, and the ticks only appear when they can mean something.**
+"Add to album" is a submenu with a box at the top; typing anywhere in it goes to
+the box. With one photograph selected the albums it is already in are ticked and
+clicking a ticked one takes it out. With several, they are not — a selection of
+forty has forty answers, and a tick that meant "some of them" is not a thing
+anybody wants to read off a menu they opened to file something.
+
 ### v2
 
 - **ML service.** Python, CLIP semantic search, then face detection and clustering.
@@ -691,15 +1007,20 @@ Cheap to verify now, annoying to discover in Phase 3.
 **6. Battery and heat.** Pushing 100GB will heat the phone significantly. Bulk
 backfill should be gated on charging + Wi-Fi by default, with a manual override.
 
-**7. Unauthenticated gallery.** Closed on the TLS listener: the read path now
-takes the same device token the write path does, so nothing on the LAN reads the
-archive without having been paired. What remains is the plaintext listener, which
-stays open by design for the browser gallery and is bound to loopback — it is now
-the only unauthenticated way in, and widening `PLAINTEXT_ADDR` is the whole risk
-rather than one half of it. A device token still cannot cross it: pairing and
-every authenticated route are absent from its routing table, so widening it
-exposes photos but never a credential. Putting the gallery on the internet, which
-§4 keeps as an option, still needs an answer for the browser — see below.
+**7. Unauthenticated gallery.** Closed on both listeners' terms since Phase 12.
+The TLS listener takes a device token or a browser session, so nothing on the LAN
+reads the archive without either having been paired or knowing the gallery
+password. What remains is the plaintext listener, which stays open by design and
+bound to loopback — it is still the only unauthenticated way in, and widening
+`PLAINTEXT_ADDR` is still the whole risk. A device token cannot cross it, and
+neither can the gallery password: pairing and both sign-in routes are absent from
+its routing table, so widening it exposes photographs but never a credential.
+What is genuinely new is that one shared password now stands in front of the
+archive for anyone on the Wi-Fi, which is a weaker thing than a 256-bit token —
+rate-limited per address, and the reason the sessions it issues are memory-only
+and idle-expiring. Putting the gallery on the internet, which §4 keeps as an
+option, is a different question again: this is a house key, and the internet is
+not a house.
 
 **8. Losing `ca.key`.** It is the one file whose loss means physically re-pairing
 every device, and the one whose disclosure lets somebody impersonate the archive

@@ -8,6 +8,7 @@
 //	photobackup export --to DIR [--from DATE] [--until DATE] [--copy]
 //	photobackup reindex [--adopt-orphans] [--dry-run]
 //	photobackup import --from DIR [--dry-run]
+//	photobackup import-snapchat --from DIR [--half memories|chat] [--dry-run]
 //	photobackup reset [--dry-run] [--yes] [--force]
 //	photobackup pair [--ttl 10m]
 //	photobackup devices [--revoke ID]
@@ -29,6 +30,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
+	"github.com/dominicclerici/photos-backup/server/internal/vault"
 	"github.com/dominicclerici/photos-backup/server/internal/verify"
 )
 
@@ -38,6 +40,8 @@ const usage = `photobackup — maintenance for the photo archive
   export --to DIR [--copy]             materialize a date tree of hardlinks
   reindex [--adopt-orphans]            rebuild the database from manifest.jsonl
   import --from DIR [--dry-run]        ingest a Google Photos export
+  import-snapchat --from DIR           ingest a Snapchat export, one half at a
+    [--half memories|chat]             time; pass --from once per unzipped zip
   reset [--dry-run] [--yes]            erase the archive, keep paired devices
 
   pair [--ttl 10m]                     mint a single-use code to pair a device
@@ -81,6 +85,8 @@ func main() {
 		code, err = runReindex(ctx, os.Args[2:])
 	case "import":
 		code, err = runImport(ctx, os.Args[2:])
+	case "import-snapchat":
+		code, err = runImportSnapchat(ctx, os.Args[2:])
 	case "reset":
 		code, err = runReset(ctx, os.Args[2:])
 	case "pair":
@@ -148,6 +154,7 @@ func open(ctx context.Context) (archive, error) {
 			Store:       store,
 			Blobs:       blobstore.New(root),
 			Derivatives: derivstore.New(derivRoot),
+			VaultBlobs:  vault.NewStore(filepath.Join(root, "vault")),
 			Uploads:     uploads.New(filepath.Join(root, "incoming")),
 			Queue:       jobs.NewQueue(store.Pool()),
 			PhotosRoot:  root,

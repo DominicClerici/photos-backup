@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { Check } from "lucide-react";
 
 import { useLiveFade } from "@/hooks/useLiveFade";
 import { liveThumbUrl, thumbUrl, type TimelineItem } from "@/lib/api";
@@ -23,6 +24,20 @@ const HOVER_DELAY_MS = 120;
  */
 const SRC_NOT_SUPPORTED = 4;
 
+/**
+ * The picture inside a tile's square, which is not quite the square itself.
+ *
+ * A selected tile draws back from its cell and rounds off, the way a card
+ * lifted off a table stops being flush with the ones beside it. The square is
+ * still exactly where the grid put it — the shrink happens inside, on an
+ * element the zoom loop does not touch, so the two transforms never fight over
+ * the same node.
+ */
+const CHROME =
+  "absolute inset-0 overflow-hidden bg-tile transition-[transform,border-radius] duration-150 ease-out motion-reduce:transition-none";
+/** Proportional, so the corner looks the same at 64px and at 512px. */
+const PICKED = "scale-[0.86] rounded-[7%]";
+
 interface Props {
   item: TimelineItem;
   /**
@@ -38,10 +53,23 @@ interface Props {
   /** Where the render loop finds this tile in the day model, without a lookup. */
   day: number;
   offset: number;
+  /** Whether the grid is in selection mode; every tile shows its mark if so. */
+  selecting: boolean;
+  selected: boolean;
   onOpen: (id: string) => void;
 }
 
-export function Tile({ item, size, thumbSize, transform, day, offset, onOpen }: Props) {
+export function Tile({
+  item,
+  size,
+  thumbSize,
+  transform,
+  day,
+  offset,
+  selecting,
+  selected,
+  onOpen,
+}: Props) {
   const [broken, setBroken] = useState(false);
   const [seenState, setSeenState] = useState(item.state);
 
@@ -63,58 +91,163 @@ export function Tile({ item, size, thumbSize, transform, day, offset, onOpen }: 
   return (
     <button
       type="button"
-      className="absolute top-0 left-0 block origin-top-left overflow-hidden bg-tile focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+      className="absolute top-0 left-0 block origin-top-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
       style={{ width: size, height: size, transform }}
       data-day={day}
       data-tile={offset}
-      onClick={() => onOpen(item.id)}
+      // A click in selection mode has already been spent on the selection by
+      // the time this fires — the grid picks tiles on pointerdown, so that a
+      // press that turns into a drag is one gesture rather than a click and
+      // then a drag.
+      onClick={() => {
+        if (!selecting) onOpen(item.id);
+      }}
       aria-label={`${label} taken ${new Date(item.taken_at).toLocaleString()}`}
+      aria-pressed={selecting ? selected : undefined}
     >
-      {attempt ? (
-        <img
-          className="block size-full object-cover"
-          src={src}
-          alt=""
-          loading="lazy"
-          decoding="async"
-          draggable={false}
-          onError={() => {
-            // A size that was never rendered is not a broken photo; only the
-            // base rendition failing means there is nothing to draw.
-            if (!fallback()) setBroken(true);
-          }}
-        />
-      ) : (
-        <span
-          className={cn(
-            "flex size-full items-center justify-center",
-            broken
-              ? "text-faint"
-              : "animate-shimmer bg-[linear-gradient(100deg,var(--tile)_30%,var(--tile-sheen)_50%,var(--tile)_70%)] bg-[length:200%_100%] motion-reduce:animate-none",
-          )}
-        >
-          {broken ? <BrokenGlyph /> : null}
-        </span>
-      )}
+      <span className={cn(CHROME, selected && PICKED)}>
+        {attempt ? (
+          <img
+            className="block size-full object-cover"
+            src={src}
+            alt=""
+            loading="lazy"
+            decoding="async"
+            draggable={false}
+            onError={() => {
+              // A size that was never rendered is not a broken photo; only the
+              // base rendition failing means there is nothing to draw.
+              if (!fallback()) setBroken(true);
+            }}
+          />
+        ) : (
+          <span
+            className={cn(
+              "flex size-full items-center justify-center",
+              broken
+                ? "text-faint"
+                : "animate-shimmer bg-[linear-gradient(100deg,var(--tile)_30%,var(--tile-sheen)_50%,var(--tile)_70%)] bg-[length:200%_100%] motion-reduce:animate-none",
+            )}
+          >
+            {broken ? <BrokenGlyph /> : null}
+          </span>
+        )}
 
-      {attempt && item.live === "ready" ? <Motion id={item.id} size={thumbSize} /> : null}
+        {/* No motion while picking photographs: a sweep across the grid to
+            select forty of them would otherwise start forty videos, and the clip
+            would play underneath the mark saying the tile had been chosen. */}
+        {attempt && item.live === "ready" && !selecting ? (
+          <Motion id={item.id} size={thumbSize} />
+        ) : null}
 
-      {item.live && item.live !== "failed" ? (
-        <span
-          className="absolute top-1.5 left-1.5 text-white/90 [filter:drop-shadow(0_1px_2px_rgb(0_0_0/0.6))]"
-          aria-hidden="true"
-        >
-          <LiveGlyph />
-        </span>
-      ) : null}
+        {item.live && item.live !== "failed" ? (
+          <span
+            className={cn(
+              "absolute top-1.5 left-1.5 text-white/90 transition-opacity duration-150 [filter:drop-shadow(0_1px_2px_rgb(0_0_0/0.6))]",
+              // The mark stands where this does, and two glyphs in one corner
+              // read as neither.
+              selecting && "opacity-0",
+            )}
+            aria-hidden="true"
+          >
+            <LiveGlyph />
+          </span>
+        ) : null}
 
-      {item.kind === "video" ? (
-        <span className="absolute right-1.5 bottom-[5px] flex items-center gap-[3px] text-[11px] tabular-nums text-white [text-shadow:0_1px_3px_rgb(0_0_0/0.7)]">
-          <PlayGlyph />
-          {item.duration ? <span>{formatDuration(item.duration)}</span> : null}
-        </span>
-      ) : null}
+        {item.kind === "video" ? (
+          <span className="absolute right-1.5 bottom-[5px] flex items-center gap-[3px] text-[11px] tabular-nums text-white [text-shadow:0_1px_3px_rgb(0_0_0/0.7)]">
+            <PlayGlyph />
+            {item.duration ? <span>{formatDuration(item.duration)}</span> : null}
+          </span>
+        ) : null}
+
+        {selecting ? <Mark selected={selected} size={size} /> : null}
+      </span>
     </button>
+  );
+}
+
+/**
+ * Whether a tile has been picked, drawn in the corner of the picture.
+ *
+ * Sized from the cell rather than fixed, because the cell runs from 64px to
+ * 512px: a mark that reads well on the largest tiles would cover a third of the
+ * smallest ones. It sits inside the chrome, so it draws back with the picture
+ * rather than hanging off the corner of a square that has shrunk away from it.
+ */
+function Mark({ selected, size }: { selected: boolean; size: number }) {
+  const d = Math.round(Math.min(20, Math.max(13, size * 0.17)));
+  const inset = Math.round(d * 0.34);
+  return (
+    <span
+      aria-hidden="true"
+      className={cn(
+        "absolute flex items-center justify-center rounded-full border-2 transition-colors duration-150 motion-reduce:transition-none",
+        selected
+          ? "border-primary bg-primary text-primary-foreground"
+          : // Unpicked: an empty ring over whatever the photograph happens to
+            // be, which is why it carries its own shadow. The tick is already
+            // there and merely invisible, so picking the tile fills it in
+            // rather than popping a new glyph into the corner.
+            "border-white/85 bg-black/25 text-transparent [filter:drop-shadow(0_1px_2px_rgb(0_0_0/0.55))]",
+      )}
+      style={{ width: d, height: d, top: inset, left: inset }}
+    >
+      <Check strokeWidth={3.2} style={{ width: d * 0.6, height: d * 0.6 }} />
+    </span>
+  );
+}
+
+/**
+ * A square the grid knows the place and size of but not yet the picture for.
+ *
+ * The grid can draw these before it has asked for a single photograph, because
+ * the day table fixes every tile's position up front — which is the whole point
+ * of them. Scrolling never runs out of grid to scroll through, the scrollbar
+ * never shrinks under the pointer as pages land, and a photo that arrives
+ * replaces the exact square that was standing in for it.
+ *
+ * Deliberately inert. It carries no shimmer: a screenful at the smallest zoom
+ * is a couple of thousand of these, and animating all of them would cost more
+ * than fetching the photographs they are waiting for. It is also flatter than
+ * the shimmer a Tile shows for a thumbnail that is still being generated, which
+ * keeps the two states distinguishable — this one is waiting on the network,
+ * that one on the worker.
+ *
+ * It carries the same `data-day`/`data-tile` pair a Tile does, because the zoom
+ * loop places every child of the board by those attributes and does not care
+ * which kind it is. Selection reads it the same way: the index is the address,
+ * so a placeholder for a selected photo is a selected placeholder, and scrolling
+ * back to a stretch of the timeline that has been dropped from memory shows the
+ * marks before it shows the photographs.
+ */
+export function Skeleton({
+  size,
+  transform,
+  day,
+  offset,
+  selecting,
+  selected,
+}: {
+  size: number;
+  transform: string;
+  day: number;
+  offset: number;
+  selecting: boolean;
+  selected: boolean;
+}) {
+  return (
+    <div
+      className="absolute top-0 left-0 origin-top-left"
+      style={{ width: size, height: size, transform }}
+      data-day={day}
+      data-tile={offset}
+      aria-hidden="true"
+    >
+      <span className={cn(CHROME, selected && PICKED)}>
+        {selecting ? <Mark selected={selected} size={size} /> : null}
+      </span>
+    </div>
   );
 }
 

@@ -137,4 +137,14 @@
   [role="button"]:not(:disabled) {
     @apply cursor-pointer;
   }
+
+  /* The viewer is a full-screen overlay above the tab bar, so the bar is already
+     out of sight whenever one is open — but not out of the tab order, and a
+     control nobody can see is not one anybody should be able to focus. An
+     attribute on <body> rather than shared state because the overlay is mounted
+     by a page and the bar by the root layout, so the two never meet in React. */
+  body[data-overlay="open"] [data-slot="tab-bar"] {
+    visibility: hidden;
+    opacity: 0;
+  }
 }
