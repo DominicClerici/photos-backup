@@ -1,7 +1,7 @@
 // Package derive renders web-viewable images from stored originals by driving
 // ImageMagick, which reads HEIC through libheif. Go only builds argv.
 //
-// Two renditions, and they are stored differently on purpose:
+// Three renditions, and they are stored differently on purpose:
 //
 //   - Thumbs are the square sizes the grid draws, written to disk once, because
 //     the grid asks for hundreds at a time and converting on demand would mean
@@ -9,6 +9,9 @@
 //   - Preview is 2048px and converted per request, never stored. One viewer
 //     shows one preview at a time, and the bytes are content-addressed, so the
 //     browser's own cache does the caching that a derivative file would.
+//   - MLRendition is 512px and uncropped, written to disk once, because the
+//     thing that reads it is a model that will be swapped for another one and
+//     the swap has to re-read the whole library.
 package derive
 
 import (
@@ -28,6 +31,11 @@ type Converter struct {
 	Binary string
 
 	ThumbQuality int
+	// MLQuality is the ML rendition's WebP quality. Higher than a thumbnail's,
+	// because this one is read by a model looking for what is in the picture
+	// rather than by an eye glancing at a 96px cell, and lower than the
+	// preview's, because nobody looks at it at all.
+	MLQuality int
 
 	// PreviewSize bounds the longest edge. Images already smaller are not
 	// scaled up.
@@ -47,6 +55,7 @@ func New() *Converter {
 	return &Converter{
 		Binary:             "magick",
 		ThumbQuality:       75,
+		MLQuality:          80,
 		PreviewSize:        2048,
 		PreviewQuality:     82,
 		PreviewConcurrency: 4,
@@ -150,6 +159,61 @@ func (c *Converter) Thumbs(ctx context.Context, src string, over *Layer, targets
 		if info.Size() == 0 {
 			return fmt.Errorf("convert %s to a %dpx thumbnail: nothing was written", src, t.Size)
 		}
+	}
+	return nil
+}
+
+// MLRendition writes the whole frame, uncropped, bounded by edge on its longest
+// side — the file the vision service is handed.
+//
+// The two differences from Thumbs are the whole reason this exists. It does not
+// crop, because a centre crop decides in advance what the photograph was about
+// and the subject is frequently at the edge of the frame. And it goes to disk
+// as a single file per asset rather than three, because a model swap re-reads
+// every one of them: 61,000 small WebPs is minutes, and re-decoding 73GB of
+// HEIC and H.265 is hours. That difference is what makes trying a second model
+// a decision rather than a project.
+//
+// The caption layer is burned in, like everywhere else in this package: for a
+// Snapchat memory the composite is the picture, and the handwriting over it is
+// something a model should be able to read and describe.
+//
+// No semaphore here, unlike Preview. This runs from the prep pool, whose size
+// is PREP_CONCURRENCY, and borrowing the viewer's four slots would mean a
+// backfill sitting in the queue somebody's open photograph is waiting in.
+func (c *Converter) MLRendition(ctx context.Context, src string, over *Layer, edge int, dst string) error {
+	if edge <= 0 {
+		return fmt.Errorf("render %s for the model: %d is not an edge length", src, edge)
+	}
+
+	compose, err := c.compose(ctx, src, over)
+	if err != nil {
+		return err
+	}
+
+	ops := []string{"-auto-orient"}
+	ops = append(ops, compose...)
+	ops = append(ops, keepColour...)
+	ops = append(ops,
+		// Shrink only. A 240px screenshot enlarged to 512 is the same picture
+		// with more bytes, and a model resizes its own input anyway.
+		"-resize", fmt.Sprintf("%dx%d>", edge, edge),
+		"-quality", fmt.Sprint(c.mlQuality()),
+		"webp:"+dst,
+	)
+	if err := c.run(ctx, nil, "an ML rendition", src, ops...); err != nil {
+		return err
+	}
+
+	// The same check Thumbs makes, for the same reason: ImageMagick can exit 0
+	// having written a file it could not finish, and an empty rendition would
+	// be a job marked done with nothing for the model to read.
+	info, err := os.Stat(dst)
+	if err != nil {
+		return fmt.Errorf("render %s for the model: %w", src, err)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("render %s for the model: nothing was written", src)
 	}
 	return nil
 }
@@ -408,6 +472,13 @@ func (c *Converter) thumbQuality() int {
 		return 75
 	}
 	return c.ThumbQuality
+}
+
+func (c *Converter) mlQuality() int {
+	if c.MLQuality <= 0 {
+		return 80
+	}
+	return c.MLQuality
 }
 
 func (c *Converter) previewSize() int {

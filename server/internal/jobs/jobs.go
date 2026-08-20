@@ -38,6 +38,19 @@ const (
 	// same queue as the thumbnails it would stall the gallery for an hour to
 	// answer a question that has not been asked yet.
 	KindSignature Kind = "signature"
+	// KindMLPrep writes the renditions the vision service reads: the whole
+	// photograph, uncropped, at 512px, and several frames out of a video. It is
+	// the Go half of ML_IMAGES.md §3 — Go decodes, Python does tensors, and
+	// photo-ml never opens a file under /mnt/photos.
+	//
+	// Its own kind rather than part of a later `vision` job, so that swapping
+	// the model requeues only the model's half: the renditions are already on
+	// disk and decoding them again is the expensive part. Its own kind rather
+	// than part of `metadata`, so that one new file per asset does not re-run
+	// exiftool and three thumbnail sizes over 23,000 of them — migration 0007
+	// did exactly that, correctly, for a change that genuinely needed it. This
+	// one does not.
+	KindMLPrep Kind = "mlprep"
 	// KindMerge concatenates a set of Snapchat segments into one archived
 	// recording. ffmpeg, so it runs in the transcode pool; the asset it names is
 	// the first piece, which is as close as this table gets to naming a group.
@@ -108,6 +121,29 @@ func Requeue(ctx context.Context, q Execer, kind Kind, assetID string) error {
 		    locked_at = null, locked_by = null, last_error = null, updated_at = now()`
 	if _, err := q.Exec(ctx, upsert, string(kind), assetID); err != nil {
 		return fmt.Errorf("requeue %s job: %w", kind, err)
+	}
+	return nil
+}
+
+// Discard removes work that is no longer owed, whatever state it is in.
+//
+// The counterpart to Requeue, and the answer to a question this table cannot
+// answer for itself: a job names an asset, and some work is owed to something
+// larger than one. When a set of Snapchat segments is refused or taken apart,
+// the merge queued against its first piece is not pending, not failed, and not
+// done — it is void, and a failed row left behind would go on being reported on
+// the status page as a job that gave up.
+// A job that is running is left alone. Its worker is holding a lease and is
+// going to report on it, and pulling the row out from under that would lose the
+// completion rather than the work — the run itself is already harmless, because
+// every job that can be discarded checks that it is still wanted before it
+// changes anything.
+func Discard(ctx context.Context, q Execer, kind Kind, assetID string) error {
+	const remove = `
+		delete from jobs
+		where kind = $1 and asset_id = $2::uuid and state <> 'running'`
+	if _, err := q.Exec(ctx, remove, string(kind), assetID); err != nil {
+		return fmt.Errorf("discard %s job: %w", kind, err)
 	}
 	return nil
 }
@@ -240,6 +276,39 @@ func ReconcileSignatures(ctx context.Context, q Execer, version int) (int64, err
 	tag, err := q.Exec(ctx, upsert, version)
 	if err != nil {
 		return 0, fmt.Errorf("reconcile signature jobs: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// ReconcileMLPrep queues ML renditions for everything the timeline shows and
+// has none.
+//
+// The predicate is assets_timeline_visible_idx, written out: no vault, no
+// trash, no overlays, no paired videos. Those four fall out for the right
+// reasons rather than as an optimisation. A paired video is not an item, it is
+// a still's motion; an overlay is not a photograph, it is one layer of
+// somebody's handwriting over one — and indexing either would put a second copy
+// of the same moment into every result page. The vault falls out because a
+// description of what a hidden photograph looks like is the thing the vault
+// exists to stop this server holding.
+//
+// Unlike ReconcileSignatures there is no version to compare against, because
+// the evidence that this job ran is a file on disk rather than a row. A changed
+// rendition format is therefore a deliberate requeue rather than something a
+// restart notices — which is the right way round for work whose output nothing
+// is waiting for.
+func ReconcileMLPrep(ctx context.Context, q Execer) (int64, error) {
+	const insert = `
+		insert into jobs (kind, asset_id)
+		select 'mlprep', a.id
+		from assets a
+		left join jobs j on j.asset_id = a.id and j.kind = 'mlprep'
+		where j.id is null
+		  and a.vault = '' and a.deleted_at is null and not a.is_overlay
+		  and a.live_parent_local_id = '' and a.live_parent_asset_id is null`
+	tag, err := q.Exec(ctx, insert)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile mlprep jobs: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }

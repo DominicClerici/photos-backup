@@ -44,6 +44,11 @@ func New(root string) *Store {
 	return &Store{root: root}
 }
 
+// Root is the archive directory itself — blobs/, manifest.jsonl and incoming/
+// are all under it. Exposed for the status page, which asks the filesystem how
+// much of that volume is left rather than adding up what is on it.
+func (s *Store) Root() string { return s.root }
+
 // Path returns the location of a blob. It is a pure function of the digest and
 // extension, so it stays valid across restarts and rebuilds.
 func (s *Store) Path(sha256hex, ext string) string {

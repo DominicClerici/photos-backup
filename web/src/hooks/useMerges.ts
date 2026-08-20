@@ -3,15 +3,16 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
+  approveGroup,
   dismissGroup,
   fetchMergeGroups,
+  forceJoin,
   mergeGroup,
   scanForMerges,
   unmergeGroup,
   undoDelete,
   type MergeGroup,
   type MergeKind,
-  type MergeState,
 } from "@/lib/api";
 import { toast } from "@/components/ui/toast";
 import { counted, ITEMS, type Noun } from "@/lib/format";
@@ -33,8 +34,14 @@ const RECORDINGS: Noun = { one: "recording", many: "recordings" };
  * questions, and answering the fourth one does not change what the fifth is
  * asking. Refetching here would only redraw four hundred thumbnails to remove
  * one row, and would scroll the page out from under somebody halfway down it.
+ *
+ * The joined recordings tab is two lists in one request each, concatenated: the
+ * joins that gave up, then the joins that worked. They are one list on screen
+ * because they are one subject — what happened to the recordings Snapchat cut
+ * up — and the failures come first because they are the only rows on that page
+ * where anything is still owed.
  */
-export function useMerges(kind: MergeKind, state: MergeState = "pending") {
+export function useMerges(kind: MergeKind, showApproved = false) {
   const [groups, setGroups] = useState<MergeGroup[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, retry] = useState(0);
@@ -44,17 +51,36 @@ export function useMerges(kind: MergeKind, state: MergeState = "pending") {
     const abort = new AbortController();
     setError(null);
     setGroups(null);
-    fetchMergeGroups(kind, state, abort.signal)
-      .then(setGroups)
-      .catch((err: unknown) => {
-        if (abort.signal.aborted) return;
-        setError(err instanceof Error ? err.message : "could not load the review");
-      });
+
+    // Pending duplicates are the review; joined recordings are already done —
+    // or already given up on — so the lists worth showing of those are what was
+    // merged and what failed.
+    const load =
+      kind === "duplicate"
+        ? fetchMergeGroups(kind, "pending", { signal: abort.signal })
+        : Promise.all([
+            fetchMergeGroups(kind, "failed", { signal: abort.signal }),
+            fetchMergeGroups(kind, "merged", {
+              approved: showApproved,
+              signal: abort.signal,
+            }),
+          ]).then(([failed, merged]) => [...failed, ...merged]);
+
+    load.then(setGroups).catch((err: unknown) => {
+      if (abort.signal.aborted) return;
+      setError(err instanceof Error ? err.message : "could not load the review");
+    });
     return () => abort.abort();
-  }, [kind, state, attempt]);
+  }, [kind, showApproved, attempt]);
 
   const drop = useCallback((id: string) => {
     setGroups((current) => current?.filter((g) => g.id !== id) ?? null);
+  }, []);
+
+  const patch = useCallback((id: string, change: Partial<MergeGroup>) => {
+    setGroups(
+      (current) => current?.map((g) => (g.id === id ? { ...g, ...change } : g)) ?? null,
+    );
   }, []);
 
   /**
@@ -123,6 +149,55 @@ export function useMerges(kind: MergeKind, state: MergeState = "pending") {
   );
 
   /**
+   * Signs off one entry of the log, or takes that back.
+   *
+   * Approving drops the row unless approved rows are being shown, which is the
+   * only reason this is not simply a patch: the list somebody is looking at is
+   * "what is left to look at", and leaving the row on it would make the button
+   * appear not to have worked.
+   */
+  const approve = useCallback(
+    async (group: string, approved: boolean) => {
+      try {
+        await approveGroup(group, approved);
+        if (approved && !showApproved) {
+          drop(group);
+          return;
+        }
+        patch(group, { approved_at: approved ? new Date().toISOString() : undefined });
+      } catch (err) {
+        notifyError(err, approved ? "Could not approve" : "Could not unapprove");
+      }
+    },
+    [drop, patch, showApproved],
+  );
+
+  /**
+   * Archives a join the server refused to make.
+   *
+   * The row goes, because what it was — a question about a failure — has been
+   * answered. What replaces it is a minute of ffmpeg in the worker pool, so the
+   * joined recording appears on this same list a moment later, on the next load
+   * rather than in place: there is nothing to show until the file exists.
+   */
+  const force = useCallback(
+    async (group: string) => {
+      try {
+        await forceJoin(group);
+        drop(group);
+        toast.add({
+          title: "Joining anyway",
+          description:
+            "The recording is being put back together now, and will appear here when it is done.",
+        });
+      } catch (err) {
+        notifyError(err, "Could not save it anyway");
+      }
+    },
+    [drop],
+  );
+
+  /**
    * Looks over the whole library again, and reloads from what it found.
    *
    * Slow enough to need the spinner — a few seconds over a library this size —
@@ -158,6 +233,8 @@ export function useMerges(kind: MergeKind, state: MergeState = "pending") {
     merge,
     dismiss,
     unmerge,
+    approve,
+    force,
     rescan,
     retry: () => retry((n) => n + 1),
   };

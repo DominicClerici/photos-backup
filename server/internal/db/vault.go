@@ -77,6 +77,14 @@ var scrubbed = []struct{ Column, Blank string }{
 	{"lens", "null"},
 	{"gps_lat", "null"},
 	{"gps_lon", "null"},
+	// Derived from the coordinates above rather than read off the file, and
+	// emptied for the same reason they are — more so, because "Chicago" is
+	// legible at a glance in a way 41.85,-87.65 is not.
+	{"place_city", "null"},
+	{"place_admin1", "null"},
+	{"place_country", "null"},
+	{"place_source", "null"},
+	{"geocoded_at", "null"},
 	{"exif_captured_at", "null"},
 	{"exif_offset_minutes", "null"},
 	{"description", "null"},

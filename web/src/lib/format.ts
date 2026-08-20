@@ -123,3 +123,35 @@ export function describeAction(verb: string, subject: Subject): string {
       return `${verb} ${subject.count.toLocaleString()} items`;
   }
 }
+
+/**
+ * How long ago something happened, in the largest unit that still says
+ * something: "4 minutes ago", "yesterday", "3 weeks ago".
+ *
+ * The status page is a page of times, and it is read to answer "is this still
+ * happening". An absolute timestamp makes that a subtraction somebody has to do
+ * in their head; the exact time is still there in the tooltip for the once in
+ * twenty when it matters.
+ */
+export function formatSince(iso: string, now: Date = new Date()): string {
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "at an unknown time";
+
+  const seconds = Math.round((then - now.getTime()) / 1000);
+  const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  const units: [Intl.RelativeTimeFormatUnit, number][] = [
+    ["year", 31_536_000],
+    ["month", 2_592_000],
+    ["week", 604_800],
+    ["day", 86_400],
+    ["hour", 3_600],
+    ["minute", 60],
+  ];
+
+  for (const [unit, size] of units) {
+    if (Math.abs(seconds) >= size) return relative.format(Math.round(seconds / size), unit);
+  }
+  // Under a minute. "0 seconds ago" is technically what happened and nobody
+  // says it.
+  return "just now";
+}

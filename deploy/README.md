@@ -16,7 +16,8 @@ and the exact paths as worth reading before pasting.
 | `vault/` | `/mnt/photos/vault`, beside the blobs | irreplaceable too, and encrypted — Archive and Hidden live here |
 | derivatives | `/var/lib/photod/derivatives`, the SSD | the gallery reads them constantly, and all of them can be rebuilt |
 | `derivatives/vault/` | the SSD, beside them | the encrypted ones, which **cannot** be rebuilt without the password |
-| Postgres | the SSD | ordinary database reasons |
+| Postgres | the SSD, in the compose container | ordinary database reasons |
+| `geonames/` | `/var/lib/photod/geonames`, the SSD | the offline geocoder's reference tables — re-downloadable, not part of the library |
 | `ca.key`, `server.key` | `/var/lib/photod/tls`, the SSD | machine identity, not library — and losing `ca.key` means re-pairing every device |
 
 `incoming/` has to be on the same filesystem as `blobs/`, because a completed
@@ -73,11 +74,69 @@ sudo install -d -m 0755 /etc/photod
 sudo install -m 0640 -g photod deploy/photod.env.example /etc/photod/photod.env
 sudoedit /etc/photod/photod.env          # at minimum, the database password
 
+# The offline geocoder's reference tables. Optional: without them photographs
+# keep their coordinates and simply have no place name. See server/README.md.
+sudo install -d -o photod -g photod /var/lib/photod/geonames
+cd /var/lib/photod/geonames
+sudo -u photod curl -O https://download.geonames.org/export/dump/cities500.zip
+sudo -u photod curl -O https://download.geonames.org/export/dump/admin1CodesASCII.txt
+sudo -u photod curl -O https://download.geonames.org/export/dump/countryInfo.txt
+cd -
+photobackup-admin geocode          # name the places for everything already archived
+
 sudo cp deploy/photod.service deploy/photobackup-verify.service \
         deploy/photobackup-verify.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now photod photobackup-verify.timer
 ```
+
+## The database
+
+Postgres runs from the repository's `docker-compose.yml` on this machine — the
+same container the tests use, on 5432, which is what `DATABASE_URL` in
+`photod.env` points at. There is no system `postgresql` unit.
+
+The image is `pgvector/pgvector:pg18`, not the stock `postgres:18-alpine`, and
+the difference matters twice. Migration 0016 opens with `create extension
+vector`, which the alpine image cannot satisfy — and the two images are built on
+different C libraries, which is not a detail.
+
+**Swapping from the alpine image is a data operation.** musl's `strcoll` is
+`strcmp`, so under alpine a `en_US.utf8` database was collating in byte order;
+glibc collates by ISO 14651. Every text B-tree written under the old image is
+therefore in the wrong order for the new one, and a wrong-ordered unique index
+does not raise an error — it fails to find rows, which for `assets.sha256` means
+`on conflict (sha256) do nothing` stops catching a duplicate and the next backup
+quietly archives a second copy of a photograph. So photod stops first, and every
+database is rebuilt before anything connects:
+
+```sh
+sudo systemctl stop photod
+docker compose pull postgres && docker compose up -d postgres
+for db in $(docker exec photos-backup-postgres-1 psql -U photobackup -tAc \
+      "select datname from pg_database where datallowconn"); do
+  docker exec photos-backup-postgres-1 psql -U photobackup -d "$db" -c "reindex database \"$db\";"
+done
+sudo systemctl start photod
+```
+
+One more statement is worth running once, and it is not cosmetic:
+
+```sh
+docker exec photos-backup-postgres-1 psql -U photobackup -c \
+  "update pg_database set datcollversion = pg_database_collation_actual_version(oid)
+   where datcollversion is null and datlocprovider = 'c';"
+```
+
+A database created under musl records no collation version at all, and
+`ALTER DATABASE … REFRESH COLLATION VERSION` refuses to fill one in — it will
+not accept a change from "unknown". Left null, Postgres has nothing to compare
+against and will *not* warn the next time glibc changes its collation, which is
+the same silent index corruption arriving again with no announcement. Writing it
+by hand is what restores the warning.
+
+This was run on this machine on 2026-08-20, against 23,080 assets, and took
+about two minutes end to end.
 
 ## Firewall
 
@@ -148,17 +207,17 @@ photobackup-admin redeploy
 ```
 
 It rebuilds `photod` and `photobackup` from the checkout, updates any of the
-installed unit files that have drifted from `deploy/`, restarts photod, and
-waits for `/health` to answer before reporting success. If it does not answer
-within fifteen seconds it prints the unit status and the last thirty journal
-lines and exits non-zero.
+installed unit files that have drifted from `deploy/`, applies any pending
+database migrations, restarts photod, and waits for `/health` to answer before
+reporting success. If it does not answer within fifteen seconds it prints the
+unit status and the last thirty journal lines and exits non-zero.
 
 ```sh
 photobackup-admin redeploy --dry-run          # build and diff, change nothing
 photobackup-admin redeploy --src ~/src/photos-backup
 ```
 
-Three things worth knowing:
+Four things worth knowing:
 
 - **The build happens before the stop.** A tree that does not compile costs a
   minute and leaves the running service untouched. Downtime is the install and
@@ -170,6 +229,12 @@ Three things worth knowing:
 - **It finds the source tree by walking up from the current directory**, looking
   for `server/go.mod` and `deploy/` together. Run it from anywhere inside the
   checkout, or set `PHOTOBACKUP_SRC`, or pass `--src`.
+- **Migrations run while photod is stopped**, from the binary that was just
+  installed, so the schema change and the code that needs it land together.
+  photod migrates on start as well, but a failure there is a service that will
+  not come back; a failure here is a deploy that stops and says so, leaving the
+  new binaries in place and photod down. Fix the schema and finish by hand:
+  `photobackup-admin migrate && sudo systemctl start photod`.
 
 Unit files are only refreshed if they are already installed; `redeploy` will not
 perform a first install, and it refuses to run at all if `photod.service` is

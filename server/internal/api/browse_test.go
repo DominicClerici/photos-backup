@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -356,6 +357,36 @@ func TestAssetDetailCarriesTheMetadataPanelFields(t *testing.T) {
 	}
 	if got.State != db.DerivedReady {
 		t.Errorf("state = %q, want ready", got.State)
+	}
+}
+
+// The viewer's panel draws a place name in the row that used to hold only
+// coordinates, so the detail has to carry it — including for a photograph in
+// the vault, whose panel is the same panel and whose place name lives in the
+// sealed document rather than on the row.
+func TestAssetDetailCarriesThePlaceName(t *testing.T) {
+	h := newHarness(t)
+	up := decodeUpload(t, h.upload(t, loadNamedFixture(t, "iphone-portrait.heic"), map[string]string{
+		"X-Photo-Filename": "iphone-portrait.heic",
+	}))
+	h.derive(t, up.ID)
+
+	place := db.Place{City: "New York City", Admin1: "New York", Country: "United States", Source: "geonames"}
+	if err := h.store.ApplyPlace(context.Background(), up.ID, place); err != nil {
+		t.Fatalf("record a place: %v", err)
+	}
+
+	var got assetDetail
+	decodeJSON(t, h.get(t, "/v1/assets/"+up.ID), &got)
+
+	if got.PlaceCity != place.City || got.PlaceAdmin1 != place.Admin1 || got.PlaceCountry != place.Country {
+		t.Errorf("place = %q/%q/%q, want %q/%q/%q",
+			got.PlaceCity, got.PlaceAdmin1, got.PlaceCountry, place.City, place.Admin1, place.Country)
+	}
+	// The coordinates stay beside it. The name is what the photograph is of;
+	// the numbers are what the camera recorded.
+	if got.GPSLat == nil || got.GPSLon == nil {
+		t.Error("the detail dropped the coordinates the place was resolved from")
 	}
 }
 

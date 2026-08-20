@@ -68,8 +68,11 @@ something that is already a square WebP of the right dimensions.
 
 ## Sections
 
-`/` is the gallery; `/collections`, `/overview`, `/search` and `/other` are
-routes of their own, still placeholders. The bar that switches between them is
+`/` is the gallery; `/collections`, `/status`, `/search` and `/other` are routes
+of their own. `/status` is the server's dashboard — how much is archived, how
+much of the drive is left, what the queue is doing, and every failed job with
+its error and a button that copies the details as Markdown. The bar that
+switches between them is
 mounted by the root layout rather than by each page, so it survives navigation
 with its highlight intact.
 
@@ -182,7 +185,7 @@ same fields.
 
 ## What the client polls, and what it does not
 
-Two loops, both narrow:
+Three loops, all narrow:
 
 - Tiles whose derivative is not ready yet poll `/v1/timeline/states`, **only for
   the ids currently on screen**. During a backfill the library can be tens of
@@ -190,6 +193,10 @@ Two loops, both narrow:
   cost more than generating the thumbnails.
 - A header chip polls `/health` for queue depth and failures, so a permanently
   failed derivative is noticeable without going to look for it.
+- The status page polls `/v1/status` every ten seconds, and stops while the tab
+  is in the background. One request carries the library counts, the disk, the
+  queue and the failure list, because they are all claims about the same instant
+  and a page assembled from four of them can contradict itself.
 
 New uploads do **not** appear without a reload. Inserting at the head mid-scroll
 would shift everything under the cursor, and watching a tile finish is worth the

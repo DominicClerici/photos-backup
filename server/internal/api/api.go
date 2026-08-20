@@ -67,10 +67,21 @@ type Server struct {
 	// groups, and only the button that looks for more answers 503, which is the
 	// right degradation for an API server running with WORKER_DISABLED.
 	Scan func(ctx context.Context) (merge.ScanResult, error)
-	Log  *slog.Logger
+	// WorkerEnabled says whether this process is draining the queue. A server
+	// with WORKER_DISABLED set still accepts uploads and still answers reads;
+	// what it does not do is ever build a thumbnail, and the status page exists
+	// to say so rather than leave a library slowly filling with grey tiles.
+	WorkerEnabled bool
+	// Tools are the external binaries the derivatives are built with, named as
+	// the daemon's config names them so the status page checks the same paths
+	// the workers will. Empty means the page reports nothing about them.
+	Tools []Tool
+	Log   *slog.Logger
 
 	pairOnce    sync.Once
 	pairLimiter *attemptLimiter
+	// deriv caches the walk behind the storage card. See derivativeBytes.
+	deriv storageCache
 }
 
 // Handler serves the whole API, and must only be mounted on a listener whose
@@ -200,6 +211,13 @@ func (s *Server) galleryRoutes(mux *http.ServeMux, allow guard) {
 	mux.HandleFunc("POST /v1/merges/{id}/merge", allow(s.handleMerge))
 	mux.HandleFunc("POST /v1/merges/{id}/dismiss", allow(s.handleDismissMerge))
 	mux.HandleFunc("POST /v1/merges/{id}/undo", allow(s.handleUnmerge))
+	// Overruling the join's own duration check, which is a write in the fullest
+	// sense: it archives a new original and trashes six. Approving is not — it
+	// records that somebody read a log entry and nothing else — but it lives
+	// here anyway, because the alternative is a mutation among the reads.
+	mux.HandleFunc("POST /v1/merges/{id}/force", allow(s.handleForceJoin))
+	mux.HandleFunc("POST /v1/merges/{id}/approve", allow(s.handleApproveMerge))
+	mux.HandleFunc("POST /v1/merges/{id}/unapprove", allow(s.handleUnapproveMerge))
 
 	// Albums, which until now only an import could make. The membership routes
 	// are POST and DELETE on a sub-resource rather than two verbs on the album
@@ -309,8 +327,17 @@ func (s *Server) readRoutes(mux *http.ServeMux, allow guard) {
 	// with the writes below.
 	mux.HandleFunc("GET /v1/merges", allow(s.handleMergeCounts))
 	mux.HandleFunc("GET /v1/merges/groups", allow(s.handleMergeGroups))
+	// The one video here that belongs to no asset: a join a merge job built and
+	// then refused to archive, kept so the refusal can be argued with by
+	// watching rather than by arithmetic. See handleJoinPreview.
+	mux.HandleFunc("GET /v1/merges/{id}/preview", allow(s.handleJoinPreview))
 
 	mux.HandleFunc("GET /v1/jobs", allow(s.handleJobs))
+	// The status page in one answer: what the library holds, what the drive
+	// holds, what the queue is doing, and what is broken. Guarded with the rest
+	// of the reads — a failed job carries a filename and an error string, which
+	// is archive content by another name.
+	mux.HandleFunc("GET /v1/status", allow(s.handleStatus))
 	mux.HandleFunc("GET /health", s.handleHealth)
 }
 

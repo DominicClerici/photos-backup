@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -183,5 +184,124 @@ func assertStagingEmpty(t *testing.T, s *Store) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("staging dir holds %d leftover files", len(entries))
+	}
+}
+
+func TestUsageChargesEachRenditionToItsOriginal(t *testing.T) {
+	s := New(t.TempDir())
+
+	const photo = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const clip = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const gone = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+	write := func(sha, suffix string, n int) {
+		t.Helper()
+		if err := s.Write(sha, suffix, func(w io.Writer) error {
+			_, err := w.Write(make([]byte, n))
+			return err
+		}); err != nil {
+			t.Fatalf("write %s%s: %v", sha, suffix, err)
+		}
+	}
+	write(photo, Thumb, 100)
+	write(photo, ThumbSuffix(512), 400)
+	// A video's poster frame is a .webp like any other, which is the whole
+	// reason Usage asks about the original rather than reading the suffix.
+	write(clip, Thumb, 100)
+	write(clip, Playback, 5_000)
+	write(gone, Thumb, 70)
+
+	kinds := map[string]string{photo: "image", clip: "video"}
+	usage, err := s.Usage(func(sha string) string { return kinds[sha] })
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if usage["image"] != 500 {
+		t.Errorf("image bytes = %d, want 500", usage["image"])
+	}
+	if usage["video"] != 5_100 {
+		t.Errorf("video bytes = %d, want 5100 (the poster counts as the video's)", usage["video"])
+	}
+	// A rendition whose original was purged or hidden is still on the disk, so
+	// it is reported rather than dropped.
+	if usage[""] != 70 {
+		t.Errorf("unattributed bytes = %d, want 70", usage[""])
+	}
+}
+
+func TestUsageIgnoresTheVaultAndTheStagingArea(t *testing.T) {
+	s := New(t.TempDir())
+
+	const kept = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	if err := s.Write(kept, Thumb, func(w io.Writer) error {
+		_, err := w.Write(make([]byte, 10))
+		return err
+	}); err != nil {
+		t.Fatalf("write thumbnail: %v", err)
+	}
+
+	staged, _, err := s.Stage("half-a-transcode")
+	if err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	if err := os.WriteFile(staged, make([]byte, 9_000), 0o644); err != nil {
+		t.Fatalf("fill staging file: %v", err)
+	}
+
+	sealed := filepath.Join(s.Root(), "vault", "de", "ad", kept+Thumb+".age")
+	if err := os.MkdirAll(filepath.Dir(sealed), 0o755); err != nil {
+		t.Fatalf("create vault tree: %v", err)
+	}
+	if err := os.WriteFile(sealed, make([]byte, 8_000), 0o644); err != nil {
+		t.Fatalf("write sealed rendition: %v", err)
+	}
+
+	usage, err := s.Usage(func(string) string { return "image" })
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage["image"] != 10 {
+		t.Errorf("image bytes = %d, want 10; the staging file or the vault was counted", usage["image"])
+	}
+}
+
+// Keys is what the sweep for orphaned joins reads. It has to find every file of
+// one suffix and nothing else — a thumbnail counted as a rejected join would be
+// deleted as one.
+func TestKeysFindsOneSuffixAndNoOther(t *testing.T) {
+	s := New(t.TempDir())
+
+	const a = "1111111111111111111111111111111111111111111111111111111111111111"
+	const b = "2222222222222222222222222222222222222222222222222222222222222222"
+	write := func(sha, suffix string) {
+		t.Helper()
+		if err := s.Write(sha, suffix, func(w io.Writer) error {
+			_, err := w.Write([]byte("x"))
+			return err
+		}); err != nil {
+			t.Fatalf("write %s%s: %v", sha, suffix, err)
+		}
+	}
+	write(a, JoinPreview)
+	write(b, JoinPreview)
+	write(a, Thumb)
+	// The one name that could be mistaken for a join preview by a suffix test
+	// alone: a video's playback rendition, whose suffix .mp4 ends the same way.
+	write(b, Playback)
+
+	keys, err := s.Keys(JoinPreview)
+	if err != nil {
+		t.Fatalf("Keys: %v", err)
+	}
+	slices.Sort(keys)
+	if !slices.Equal(keys, []string{a, b}) {
+		t.Errorf("Keys = %v, want exactly the two join previews", keys)
+	}
+
+	// And an empty tree is an archive with nothing kept, not a failure.
+	empty, err := New(t.TempDir()).Keys(JoinPreview)
+	if err != nil || len(empty) != 0 {
+		t.Errorf("Keys on an empty store = %v, %v; want none and no error", empty, err)
 	}
 }

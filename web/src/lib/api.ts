@@ -52,6 +52,15 @@ export interface AssetDetail {
   lens?: string;
   gps_lat?: number;
   gps_lon?: number;
+  /**
+   * Where those coordinates are, in words, resolved offline from a GeoNames
+   * extract. Three fields rather than one string because the panel joins them
+   * its own way; all absent on the 38% of the library with no GPS fix, and on
+   * anything nobody has geocoded yet.
+   */
+  place_city?: string;
+  place_admin1?: string;
+  place_country?: string;
   // What an import knew and the file did not: a Google Takeout carries the
   // caption, the star, and the album a photo was in in a JSON sidecar rather
   // than in the photo. All absent on anything the phone delivered directly.
@@ -836,7 +845,24 @@ export function fetchVaultCollections(
 
 /** Which kind of group. Not interchangeable; see the review page. */
 export type MergeKind = "duplicate" | "video-segments";
-export type MergeState = "pending" | "merged" | "dismissed";
+
+/**
+ * What has happened to a group, plus one thing that has not.
+ *
+ * "failed" is not a fourth state a row can be in: it is the pending groups
+ * whose join gave up, which is a fact in the jobs table rather than this one. It
+ * is asked for by name because the joined recordings tab shows those first —
+ * they are the only rows on that page where anything is still owed.
+ */
+export type MergeState = "pending" | "merged" | "dismissed" | "failed";
+
+/** The last attempt at a join, as much of it as belongs beside the recording. */
+export interface MergeFailure {
+  job: number;
+  attempts: number;
+  error: string;
+  failed_at: string;
+}
 
 /**
  * One candidate, described in the terms the choice is actually made in.
@@ -875,6 +901,21 @@ export interface MergeGroup {
   detected_at: string;
   /** The copy that was kept, or the recording that was built. */
   keeper_asset_id?: string;
+  /**
+   * When somebody read this entry of the joined recordings log and was content
+   * with it. Absent until they do, which is what keeps it on the list.
+   */
+  approved_at?: string;
+  /** True when the join was archived over the objection of the duration check. */
+  forced?: boolean;
+  /** The merge job that gave up on this group, when one has. */
+  failure?: MergeFailure;
+  /**
+   * True when the join this group's last attempt refused to archive is still on
+   * disk to be watched. False for every failure that never produced a file,
+   * which is why the page asks rather than assuming.
+   */
+  preview?: boolean;
   members: MergeMember[];
 }
 
@@ -885,7 +926,7 @@ export interface SignatureCoverage {
 }
 
 /**
- * What the overview card says.
+ * What the status page's review cards say.
  *
  * Groups and photographs are both here because they answer different questions:
  * the first is how many decisions are waiting, the second is how much is at
@@ -896,6 +937,10 @@ export interface MergeCounts {
   duplicate_items: number;
   pending_segments: number;
   merged_segments: number;
+  /** Joins that gave up. Apart from the two above: this one waits forever. */
+  failed_segments: number;
+  /** Joins that have been read and signed off, and so counted nowhere else. */
+  approved_segments: number;
   merged_duplicates: number;
   coverage: SignatureCoverage;
 }
@@ -907,9 +952,12 @@ export function fetchMergeCounts(signal?: AbortSignal): Promise<MergeCounts> {
 export function fetchMergeGroups(
   kind: MergeKind = "duplicate",
   state: MergeState = "pending",
-  signal?: AbortSignal,
+  { approved = false, signal }: { approved?: boolean; signal?: AbortSignal } = {},
 ): Promise<MergeGroup[]> {
   const params = new URLSearchParams({ kind, state });
+  // Off by default on the server too. Sent explicitly anyway, because "show
+  // approved" is a switch somebody flicked and the request should read like it.
+  if (approved) params.set("approved", "true");
   return get<{ groups: MergeGroup[] }>(`/v1/merges/groups?${params}`, signal).then(
     (r) => r.groups ?? [],
   );
@@ -961,6 +1009,42 @@ export function unmergeGroup(group: string): Promise<Unmerged> {
   return send<Unmerged>(`/v1/merges/${group}/undo`, {});
 }
 
+/**
+ * Records that this entry of the joined recordings log has been read, or takes
+ * that back.
+ *
+ * It changes nothing about the photographs — the pieces stay in the trash, the
+ * joined recording stays in the library, and splitting it back up goes on
+ * working. That is what makes it one click with no confirmation.
+ */
+export async function approveGroup(group: string, approved: boolean): Promise<void> {
+  const path = approved ? "approve" : "unapprove";
+  const res = await fetch(`${API_BASE}/v1/merges/${group}/${path}`, { method: "POST" });
+  if (!res.ok) throw new ApiError(res.status, await errorText(res));
+}
+
+/**
+ * Archives a join the server refused to make.
+ *
+ * The refusal is arithmetic: the concatenated file did not come out the length
+ * its parts add up to, which is indistinguishable from ffmpeg having dropped
+ * one — by arithmetic. Watching it tells them apart, so this is only ever
+ * pressed after the preview, and it queues the join again with the objection
+ * disabled rather than doing it here.
+ */
+export function forceJoin(group: string): Promise<{ queued: boolean }> {
+  return send<{ queued: boolean }>(`/v1/merges/${group}/force`, {});
+}
+
+/**
+ * The join a merge job built and then refused to archive.
+ *
+ * The one video in this API that belongs to no asset: it was never committed,
+ * never indexed, and is not in the library. It is served anyway because the
+ * decision it is evidence for cannot be made any other way.
+ */
+export const joinPreviewUrl = (group: string) => `${MEDIA_BASE}/v1/merges/${group}/preview`;
+
 /** What one sweep of the library found. */
 export interface ScanResult {
   segments: number;
@@ -980,4 +1064,94 @@ export interface ScanResult {
  */
 export function scanForMerges(): Promise<ScanResult> {
   return send<ScanResult>("/v1/merges/scan", {});
+}
+
+/** One filesystem, as the server's kernel reports it. */
+export interface Volume {
+  path: string;
+  total: number;
+  used: number;
+  free: number;
+}
+
+/**
+ * The drive, and what of it this archive accounts for.
+ *
+ * `used` and `free` close on `total` by construction, so a pie drawn from them
+ * has no gap. What the four attributed figures do *not* close on is `used`:
+ * the database, the vault, and the blocks the filesystem reserves for root are
+ * all real bytes with no card of their own, and the remainder is where they go.
+ */
+export interface StorageStatus {
+  archive: Volume;
+  derivatives: Volume;
+  /** Whether the renditions are on the same disk as the originals. */
+  same_volume: boolean;
+  photos: number;
+  videos: number;
+  photo_derivatives: number;
+  video_derivatives: number;
+  unattributed_derivatives: number;
+  /** When the derivative walk behind those last three figures last ran. */
+  measured_at: string;
+}
+
+export interface JobCount {
+  kind: string;
+  state: string;
+  count: number;
+}
+
+export interface QueueStatus {
+  pending: number;
+  running: number;
+  failed: number;
+  kinds: JobCount[];
+}
+
+/** Something wrong with the server rather than with one photograph. */
+export interface Problem {
+  id: string;
+  severity: "error" | "warning";
+  title: string;
+  detail: string;
+}
+
+/** One job that gave up, and the asset it gave up on. */
+export interface Failure {
+  id: number;
+  kind: string;
+  asset_id: string;
+  attempts: number;
+  error: string;
+  failed_at: string;
+  filename?: string;
+  media_kind?: MediaKind;
+  /** False when there is no thumbnail to draw: the asset is vaulted or gone. */
+  viewable: boolean;
+}
+
+export interface LibraryStats {
+  items: number;
+  photos: number;
+  videos: number;
+  trashed: number;
+}
+
+/**
+ * The status page, in one answer.
+ *
+ * One request rather than five, because every card is a claim about the same
+ * instant — see the note on statusResponse in the server.
+ */
+export interface Status {
+  library: LibraryStats;
+  storage: StorageStatus;
+  queue: QueueStatus;
+  problems: Problem[];
+  failures: Failure[];
+}
+
+export function fetchStatus(signal?: AbortSignal): Promise<Status> {
+  return get<Status>("/v1/status", signal);
 }

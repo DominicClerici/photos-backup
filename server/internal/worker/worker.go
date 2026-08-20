@@ -2,10 +2,13 @@
 // what happens to an asset and in what order; the queue below it knows nothing
 // about images, and the media packages above it know nothing about queues.
 //
-// It runs two independent pools rather than one. A single shared pool lets a
+// It runs four independent pools rather than one. A single shared pool lets a
 // handful of 4K transcodes claim every slot, and every thumbnail queued behind
 // them waits minutes for work that takes 80ms — so during a backfill the
-// gallery would appear to be doing nothing at all.
+// gallery would appear to be doing nothing at all. The two pools past the first
+// exist for the same reason pointed at slower work: a pass over the whole
+// archive that nobody is waiting for must not be in front of the work somebody
+// is.
 package worker
 
 import (
@@ -24,6 +27,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/derive"
 	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
+	"github.com/dominicclerici/photos-backup/server/internal/geocode"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
@@ -40,6 +44,11 @@ type Deps struct {
 	Images      *derive.Converter
 	Video       *video.Tool
 	Exif        *exifdata.Reader
+	// Places turns coordinates into a city, a state and a country, from an
+	// extract on disk. Optional: without it photographs keep their coordinates
+	// and have no place name, which is exactly what the whole library looked
+	// like before this existed. See internal/geocode.
+	Places *geocode.Loader
 	// Manifest is the append-only recovery log, and this worker writes to it
 	// for exactly one reason: joining a Snapchat recording back together
 	// produces an original, and an original with no manifest line is a blob a
@@ -71,6 +80,17 @@ type Runner struct {
 	// behind it. One by default, so a backfill is something the machine does in
 	// the background rather than something it does instead of everything else.
 	SignatureWorkers int
+	// PrepWorkers build the renditions a vision model reads: one uncropped
+	// 512px WebP per photograph, six frames per video.
+	//
+	// A fourth pool, for the third time and the same reason. It is a full
+	// decode of every visible original in the archive, it takes an hour or so
+	// over a library this size, and the thing waiting for it is a search
+	// feature that does not exist yet. Two by default rather than one: unlike
+	// the signature pass this writes files and is bounded by ImageMagick rather
+	// than by the database, and two ImageMagicks fit comfortably beside the
+	// metadata pool on any machine that can run this at all.
+	PrepWorkers int
 
 	// PollInterval is the floor on how often an idle worker looks for work.
 	// Uploads nudge the pools directly, so this only matters for work that
@@ -84,6 +104,10 @@ type Runner struct {
 	mu     sync.Mutex
 	nudges []chan struct{}
 	wg     sync.WaitGroup
+
+	// noGeocoder makes "the extract is not installed" a single line in the log
+	// rather than one per photograph with a GPS fix.
+	noGeocoder sync.Once
 }
 
 func New(deps Deps) *Runner {
@@ -92,6 +116,7 @@ func New(deps Deps) *Runner {
 		MetadataWorkers:   4,
 		TranscodeWorkers:  1,
 		SignatureWorkers:  1,
+		PrepWorkers:       2,
 		PollInterval:      5 * time.Second,
 		SweepInterval:     time.Minute,
 		HeartbeatInterval: jobs.DefaultLease / 3,
@@ -109,6 +134,9 @@ func (r *Runner) Start(ctx context.Context) {
 	if err := r.reconcileSignatures(ctx); err != nil {
 		r.log().Error("reconcile signature jobs", "error", err)
 	}
+	if err := r.reconcileMLPrep(ctx); err != nil {
+		r.log().Error("reconcile mlprep jobs", "error", err)
+	}
 
 	for i := range r.metadataWorkers() {
 		r.spawn(ctx, fmt.Sprintf("metadata-%d", i), []jobs.Kind{jobs.KindMetadata})
@@ -121,6 +149,9 @@ func (r *Runner) Start(ctx context.Context) {
 	}
 	for i := range r.signatureWorkers() {
 		r.spawn(ctx, fmt.Sprintf("signature-%d", i), []jobs.Kind{jobs.KindSignature})
+	}
+	for i := range r.prepWorkers() {
+		r.spawn(ctx, fmt.Sprintf("prep-%d", i), []jobs.Kind{jobs.KindMLPrep})
 	}
 
 	r.wg.Add(1)
@@ -265,6 +296,8 @@ func (r *Runner) run(ctx context.Context, job jobs.Job) (err error) {
 		return r.runPlayback(ctx, job.AssetID)
 	case jobs.KindSignature:
 		return r.runSignature(ctx, job.AssetID)
+	case jobs.KindMLPrep:
+		return r.runMLPrep(ctx, job.AssetID)
 	case jobs.KindMerge:
 		if r.Manifest == nil {
 			return errors.New("no manifest log configured; refusing to archive a joined recording that a rebuild could not recover")
@@ -345,6 +378,12 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 	if err := r.Store.ApplyMetadata(ctx, assetID, meta); err != nil {
 		return err
 	}
+
+	// Where it was taken, in words. After the metadata is stored rather than
+	// before, because the coordinates this resolves may be the ones that update
+	// just coalesced in from an import sidecar.
+	r.geocode(ctx, assetID)
+
 	if thumbErr != nil {
 		return thumbErr
 	}
@@ -354,8 +393,14 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 	// written a few lines above. Not for the components — a paired video and a
 	// caption layer are parts of another asset's picture, and the duplicate
 	// scan never looks at either.
+	// The ML renditions are queued from here for the same reason and with the
+	// same exclusions. A video's six frames are spread across its running time,
+	// and its running time was written a few lines above.
 	if !asset.IsLivePair() && !asset.IsOverlay {
 		if err := jobs.Enqueue(ctx, r.Store.Pool(), jobs.KindSignature, assetID); err != nil {
+			return err
+		}
+		if err := jobs.Enqueue(ctx, r.Store.Pool(), jobs.KindMLPrep, assetID); err != nil {
 			return err
 		}
 	}
@@ -396,6 +441,58 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 		r.Nudge()
 	}
 	return nil
+}
+
+// geocode resolves a place name from the coordinates on an asset's row and
+// stores it.
+//
+// Nothing here is allowed to fail the job. A photograph that arrives without a
+// place name is a photograph — the archive worked exactly as it did before
+// there was such a thing as a place name, and `photobackup geocode` fills in
+// whatever was missed. Failing the metadata job instead would mean a missing
+// 40MB text file could stop thumbnails being built, which is the shape of
+// dependency PROJECT.md §4 spends a paragraph refusing.
+func (r *Runner) geocode(ctx context.Context, assetID string) {
+	if r.Places == nil {
+		return
+	}
+	target, ok, err := r.Store.AssetToGeocode(ctx, assetID)
+	if err != nil {
+		r.log().Warn("read coordinates to geocode", "asset", assetID, "error", err)
+		return
+	}
+	if !ok {
+		return
+	}
+
+	ix, err := r.Places.Index()
+	if err != nil {
+		r.noGeocoder.Do(func() {
+			if errors.Is(err, geocode.ErrNoData) {
+				r.log().Info("no GeoNames extract installed; photographs will keep their coordinates and have no place name",
+					"dir", r.Places.Dir(), "how", "photobackup geocode")
+			} else {
+				r.log().Error("load the GeoNames extract", "error", err)
+			}
+		})
+		return
+	}
+
+	// An empty place is stored rather than skipped: it records that somebody
+	// looked and there was nothing within reach, which is the difference
+	// between a photograph taken over open water and one nobody has resolved.
+	var place db.Place
+	if found, ok := ix.Nearest(target.Lat, target.Lon); ok {
+		place = db.Place{
+			City:    found.City,
+			Admin1:  found.Admin1,
+			Country: found.Country,
+			Source:  geocode.Source,
+		}
+	}
+	if err := r.Store.ApplyPlace(ctx, assetID, place); err != nil {
+		r.log().Warn("record a place name", "asset", assetID, "error", err)
+	}
 }
 
 // applyContentID records the Apple content identifier this file actually
@@ -815,6 +912,13 @@ func (r *Runner) signatureWorkers() int {
 		return 1
 	}
 	return r.SignatureWorkers
+}
+
+func (r *Runner) prepWorkers() int {
+	if r.PrepWorkers <= 0 {
+		return 1
+	}
+	return r.PrepWorkers
 }
 
 func (r *Runner) pollInterval() time.Duration {

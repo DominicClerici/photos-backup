@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/dominicclerici/photos-backup/server/internal/db"
+	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 	"github.com/dominicclerici/photos-backup/server/internal/imagehash"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
@@ -24,18 +25,34 @@ import (
 // Generated rather than a fixture because what these tests are about is several
 // files becoming one, which needs several files whose contents differ.
 func snapClip(t *testing.T, dir, name string, seconds float64, hue int) []byte {
+	return snapClipOf(t, dir, name, seconds, seconds, hue)
+}
+
+// snapClipOf writes one with a picture and a sound of independently chosen
+// lengths.
+//
+// Sound that outlasts the picture is how the duration mismatch is reproduced:
+// the join measures a part by its video stream and the concat demuxer offsets
+// the next part by the whole container, so parts like these come out longer
+// than they add up to. A real Snapchat export misses by a tenth of a second,
+// which is a difference of degree.
+func snapClipOf(t *testing.T, dir, name string, picture, sound float64, hue int) []byte {
 	t.Helper()
 	path := filepath.Join(dir, name)
 
-	out, err := exec.Command("ffmpeg", "-nostdin", "-y", "-v", "error",
+	args := []string{"-nostdin", "-y", "-v", "error",
 		"-f", "lavfi", "-i",
-		"testsrc=size=180x320:rate=15:duration="+ftoa(seconds),
+		"testsrc=size=180x320:rate=15:duration=" + ftoa(picture),
 		"-f", "lavfi", "-i",
-		"sine=frequency="+itoa(220+hue*40)+":sample_rate=44100:duration="+ftoa(seconds),
-		"-vf", "hue=h="+itoa(hue*30),
+		"sine=frequency=" + itoa(220+hue*40) + ":sample_rate=44100:duration=" + ftoa(sound),
+		"-vf", "hue=h=" + itoa(hue*30),
 		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
 		"-c:a", "aac", "-ac", "2", "-ar", "44100",
-		"-shortest", path).CombinedOutput()
+	}
+	if sound <= picture {
+		args = append(args, "-shortest")
+	}
+	out, err := exec.Command("ffmpeg", append(args, path)...).CombinedOutput()
 	if err != nil {
 		t.Skipf("could not build a fixture clip (is ffmpeg installed?): %v: %s", err, out)
 	}
@@ -94,6 +111,12 @@ func itoa(v int) string {
 // in the way memories_history.json spaces them, with the sidecar an import
 // would have written.
 func (h *harness) segments(t *testing.T, n int) []db.Asset {
+	return h.segmentsPadded(t, n, 0)
+}
+
+// segmentsPadded is the same recording with `pad` seconds of sound hanging off
+// the end of every piece — which is a join that will not add up. See snapClipOf.
+func (h *harness) segmentsPadded(t *testing.T, n int, pad float64) []db.Asset {
 	t.Helper()
 	dir := t.TempDir()
 	start := time.Date(2018, 10, 7, 5, 42, 5, 0, time.UTC)
@@ -105,7 +128,8 @@ func (h *harness) segments(t *testing.T, n int) []db.Asset {
 			seconds = 6.0 // the tail of a recording
 		}
 		name := "2018-10-07_piece" + itoa(i) + "-main.mp4"
-		asset := h.ingestBytes(t, name, db.MediaVideo, snapClip(t, dir, name, seconds, i))
+		asset := h.ingestBytes(t, name, db.MediaVideo,
+			snapClipOf(t, dir, name, seconds, seconds+pad, i))
 
 		at := start.Add(time.Duration(i) * 10 * time.Second)
 		sidecar, err := json.Marshal(snapchat.Sidecar{
@@ -169,7 +193,7 @@ func TestScanJoinsASplitRecording(t *testing.T) {
 		}
 	}
 
-	groups, err := h.store.Groups(ctx, merge.KindSegments, db.MergeMerged, 10)
+	groups, err := h.store.Groups(ctx, db.MergeQuery{Kind: merge.KindSegments, State: db.MergeMerged, Limit: 10})
 	if err != nil {
 		t.Fatalf("Groups: %v", err)
 	}
@@ -294,7 +318,7 @@ func TestScanningTwiceJoinsOnce(t *testing.T) {
 		t.Errorf("the second scan proposed %d segment groups, want 0", found.Segments)
 	}
 
-	groups, err := h.store.Groups(ctx, merge.KindSegments, db.MergeMerged, 10)
+	groups, err := h.store.Groups(ctx, db.MergeQuery{Kind: merge.KindSegments, State: db.MergeMerged, Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,18 +337,25 @@ func TestAMergeWhoseGroupWentAwayIsNotAFailure(t *testing.T) {
 	if _, err := h.Scan(ctx); err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
-	groups, err := h.store.Groups(ctx, merge.KindSegments, db.MergePending, 10)
+	groups, err := h.store.Groups(ctx, db.MergeQuery{Kind: merge.KindSegments, State: db.MergePending, Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(groups) != 1 {
 		t.Fatalf("%d pending groups, want 1", len(groups))
 	}
+	// Claimed before the dismissal, which is the race this is about. A
+	// dismissal that lands first takes the queued join with it — see
+	// db.DismissGroup — so the only way to reach runMerge with no group to work
+	// on is to already be holding the job when somebody answers the question.
+	job, err := h.Queue.Claim(ctx, []jobs.Kind{jobs.KindMerge}, "test-worker")
+	if err != nil {
+		t.Fatalf("claim merge job: %v", err)
+	}
 	if err := h.store.DismissGroup(ctx, groups[0].ID); err != nil {
 		t.Fatalf("DismissGroup: %v", err)
 	}
-
-	job := h.claimAndRun(t, jobs.KindMerge)
+	h.execute(ctx, "test-worker", job)
 	if state := jobStateByID(t, h, job.ID); state != string(jobs.StateDone) {
 		t.Errorf("job state = %q, want done", state)
 	}
@@ -470,7 +501,7 @@ func TestScanFindsARecompressedCopy(t *testing.T) {
 		t.Fatalf("Scan found %d duplicate groups, want 1", found.Duplicates)
 	}
 
-	groups, err := h.store.Groups(ctx, merge.KindDuplicate, db.MergePending, 10)
+	groups, err := h.store.Groups(ctx, db.MergeQuery{Kind: merge.KindDuplicate, State: db.MergePending, Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,5 +602,79 @@ func TestSampleEdgeMatchesWhatTheDecodersProduce(t *testing.T) {
 	}
 	if _, err := imagehash.Compute(gray); err != nil {
 		t.Fatalf("Compute: %v", err)
+	}
+}
+
+// The failure that leaves something behind, and the way out of it.
+//
+// A recording whose pieces do not add up is refused by the join and the job
+// fails — but the file it refused is kept under the group, because the
+// arithmetic cannot tell a part ffmpeg dropped from a container that overstates
+// its own length, and somebody watching it can. Saying so puts the same work
+// back on the queue with the check turned off.
+func TestARejectedJoinIsKeptAndCanBeForced(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	pieces := h.segmentsPadded(t, 3, 3)
+
+	if _, err := h.Scan(ctx); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	h.claimAndRun(t, jobs.KindMerge)
+
+	pending, err := h.store.Groups(ctx, db.MergeQuery{Kind: merge.KindSegments, State: db.MergePending, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("%d pending groups after the join failed, want the question still open", len(pending))
+	}
+	group := pending[0]
+	for _, piece := range pieces {
+		if got := h.reload(t, piece.ID); got.DeletedAt != nil {
+			t.Errorf("piece %s was trashed by a join that failed", piece.OriginalFilename)
+		}
+	}
+	if !h.Derivatives.Exists(group.Fingerprint, derivstore.JoinPreview) {
+		t.Fatal("the refused join was not kept, so there is nothing to watch before deciding")
+	}
+
+	// Overruled.
+	if err := h.store.ForceJoin(ctx, group.ID); err != nil {
+		t.Fatalf("ForceJoin: %v", err)
+	}
+	h.claimAndRun(t, jobs.KindMerge)
+
+	merged, err := h.store.Groups(ctx, db.MergeQuery{Kind: merge.KindSegments, State: db.MergeMerged, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merged) != 1 || merged[0].KeeperAssetID == nil {
+		t.Fatalf("got %d merged groups; want one with a joined recording", len(merged))
+	}
+	if !merged[0].Forced {
+		t.Error("the group does not record that this join was overruled")
+	}
+	for _, piece := range pieces {
+		if got := h.reload(t, piece.ID); got.DeletedAt == nil {
+			t.Errorf("piece %s is still in the library after the forced join", piece.OriginalFilename)
+		}
+	}
+	if h.Derivatives.Exists(group.Fingerprint, derivstore.JoinPreview) {
+		t.Error("the refused join is still on disk after the question was answered")
+	}
+
+	// And the doubt is written down where it will outlive the pieces.
+	joined := h.reload(t, *merged[0].KeeperAssetID)
+	sidecar, err := h.store.ImportSidecar(ctx, joined.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out snapchat.Sidecar
+	if err := json.Unmarshal(sidecar, &out); err != nil {
+		t.Fatalf("read the joined sidecar: %v", err)
+	}
+	if out.Joined == nil || out.Joined.ExpectedSeconds == 0 {
+		t.Errorf("the sidecar does not record what the parts were expected to add up to: %+v", out.Joined)
 	}
 }

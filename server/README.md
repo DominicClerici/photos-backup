@@ -25,9 +25,11 @@ proxies `/api/*` here; see its README to bring the browser side up.
 | `PHOTOS_ROOT` | `./data/photos` | holds `blobs/` and `manifest.jsonl` |
 | `DERIVATIVES_ROOT` | `$PHOTOS_ROOT/derivatives` | thumbnails and playback files |
 | `DATABASE_URL` | local compose Postgres | Postgres connection string |
+| `GEONAMES_DIR` | `./data/geonames` | the offline geocoder's extract; absent means no place names |
 | `WORKER_CONCURRENCY` | `4` | metadata + thumbnail workers |
 | `TRANSCODE_CONCURRENCY` | `1` | video transcode and merge workers |
 | `SIGNATURE_CONCURRENCY` | `1` | workers hashing originals for the duplicate scan |
+| `PREP_CONCURRENCY` | `2` | workers writing the renditions a vision model reads |
 | `PREVIEW_CONCURRENCY` | `4` | simultaneous on-demand preview conversions |
 | `LIVE_PREVIEW_CONCURRENCY` | `2` | simultaneous on-demand Live Photo renditions |
 | `LIVE_PREVIEW_CACHE_MB` | `64` | memory those renditions are held in between requests |
@@ -84,8 +86,10 @@ GET  /v1/assets/{id}/playback/plain   the same video without it burned in
 GET  /v1/assets/{id}/live/thumb[/{px}]  a Live Photo's motion, same sizes
 GET  /v1/assets/{id}/live/preview       1080p with audio, rendered per request
 GET  /v1/merges                  how much is waiting, and how much has been analysed
-GET  /v1/merges/groups?kind=&state=   the review: sets of items that should be one
+GET  /v1/merges/groups?kind=&state=&approved=   the review: sets of items that should be one
+GET  /v1/merges/{id}/preview     a join the worker built and refused to archive
 GET  /v1/jobs                    queue depth and the failure list
+GET  /v1/status                  the status page: library counts, disk, queue, and what is broken
 GET  /health                     also reports pending and failed job counts
 
 gallery (writes, but no device token — see below):
@@ -97,6 +101,9 @@ POST /v1/merges/scan             look for duplicates and split recordings again
 POST /v1/merges/{id}/merge       keep one copy of a group, trash the rest
 POST /v1/merges/{id}/dismiss     record that these are different photographs
 POST /v1/merges/{id}/undo        put a merge back: copies out of the trash, a join into it
+POST /v1/merges/{id}/force       archive a join whose parts do not add up
+POST /v1/merges/{id}/approve     record that a joined recording has been looked at
+POST /v1/merges/{id}/unapprove   take that back
 ```
 
 `/v1/timeline`, `/v1/timeline/days` and `/v1/timeline/locate` share a filter, and
@@ -384,7 +391,7 @@ it has been through JavaScript; `Date.toISOString()` always emits three decimals
 
 ## Derivatives
 
-Four kinds of job, in three separately sized pools:
+Five kinds of job, in four separately sized pools:
 
 | kind | does | pool |
 |---|---|---|
@@ -392,6 +399,7 @@ Four kinds of job, in three separately sized pools:
 | `playback` | H.264/AAC MP4 capped at 1080p, `+faststart` | `TRANSCODE_CONCURRENCY` |
 | `merge` | concatenates the pieces of a split Snapchat recording into one archived original | `TRANSCODE_CONCURRENCY` |
 | `signature` | decodes an original into the hashes the duplicate scan compares | `SIGNATURE_CONCURRENCY` |
+| `mlprep` | writes the uncropped 512px renditions a vision model reads | `PREP_CONCURRENCY` |
 
 The pools are split so a handful of 4K transcodes cannot claim every slot and
 starve the thumbnails behind them — during a backfill that would look like the
@@ -399,6 +407,13 @@ gallery doing nothing at all. `signature` gets a third pool for a related reason
 and a stronger one: it is a full decode of every original in the archive plus
 twenty sampled frames out of every video, it takes about an hour over a library
 of this size, and nothing at all is waiting for the answer.
+
+`mlprep` gets a fourth pool for the same reason again. It is another full decode
+of every visible original, its output is read by a service that does not exist
+yet, and putting it in front of a thumbnail would trade a gallery somebody is
+looking at for a search feature nobody has typed into. Two workers rather than
+one, because each item here is a single ImageMagick rather than twenty sampled
+frames.
 
 `merge` shares the transcode pool because it is the same kind of work — ffmpeg
 over a whole video, minutes rather than milliseconds. It is the only job here
@@ -424,6 +439,23 @@ machine's configuration; the defaults stay portable.
 Stored on disk: `<sha>.thumb.webp`, and `<sha>.mp4` for video. The 2048px
 preview is rendered per request and never stored; the browser's cache does the
 caching a derivative file would.
+
+`mlprep` adds `<sha>.ml.webp` — the whole photograph, **uncropped**, 512px on
+its longest edge — and `<sha>.ml.0.webp` through `.ml.5.webp` for a video, six
+frames spread across its running time. Uncropped is the entire point of the
+file: `.thumb512.webp` is a square centre crop, which is right for a grid of
+square cells and wrong for a model, because the subject is frequently at the
+edge and a centre crop decides in advance what the photograph was about. Six
+frames rather than one because a clip that starts on a beach and ends in a
+restaurant is findable as both only if both were looked at.
+
+Nothing reads them yet. They exist so that the vision service, when it arrives,
+is handed image bytes over loopback and never opens a file under the archive —
+which is what excludes the vault by construction rather than by a `WHERE` clause
+somebody can forget to write — and so that swapping the model re-reads 61,000
+small WebPs instead of re-decoding 73GB of HEIC and H.265. That is the
+difference between minutes and hours, and it is what makes trying a second model
+a decision rather than a project. Roughly 4GB for this library. See ML_IMAGES.md.
 
 A Snapchat memory is the other exception. Its renditions are built from the
 photograph and its caption layer composed, not from the file the job was handed
@@ -454,8 +486,10 @@ rebuilt by re-running one job, so paying `fsync` on every thumbnail through a
 ### When something breaks
 
 A job retries with exponential backoff up to 5 attempts, then parks as `failed`
-with the error kept verbatim. Find them at `GET /v1/jobs`; the count also shows
-up in `/health`. A permanently failed metadata job sets the asset's
+with the error kept verbatim. Find them at `GET /v1/jobs`, or on the gallery's
+status page, which reads `GET /v1/status` — the same failures with the asset's
+filename attached and a button that puts the lot on the clipboard as Markdown.
+The count also shows up in `/health`. A permanently failed metadata job sets the asset's
 `derived_state` to `failed`, which the gallery draws as an error tile rather
 than one that spins forever.
 
@@ -463,6 +497,35 @@ A running job heartbeats its lease. Without that, a transcode longer than the
 10-minute lease would be handed to a second worker while the first was still
 encoding, and repeated reclaims would eventually mark a perfectly healthy job
 as failed.
+
+### What the status page measures
+
+`GET /v1/status` answers four questions at once, because they are all claims
+about the same instant: what the library holds, what the drive holds, what the
+queue is doing, and what is wrong with the server.
+
+The disk figures come from `statfs` rather than from adding up files — that is
+the only number that includes the bytes photod did not put there. `used` is
+`total - available`, so the blocks ext4 reserves for root count as used and the
+two always close on the total. Against that, the originals are summed from
+`assets.byte_size` per media kind, and the renditions are measured by walking
+the derivative tree and charging each file to the kind of the original it was
+made from (a video's poster frame is a video derivative, not a photo one). The
+gap between the two — the database, the vault, the reserved blocks — is reported
+as a remainder rather than distributed among the slices.
+
+Two things are deliberately left out of the attributed figures. **The vault**:
+its originals and renditions are on the same disks and their bytes are real, but
+"your hidden photographs come to 12GB" is exactly the question the encryption
+exists to refuse, so they fall into the remainder. **The other volume**: the
+deployment puts blobs on the external drive and derivatives on the SSD, so the
+response reports both volumes and a `same_volume` flag, and the gallery draws
+the derivative sizes outside the ring when they are not on the disk the ring is
+of.
+
+The walk is cached for a minute. It is a `stat` of every rendition — on this
+archive, about a quarter of a second — and the figure moves by megabytes an
+hour, so re-walking it on every ten-second poll would buy nothing.
 
 ## Capture time
 
@@ -517,6 +580,62 @@ camera's "Screenshot" no matter which job ran last — the same shape
 record an ISO of `75.4582213796711` and a `Software` of `12.4` where a string
 belongs, and read strictly, one odd tag fails the whole record, retries four
 more times, and marks a good photograph broken and thumbnail-less.
+
+## Place names
+
+The metadata job resolves a photograph's coordinates into a city, a state and a
+country and writes them to `place_city`, `place_admin1` and `place_country`.
+`photobackup geocode` does the same for everything already in the archive —
+11,045 assets here, and the whole run takes under a second.
+
+It is offline. A bundled GeoNames extract and a k-d tree in memory: no network,
+no per-photo API call, and no coordinates leaving the machine. It is also not
+machine learning, deliberately — nothing about "photos in Chicago" should be
+able to break because a GPU is busy, or have to wait for somebody to choose a
+model.
+
+The extract is not in git. Download all three files into `GEONAMES_DIR`:
+
+```sh
+mkdir -p server/data/geonames && cd server/data/geonames
+curl -O https://download.geonames.org/export/dump/cities500.zip
+curl -O https://download.geonames.org/export/dump/admin1CodesASCII.txt
+curl -O https://download.geonames.org/export/dump/countryInfo.txt
+```
+
+The zip is read as it downloads — there is no unzip step — and `cities500.txt`
+is accepted in its place. All three are required rather than optional: falling
+back to raw codes for a missing file would put "IL" in some rows and "Illinois"
+in others depending on what somebody happened to fetch, and those columns are
+search text, where an inconsistency is invisible until a query quietly misses
+half the library.
+
+Without the extract, photographs keep their coordinates and have no place name.
+The metadata job logs one line and carries on: an optional reference table must
+not be able to stop a thumbnail being built.
+
+**Which name a photograph gets.** Not the nearest one. GeoNames records a city
+and the neighbourhoods, wards and villages inside and beside it as separate
+points, so nearest-centre answers a photograph taken at the Eiffel Tower with
+"Paris 16 Passy" and one taken in Shibuya with the name of a block of 1,800
+people — both correct, both useless, because the word somebody will type is
+Paris. Instead each place is given a radius from its population, and the
+largest place whose radius reaches the photograph wins. Chicago comes out at
+13.6km, close to the real thing; a hamlet of 500 covers 200 metres.
+
+The visible cost: Oak Park shares a border with Chicago, sits inside the radius,
+and reads as Chicago. Evanston is 18km up the lakefront, outside it, and stays
+Evanston. The line falls roughly where a city's own extent falls, and the
+direction of the error is the helpful one — a search box is a place to type the
+name of a city, not the name of a ward. A photograph with no inhabited place
+within 150km — over open water, mostly — is recorded as having been looked at
+and having none, which is what stops the backfill offering the same 67 assets
+forever.
+
+The vault takes the place name too, and the reason is worth stating: "Chicago"
+is legible at a glance in a way `41.85, -87.65` is not, so leaving it on a
+hidden photograph's row would be a worse leak than the coordinates the scrub
+already empties. It goes into the sealed document and comes back on restore.
 
 ## What only the phone knows
 
@@ -856,6 +975,32 @@ crash halfway leaves a duplicate-looking minute of video beside its pieces, whic
 somebody can see and undo, where the other order would leave the pieces deleted
 and nothing joined.
 
+**A join that does not add up.** The joined file is probed and its running time
+compared against the sum of its parts, within a tenth of a second. The failure
+this catches is ffmpeg silently dropping a piece — ten whole seconds, which
+could not hide under that tolerance — but it also catches a container that
+overstates its own length by a fraction, and arithmetic cannot tell the two
+apart. So the file the job refused is kept rather than deleted, filed under the
+group's fingerprint as `<fingerprint>.join.mp4` in the derivative tree: the
+review page lists the group with its error and a button that plays that file,
+and `POST /v1/merges/{id}/force` queues the join again with the check disabled.
+The override lives on the group, so every retry makes the same choice, and the
+sidecar of anything archived that way records what the parts were expected to
+add up to.
+
+It is the one file under the derivatives root named after something other than
+an asset, so no per-asset cleanup can reach it: it is removed when the group is
+answered either way, and a sweep on the purge timer reconciles the whole tree
+against the groups still entitled to one.
+
+**Approving.** The joined recordings list is a log rather than a queue — every
+row on it has already happened — so it only ever grows, and the status card
+counting it goes on asking for attention that was paid weeks ago. Approving a
+row says it has been read: it comes off the list, stops being counted, and
+changes nothing else. The pieces stay in the trash, the recording stays in the
+library, splitting it back up goes on working, and the review page's "show
+approved" puts them all back on screen.
+
 **Undo.** Both kinds hand back a delete batch, and `POST /v1/merges/{id}/undo`
 restores it — plus, for a join, sends the joined recording to the trash so the
 library does not end up holding the minute *and* the six pieces. An undone group
@@ -936,12 +1081,14 @@ The maintenance CLI. Reads the same environment photod does.
 photobackup verify [--deep] [--fix]     audit the archive against itself
 photobackup export --to DIR [--copy]    materialize a date tree of hardlinks
 photobackup reindex [--adopt-orphans]   rebuild the database from manifest.jsonl
+photobackup geocode [--all]             name the places photographs were taken
 photobackup import --from DIR [--from…] ingest a Google Photos export
 photobackup import-snapchat --from DIR  ingest a Snapchat export, one half at a
   [--half memories|chat] [--from…]      time; --from once per unzipped zip
 photobackup pair [--ttl 10m]            mint a single-use code to pair a device
 photobackup devices [--revoke ID]       list paired devices, or unpair one
 photobackup ca [--serve]                the CA to install on a device, and how
+photobackup migrate [--check]           apply pending schema migrations
 ```
 
 **verify** runs five passes: assets against blobs, blobs against assets, the
@@ -1033,6 +1180,12 @@ docker compose up -d
 go test ./...
 ```
 
+The image is `pgvector/pgvector:pg18` rather than the stock one, because
+migration 0016 opens with `create extension vector` and `postgres:18-alpine`
+does not ship it. Every per-package database runs the same migrations, so the
+extension is created in each of them and a Postgres without it fails the whole
+suite at the first `Migrate`.
+
 On a machine that is also *running* photod, the compose Postgres cannot bind
 5432 — the deployed one already has it. Point the tests at a second server
 instead of stopping the archive:
@@ -1040,7 +1193,7 @@ instead of stopping the archive:
 ```sh
 docker run -d --name photobackup-test-pg -p 5433:5432 \
   -e POSTGRES_USER=photobackup -e POSTGRES_PASSWORD=photobackup \
-  -e POSTGRES_DB=photobackup postgres:18-alpine
+  -e POSTGRES_DB=photobackup pgvector/pgvector:pg18
 export TEST_DATABASE_URL=postgres://photobackup:photobackup@localhost:5433/photobackup?sslmode=disable
 ```
 

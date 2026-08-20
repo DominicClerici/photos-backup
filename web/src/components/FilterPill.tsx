@@ -69,7 +69,7 @@ const FACET_ICON: Record<Facet, typeof Images> = {
  * for the same reason: these two are the things you do *to* a grid, and the
  * grid is a full-height scroller with no room left in it. It draws nothing at
  * all unless a grid is on screen, which keeps it off the collections and
- * overview pages.
+ * status pages.
  *
  * The panel opens upward and holds three things in the order somebody reaches
  * for them: the order, then what to leave out, then where to go. The filters

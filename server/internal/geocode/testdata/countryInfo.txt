@@ -1,0 +1,3 @@
+# ================================
+CH	CHE	756	SZ	Switzerland	Bern	41290	8516543	EU	.ch	CHF	Franc	41	####	^(\d{4})$	de-CH,fr-CH,it-CH,rm	2658434	DE,IT,LI,FR,AT	
+US	USA	840	US	United States	Washington	9629091	327167434	NA	.us	USD	Dollar	1	#####-####	^\d{5}(-\d{4})?$	en-US,es-US,haw,fr	6252001	CA,MX,CU	

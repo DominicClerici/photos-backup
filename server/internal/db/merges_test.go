@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/merge"
 )
 
@@ -29,7 +30,7 @@ func recordGroup(t *testing.T, s *Store, kind string, ids ...string) string {
 	if _, err := s.RecordGroups(context.Background(), []merge.Group{{Kind: kind, IDs: ids}}); err != nil {
 		t.Fatalf("RecordGroups: %v", err)
 	}
-	groups, err := s.Groups(context.Background(), kind, MergePending, 100)
+	groups, err := s.Groups(context.Background(), MergeQuery{Kind: kind, State: MergePending, Limit: 100})
 	if err != nil {
 		t.Fatalf("Groups: %v", err)
 	}
@@ -118,7 +119,7 @@ func TestRecordGroupsSupersedesAnOverlappingPendingGroup(t *testing.T) {
 	recordGroup(t, s, merge.KindDuplicate, ids[0], ids[1])
 	recordGroup(t, s, merge.KindDuplicate, ids[0], ids[1], ids[2])
 
-	groups, err := s.Groups(context.Background(), merge.KindDuplicate, MergePending, 100)
+	groups, err := s.Groups(context.Background(), MergeQuery{Kind: merge.KindDuplicate, State: MergePending, Limit: 100})
 	if err != nil {
 		t.Fatalf("Groups: %v", err)
 	}
@@ -702,7 +703,7 @@ func TestGroupsDescribeEachMember(t *testing.T) {
 	}
 	recordGroup(t, s, merge.KindDuplicate, ids...)
 
-	groups, err := s.Groups(ctx, merge.KindDuplicate, MergePending, 10)
+	groups, err := s.Groups(ctx, MergeQuery{Kind: merge.KindDuplicate, State: MergePending, Limit: 10})
 	if err != nil {
 		t.Fatalf("Groups: %v", err)
 	}
@@ -735,7 +736,7 @@ func TestGroupsHonoursTheLimit(t *testing.T) {
 		recordGroup(t, s, merge.KindDuplicate, ids[i], ids[i+1])
 	}
 
-	groups, err := s.Groups(ctx, merge.KindDuplicate, MergePending, 3)
+	groups, err := s.Groups(ctx, MergeQuery{Kind: merge.KindDuplicate, State: MergePending, Limit: 3})
 	if err != nil {
 		t.Fatalf("Groups: %v", err)
 	}
@@ -750,3 +751,277 @@ func TestGroupsHonoursTheLimit(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// failJoin puts the group's queued join into the state a worker that gave up
+// leaves it in. The job is queued against the group's first member, which is
+// the only thing the jobs table knows about a group.
+func failJoin(t *testing.T, s *Store, group, head, message string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := jobs.Enqueue(ctx, s.pool, jobs.KindMerge, head); err != nil {
+		t.Fatalf("enqueue the join: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `
+		update jobs set state = 'failed', attempts = 5, last_error = $3, updated_at = now()
+		where kind = $1 and asset_id = $2::uuid`, jobs.KindMerge, head, message); err != nil {
+		t.Fatalf("fail the join: %v", err)
+	}
+}
+
+// A join that gave up leaves the group pending — nothing about the photographs
+// has changed — so it has to be findable by something other than the state
+// column, and it has to bring the error with it.
+func TestFailedFindsGroupsWhoseJoinGaveUp(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	pieces := seedCopies(t, s, 3)
+	group := recordGroup(t, s, merge.KindSegments, pieces...)
+
+	const why = "join: 3 parts totalling 28.643s came out as 28.797s; refusing to archive that"
+	failJoin(t, s, group, pieces[0], why)
+
+	failed, err := s.Groups(ctx, MergeQuery{Kind: merge.KindSegments, State: MergeFailedState, Limit: 10})
+	if err != nil {
+		t.Fatalf("Groups: %v", err)
+	}
+	if len(failed) != 1 {
+		t.Fatalf("%d failed groups, want 1", len(failed))
+	}
+	if failed[0].ID != group {
+		t.Errorf("found group %s, want %s", failed[0].ID, group)
+	}
+	if failed[0].State != MergePending {
+		t.Errorf("state = %q, want it to still be pending", failed[0].State)
+	}
+	if failed[0].Failure == nil {
+		t.Fatal("the failure did not come with it, so the page has nothing to explain the row with")
+	}
+	if failed[0].Failure.Error != why || failed[0].Failure.Attempts != 5 {
+		t.Errorf("failure = %+v, want the error verbatim and 5 attempts", failed[0].Failure)
+	}
+
+	// And a group nobody has failed to join is not one of them.
+	other := recordGroup(t, s, merge.KindSegments, seedTwo(t, s, 60)...)
+	failed, err = s.Groups(ctx, MergeQuery{Kind: merge.KindSegments, State: MergeFailedState, Limit: 10})
+	if err != nil {
+		t.Fatalf("Groups: %v", err)
+	}
+	if len(failed) != 1 || failed[0].ID == other {
+		t.Errorf("%d failed groups, want only the one whose job failed", len(failed))
+	}
+}
+
+// Approving is the only way the joined recordings log ever gets shorter. It
+// changes nothing about the photographs, which is the whole reason it is safe.
+func TestApproveTakesAJoinOffTheList(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	pieces := seedCopies(t, s, 3)
+	joined := seedAsset(t, s, 99, mergeEpoch)
+	group := recordGroup(t, s, merge.KindSegments, pieces...)
+	if _, err := s.MergeSegments(ctx, group, joined); err != nil {
+		t.Fatalf("MergeSegments: %v", err)
+	}
+
+	merged := MergeQuery{Kind: merge.KindSegments, State: MergeMerged, Limit: 10}
+	if groups, err := s.Groups(ctx, merged); err != nil || len(groups) != 1 {
+		t.Fatalf("before approving: %d groups, %v; want 1", len(groups), err)
+	}
+
+	if err := s.ApproveGroup(ctx, group, true); err != nil {
+		t.Fatalf("ApproveGroup: %v", err)
+	}
+	groups, err := s.Groups(ctx, merged)
+	if err != nil {
+		t.Fatalf("Groups: %v", err)
+	}
+	if len(groups) != 0 {
+		t.Errorf("%d groups after approving, want none on the default list", len(groups))
+	}
+
+	merged.Approved = true
+	groups, err = s.Groups(ctx, merged)
+	if err != nil {
+		t.Fatalf("Groups: %v", err)
+	}
+	if len(groups) != 1 || groups[0].ApprovedAt == nil {
+		t.Fatalf("show-approved returned %d groups, want the approved one with its date", len(groups))
+	}
+	// Still merged, still undoable: approving is a note, not a resolution.
+	if groups[0].State != MergeMerged || groups[0].KeeperAssetID == nil {
+		t.Errorf("approving changed the group to %+v", groups[0])
+	}
+
+	if err := s.ApproveGroup(ctx, group, false); err != nil {
+		t.Fatalf("ApproveGroup(false): %v", err)
+	}
+	if groups, err := s.Groups(ctx, MergeQuery{Kind: merge.KindSegments, State: MergeMerged, Limit: 10}); err != nil || len(groups) != 1 {
+		t.Fatalf("after unapproving: %d groups, %v; want it back", len(groups), err)
+	}
+}
+
+// A pending group has not happened yet, so there is nothing to have read.
+func TestApproveRefusesAGroupThatWasNeverMerged(t *testing.T) {
+	s := testStore(t)
+	group := recordGroup(t, s, merge.KindSegments, seedCopies(t, s, 2)...)
+
+	if err := s.ApproveGroup(context.Background(), group, true); !errors.Is(err, ErrNotMerged) {
+		t.Errorf("ApproveGroup on a pending group = %v, want ErrNotMerged", err)
+	}
+}
+
+// The counts behind the status card. An approved join stops being counted and a
+// failed one is counted apart from the ones that are merely slow.
+func TestMergeCountsSeparatesFailedAndApprovedSegments(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+
+	slow := recordGroup(t, s, merge.KindSegments, seedCopies(t, s, 2)...)
+	_ = slow
+	stuck := seedTwo(t, s, 10)
+	stuckGroup := recordGroup(t, s, merge.KindSegments, stuck...)
+	failJoin(t, s, stuckGroup, stuck[0], "no")
+
+	done := seedTwo(t, s, 20)
+	doneGroup := recordGroup(t, s, merge.KindSegments, done...)
+	if _, err := s.MergeSegments(ctx, doneGroup, seedAsset(t, s, 90, mergeEpoch)); err != nil {
+		t.Fatalf("MergeSegments: %v", err)
+	}
+
+	counts, err := s.MergeCounts(ctx)
+	if err != nil {
+		t.Fatalf("MergeCounts: %v", err)
+	}
+	if counts.PendingSegments != 1 || counts.FailedSegments != 1 || counts.MergedSegments != 1 || counts.ApprovedSegments != 0 {
+		t.Fatalf("counts = %+v, want one still being joined, one failed, one merged", counts)
+	}
+
+	if err := s.ApproveGroup(ctx, doneGroup, true); err != nil {
+		t.Fatalf("ApproveGroup: %v", err)
+	}
+	counts, err = s.MergeCounts(ctx)
+	if err != nil {
+		t.Fatalf("MergeCounts: %v", err)
+	}
+	if counts.MergedSegments != 0 || counts.ApprovedSegments != 1 {
+		t.Errorf("after approving: merged = %d, approved = %d; want 0 and 1",
+			counts.MergedSegments, counts.ApprovedSegments)
+	}
+}
+
+// seedTwo is two more assets with digests that will not collide with the ones
+// seedCopies already handed out.
+func seedTwo(t *testing.T, s *Store, from int) []string {
+	t.Helper()
+	return []string{
+		seedAsset(t, s, from, mergeEpoch),
+		seedAsset(t, s, from+1, mergeEpoch.Add(10*time.Second)),
+	}
+}
+
+// Overruling the duration check puts the work back on the queue, and says so on
+// the group rather than on the job — every retry has to make the same choice.
+func TestForceJoinFlagsTheGroupAndRequeuesTheWork(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	pieces := seedCopies(t, s, 3)
+	group := recordGroup(t, s, merge.KindSegments, pieces...)
+	failJoin(t, s, group, pieces[0], "the parts do not add up")
+
+	if err := s.ForceJoin(ctx, group); err != nil {
+		t.Fatalf("ForceJoin: %v", err)
+	}
+
+	g, err := s.Group(ctx, group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !g.Forced {
+		t.Error("the override was not recorded on the group, so the next attempt would refuse again")
+	}
+
+	var state string
+	var attempts int
+	if err := s.pool.QueryRow(ctx, `
+		select state, attempts from jobs where kind = $1 and asset_id = $2::uuid`,
+		jobs.KindMerge, pieces[0]).Scan(&state, &attempts); err != nil {
+		t.Fatalf("read the job: %v", err)
+	}
+	if state != string(jobs.StatePending) || attempts != 0 {
+		t.Errorf("job is %s after %d attempts, want pending from scratch", state, attempts)
+	}
+
+	// And a group that has already been resolved is not something to force.
+	other := recordGroup(t, s, merge.KindSegments, seedTwo(t, s, 40)...)
+	if _, err := s.MergeSegments(ctx, other, seedAsset(t, s, 91, mergeEpoch)); err != nil {
+		t.Fatalf("MergeSegments: %v", err)
+	}
+	if err := s.ForceJoin(ctx, other); !errors.Is(err, ErrNotPending) {
+		t.Errorf("ForceJoin on a merged group = %v, want ErrNotPending", err)
+	}
+}
+
+// Refusing a join takes the work off the queue with it. Without that the status
+// page goes on reporting a job that gave up on something nobody wants done.
+func TestDismissTakesTheFailedJoinOffTheQueue(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	pieces := seedCopies(t, s, 3)
+	group := recordGroup(t, s, merge.KindSegments, pieces...)
+	failJoin(t, s, group, pieces[0], "the parts do not add up")
+
+	if err := s.DismissGroup(ctx, group); err != nil {
+		t.Fatalf("DismissGroup: %v", err)
+	}
+
+	var left int
+	if err := s.pool.QueryRow(ctx,
+		`select count(*)::int from jobs where kind = $1`, jobs.KindMerge).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 0 {
+		t.Errorf("%d merge jobs left after the group was refused, want none", left)
+	}
+}
+
+// The list a sweep reconciles the derivative tree against. A group qualifies
+// while it is still a question with parts to answer it, and not afterwards.
+func TestSegmentPreviewsListsOnlyGroupsStillWaitingToBeJoined(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+
+	pieces := seedCopies(t, s, 3)
+	waiting := recordGroup(t, s, merge.KindSegments, pieces...)
+
+	resolved := recordGroup(t, s, merge.KindSegments, seedTwo(t, s, 30)...)
+	if _, err := s.MergeSegments(ctx, resolved, seedAsset(t, s, 92, mergeEpoch)); err != nil {
+		t.Fatalf("MergeSegments: %v", err)
+	}
+	refused := recordGroup(t, s, merge.KindSegments, seedTwo(t, s, 50)...)
+	if err := s.DismissGroup(ctx, refused); err != nil {
+		t.Fatalf("DismissGroup: %v", err)
+	}
+
+	want, err := s.Group(ctx, waiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.SegmentPreviews(ctx)
+	if err != nil {
+		t.Fatalf("SegmentPreviews: %v", err)
+	}
+	if len(got) != 1 || got[0] != want.Fingerprint {
+		t.Fatalf("SegmentPreviews = %v, want just %s", got, want.Fingerprint)
+	}
+
+	// A group whose parts have been destroyed is not owed a preview either,
+	// even though nothing has answered its question.
+	if _, err := s.pool.Exec(ctx, `delete from assets where id = any($1::uuid[])`, pieces); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.SegmentPreviews(ctx); err != nil {
+		t.Fatalf("SegmentPreviews: %v", err)
+	} else if len(got) != 0 {
+		t.Errorf("SegmentPreviews = %v after its parts were destroyed, want none", got)
+	}
+}

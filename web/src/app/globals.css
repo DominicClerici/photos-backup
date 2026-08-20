@@ -55,6 +55,11 @@
   --sidebar-ring: #6ea8fe;
 
   /* App surfaces with no shadcn equivalent. */
+  /* Degraded, as distinct from broken. The status page needs three states and
+     shadcn ships two: a server missing ffmpeg is not a server that is down, and
+     drawing both of them in --destructive would spend the loudest colour in the
+     palette on the case that can wait until Saturday. */
+  --warning: #e0a458;
   --faint: #6a6a74;
   --tile: #1c1c21;
   --tile-sheen: #24242b;
@@ -96,6 +101,7 @@
   --color-foreground: var(--foreground);
   --color-background: var(--background);
 
+  --color-warning: var(--warning);
   --color-faint: var(--faint);
   --color-tile: var(--tile);
   --color-tile-sheen: var(--tile-sheen);

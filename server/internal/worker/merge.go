@@ -15,6 +15,7 @@ import (
 
 	"github.com/dominicclerici/photos-backup/server/internal/blobstore"
 	"github.com/dominicclerici/photos-backup/server/internal/db"
+	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/mediatype"
@@ -68,13 +69,31 @@ func (r *Runner) runMerge(ctx context.Context, assetID string) error {
 	}
 	defer cleanup()
 
-	result, err := r.Video.Join(ctx, parts, staged)
+	result, err := r.Video.Join(ctx, parts, staged,
+		video.JoinOptions{AllowDurationMismatch: group.Forced})
+	var mismatch *video.DurationMismatch
+	if errors.As(err, &mismatch) {
+		// The one join failure that produces a playable file, and the one worth
+		// arguing with: the arithmetic cannot tell a part ffmpeg silently
+		// dropped from a container whose last frame runs a tenth of a second
+		// long, and a person watching it can. So the file this job just refused
+		// is kept under the group rather than deleted with the rest of the
+		// staging, and the review page offers it beside a button that archives
+		// it anyway. The job still fails — nothing is in the library yet.
+		r.keepRejected(group, staged)
+		return err
+	}
 	if err != nil {
 		return err
 	}
 	if !result.Copied {
 		r.log().Info("joined a recording by re-encoding it",
 			"group", group.ID, "parts", len(parts), "reason", result.Why)
+	}
+	if result.Mismatch {
+		r.log().Warn("archived a joined recording whose parts do not add up",
+			"group", group.ID, "parts", len(parts),
+			"expected", result.Expected, "seconds", result.DurationSeconds)
 	}
 
 	joined, err := r.archiveJoined(ctx, group, assets, staged, result)
@@ -89,6 +108,12 @@ func (r *Runner) runMerge(ctx context.Context, assetID string) error {
 	r.log().Info("joined a Snapchat recording that was exported in pieces",
 		"group", group.ID, "parts", len(parts), "asset", joined,
 		"seconds", result.DurationSeconds, "copied", result.Copied, "trashed", merged.Trashed)
+
+	// The question has been answered, so the rejected attempt at answering it is
+	// nobody's. Sweeping catches this too — see db.SegmentPreviews — but a file
+	// removed at the moment it stops being wanted is a file nothing has to
+	// reason about later.
+	r.dropRejected(group)
 
 	// The joined asset was inserted with a metadata job of its own, and there is
 	// a transcode behind that.
@@ -326,6 +351,9 @@ func joinedSidecar(
 		DurationSeconds: result.DurationSeconds,
 		JoinedAt:        time.Now().UTC(),
 	}
+	if result.Mismatch {
+		joined.ExpectedSeconds = result.Expected
+	}
 	for _, p := range parts {
 		part := snapchat.JoinedPart{File: p.OriginalFilename, SHA256: p.SHA256}
 		if p.CapturedAt != nil {
@@ -352,6 +380,39 @@ func joinedSidecar(
 		Joined:           joined,
 	}
 	return json.Marshal(out)
+}
+
+// keepRejected files a join this worker refused to archive under the group it
+// came from, so it can be watched.
+//
+// Under the group's fingerprint rather than any asset's digest, because it is
+// not a rendition of an asset: it is what six of them would be if they were
+// one. That makes it the only file in the derivative tree that no per-asset
+// cleanup can reach, which is why db.SegmentPreviews and the sweep that reads
+// it exist.
+//
+// Never fatal. The job has already failed and is about to say so; failing to
+// keep the evidence costs the review page a button, not the archive anything.
+func (r *Runner) keepRejected(group db.MergeGroup, staged string) {
+	if r.Derivatives == nil {
+		return
+	}
+	if err := r.Derivatives.Commit(group.Fingerprint, derivstore.JoinPreview, staged); err != nil {
+		r.log().Warn("could not keep the rejected join for review",
+			"error", err, "group", group.ID)
+		return
+	}
+	r.log().Info("kept a rejected join for review", "group", group.ID)
+}
+
+// dropRejected removes an earlier attempt's evidence once the join has landed.
+func (r *Runner) dropRejected(group db.MergeGroup) {
+	if r.Derivatives == nil {
+		return
+	}
+	if err := r.Derivatives.Remove(group.Fingerprint, derivstore.JoinPreview); err != nil {
+		r.log().Warn("could not remove a rejected join", "error", err, "group", group.ID)
+	}
 }
 
 // EnqueueSegmentMerges queues a join for every recording found and not yet put

@@ -24,6 +24,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/devices"
 	"github.com/dominicclerici/photos-backup/server/internal/discovery"
 	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
+	"github.com/dominicclerici/photos-backup/server/internal/geocode"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/livecache"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
@@ -62,6 +63,14 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	if err := os.MkdirAll(derivRoot, 0o755); err != nil {
+		return err
+	}
+
+	// Resolved but deliberately not created. It holds files somebody downloads,
+	// and an empty directory photod made for itself would look like an install
+	// that had happened.
+	geoDir, err := filepath.Abs(cfg.GeoNamesDir)
+	if err != nil {
 		return err
 	}
 
@@ -125,7 +134,10 @@ func run(log *slog.Logger) error {
 		Uploads:      staging,
 		Devices:      paired,
 		Vault:        vaults,
-		Log:          log,
+		// What the status page needs to tell a degraded server from a busy one.
+		WorkerEnabled: !cfg.WorkerDisabled,
+		Tools:         mediaTools(cfg),
+		Log:           log,
 	}
 
 	go sweepUploads(ctx, log, staging, cfg.UploadSessionTTL)
@@ -148,6 +160,10 @@ func run(log *slog.Logger) error {
 	// and it will probably never open, but "probably never" is not the standard
 	// a vault is held to. See vault.Service.Reconcile.
 	go sweepVault(ctx, vaults, cfg.PurgeInterval)
+
+	// And on the same timer again, for the one file in the derivative tree that
+	// no per-asset cleanup can reach. See sweepJoinPreviews.
+	go sweepJoinPreviews(ctx, store, derivatives, log, cfg.PurgeInterval)
 
 	// Before the worker pools start, because unlike everything below this can
 	// fail: TLS is not optional the way the media tools are. A missing ffmpeg
@@ -192,12 +208,14 @@ func run(log *slog.Logger) error {
 			Images:      converter,
 			Video:       videoTool,
 			Exif:        exif,
+			Places:      geocode.NewLoader(geoDir),
 			Manifest:    srv.Manifest,
 			Log:         log,
 		})
 		workers.MetadataWorkers = cfg.WorkerConcurrency
 		workers.TranscodeWorkers = cfg.TranscodeConcurrency
 		workers.SignatureWorkers = cfg.SignatureConcurrency
+		workers.PrepWorkers = cfg.PrepConcurrency
 
 		workers.Start(ctx)
 		defer workers.Wait()
@@ -410,19 +428,99 @@ func sweepVault(ctx context.Context, vaults *vault.Service, every time.Duration)
 	}
 }
 
+// sweepJoinPreviews removes rejected joins that no merge group wants any more.
+//
+// Every other file under the derivatives root is named after an asset's digest,
+// so it is cleaned up by whatever cleans up that asset: a purge removes the
+// renditions beside the original, and the vault seals them with it. A join
+// preview is named after a merge group — it is what six assets would be if they
+// were one — and a group can stop wanting one in ways that never pass through
+// this process at all: its parts purged out from under it by the sweep above,
+// its question answered by another machine against the same database.
+//
+// So the tree is reconciled against the database rather than trusted to have
+// been tidied. Cheap: one directory walk of a tree already walked once a minute
+// for the storage card, against a query that returns single digits.
+func sweepJoinPreviews(ctx context.Context, store *db.Store, derivatives *derivstore.Store, log *slog.Logger, every time.Duration) {
+	if derivatives == nil {
+		return
+	}
+
+	sweep := func() {
+		on, err := derivatives.Keys(derivstore.JoinPreview)
+		if err != nil {
+			log.Warn("could not list rejected joins", "error", err)
+			return
+		}
+		if len(on) == 0 {
+			return
+		}
+		wanted, err := store.SegmentPreviews(ctx)
+		if err != nil {
+			// Without the list there is no way to tell an orphan from evidence
+			// somebody is about to look at, and deleting the second is worse
+			// than keeping the first.
+			log.Warn("could not list the groups a rejected join could belong to", "error", err)
+			return
+		}
+
+		keep := make(map[string]bool, len(wanted))
+		for _, fingerprint := range wanted {
+			keep[fingerprint] = true
+		}
+		removed := 0
+		for _, fingerprint := range on {
+			if keep[fingerprint] {
+				continue
+			}
+			if err := derivatives.Remove(fingerprint, derivstore.JoinPreview); err != nil {
+				log.Warn("could not remove an orphaned join", "error", err, "group", fingerprint)
+				continue
+			}
+			removed++
+		}
+		if removed > 0 {
+			log.Info("removed rejected joins whose groups are gone", "files", removed)
+		}
+	}
+
+	sweep()
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
+}
+
 // checkTools reports which external tools are missing, and what stops working
 // without each one. Finding out at startup beats finding out from a queue full
 // of identical failures an hour into a backfill.
+// mediaTools are the external binaries the derivatives are built with, and what
+// is lost when one is missing.
+//
+// One list, read twice: once at startup for the log, and once per request by
+// the status page — which re-checks rather than trusting this snapshot, because
+// installing the missing package is the obvious fix and nobody should have to
+// restart the daemon to see that it worked.
+func mediaTools(cfg config.Config) []api.Tool {
+	return []api.Tool{
+		{Binary: cfg.MagickBin, Needs: "thumbnails and previews"},
+		{Binary: cfg.ExiftoolBin, Needs: "capture times, camera, and GPS"},
+		{Binary: cfg.FFmpegBin, Needs: "video posters and playback renditions"},
+		{Binary: cfg.FFprobeBin, Needs: "video dimensions and duration"},
+	}
+}
+
 func checkTools(log *slog.Logger, cfg config.Config) {
-	for _, tool := range []struct{ binary, needed string }{
-		{cfg.MagickBin, "thumbnails and previews"},
-		{cfg.ExiftoolBin, "capture times, camera, and GPS"},
-		{cfg.FFmpegBin, "video posters and playback renditions"},
-		{cfg.FFprobeBin, "video dimensions and duration"},
-	} {
-		if _, err := exec.LookPath(tool.binary); err != nil {
+	for _, tool := range mediaTools(cfg) {
+		if _, err := exec.LookPath(tool.Binary); err != nil {
 			log.Warn("external tool not found; uploads still work but derivatives will fail",
-				"binary", tool.binary, "affects", tool.needed)
+				"binary", tool.Binary, "affects", tool.Needs)
 		}
 	}
 }

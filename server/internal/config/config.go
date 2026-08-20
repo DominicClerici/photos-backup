@@ -23,6 +23,17 @@ type Config struct {
 	DerivativesRoot string
 	DatabaseURL     string
 
+	// GeoNamesDir holds the offline geocoder's extract: cities500, the admin1
+	// codes and the country names, exactly as downloaded. See internal/geocode
+	// for what goes in it and where from.
+	//
+	// Its own setting rather than a directory under PhotosRoot because it is
+	// neither part of the library nor derived from it. It is a reference table
+	// that can be re-downloaded, which puts it with the machine's state on the
+	// SSD rather than on the archive drive. Photographs keep their coordinates
+	// and go without a place name when it is absent.
+	GeoNamesDir string
+
 	// TLSDir holds ca.crt, ca.key and the server certificate photod issues for
 	// itself. Empty means PhotosRoot/tls.
 	//
@@ -68,6 +79,12 @@ type Config struct {
 	// background over an hour, not something it does instead of serving the
 	// gallery.
 	SignatureConcurrency int
+	// PrepConcurrency sizes the pool that writes the renditions a vision model
+	// reads. Two by default: it is another full decode of every visible
+	// original in the archive, and like the signature pass nothing is waiting
+	// for it — but unlike the signature pass each item is one ImageMagick
+	// rather than twenty sampled frames, so a second worker is worth having.
+	PrepConcurrency int
 	// PreviewConcurrency caps simultaneous on-demand preview conversions, so a
 	// fast scroll cannot fork an ImageMagick per request.
 	PreviewConcurrency int
@@ -126,6 +143,8 @@ func FromEnv() Config {
 		DerivativesRoot: os.Getenv("DERIVATIVES_ROOT"),
 		DatabaseURL:     or(os.Getenv("DATABASE_URL"), "postgres://photobackup:photobackup@localhost:5432/photobackup?sslmode=disable"),
 
+		GeoNamesDir: or(os.Getenv("GEONAMES_DIR"), "./data/geonames"),
+
 		TLSDir:       os.Getenv("TLS_DIR"),
 		TLSExtraSANs: list(os.Getenv("TLS_EXTRA_SANS")),
 		TLSDisabled:  truthy(os.Getenv("TLS_DISABLED")),
@@ -139,6 +158,7 @@ func FromEnv() Config {
 		WorkerConcurrency:    positive(os.Getenv("WORKER_CONCURRENCY"), 4),
 		SignatureConcurrency: positive(os.Getenv("SIGNATURE_CONCURRENCY"), 1),
 		TranscodeConcurrency: positive(os.Getenv("TRANSCODE_CONCURRENCY"), 1),
+		PrepConcurrency:      positive(os.Getenv("PREP_CONCURRENCY"), 2),
 		PreviewConcurrency:   positive(os.Getenv("PREVIEW_CONCURRENCY"), 4),
 		WorkerDisabled:       truthy(os.Getenv("WORKER_DISABLED")),
 

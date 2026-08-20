@@ -307,6 +307,15 @@ type assetDetail struct {
 	GPSLat *float64 `json:"gps_lat,omitempty"`
 	GPSLon *float64 `json:"gps_lon,omitempty"`
 
+	// Where those coordinates are, in words, from the offline geocoder. Sent as
+	// three fields rather than one formatted string because the panel and a
+	// future search pill want to draw them differently, and joining them with
+	// commas is not a decision the server has to make. All absent on the 38% of
+	// the library with no GPS fix.
+	PlaceCity    string `json:"place_city,omitempty"`
+	PlaceAdmin1  string `json:"place_admin1,omitempty"`
+	PlaceCountry string `json:"place_country,omitempty"`
+
 	// What an import knew and the file did not. Absent on anything a device
 	// uploaded directly, which is why every one of these is omitempty.
 	Description string   `json:"description,omitempty"`
@@ -369,6 +378,9 @@ func (s *Server) handleAssetDetail(w http.ResponseWriter, r *http.Request) {
 		Lens:            asset.Lens,
 		GPSLat:          asset.GPSLat,
 		GPSLon:          asset.GPSLon,
+		PlaceCity:       asset.Place.City,
+		PlaceAdmin1:     asset.Place.Admin1,
+		PlaceCountry:    asset.Place.Country,
 		Description:     asset.Description,
 		Favorite:        asset.Favorite,
 		Archived:        asset.Archived,

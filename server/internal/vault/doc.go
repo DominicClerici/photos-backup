@@ -77,6 +77,13 @@ type row struct {
 	Lens        *string    `json:"lens"`
 	GPSLat      *float64   `json:"gps_lat"`
 	GPSLon      *float64   `json:"gps_lon"`
+	// Where the photograph was taken, in words. In the document rather than on
+	// the row for the same reason the coordinates are — see the scrub list in
+	// internal/db/vault.go — and read back out here so the panel a hidden
+	// photograph opens into is the same panel.
+	PlaceCity    *string `json:"place_city"`
+	PlaceAdmin1  *string `json:"place_admin1"`
+	PlaceCountry *string `json:"place_country"`
 }
 
 // Detail is one hidden photograph as the viewer's panel draws it: everything
@@ -103,6 +110,9 @@ type Detail struct {
 	Lens            string
 	GPSLat          *float64
 	GPSLon          *float64
+	PlaceCity       string
+	PlaceAdmin1     string
+	PlaceCountry    string
 	Description     string
 	Favorite        bool
 	Archived        bool
@@ -139,6 +149,9 @@ func (i *Item) Detail() Detail {
 		Lens:            text(i.row.Lens),
 		GPSLat:          i.row.GPSLat,
 		GPSLon:          i.row.GPSLon,
+		PlaceCity:       text(i.row.PlaceCity),
+		PlaceAdmin1:     text(i.row.PlaceAdmin1),
+		PlaceCountry:    text(i.row.PlaceCountry),
 		Description:     text(i.row.Description),
 		Favorite:        i.row.Favorite,
 		Archived:        i.row.Archived,

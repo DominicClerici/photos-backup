@@ -3,10 +3,13 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"path"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -103,6 +106,13 @@ type Asset struct {
 	// has to know to go and ask for the key instead. See internal/vault.
 	Vault string
 
+	// Place is where the photograph was taken, in words, resolved from the
+	// coordinates by internal/geocode. Empty on the 38% of the library with no
+	// GPS fix, and on everything nobody has geocoded yet — GeocodedAt is what
+	// tells those two apart.
+	Place      Place
+	GeocodedAt *time.Time
+
 	// SortTime is the generated column the timeline orders on:
 	// exif capture time, else the phone's, else arrival.
 	SortTime time.Time
@@ -175,6 +185,21 @@ type Metadata struct {
 	Faces json.RawMessage
 }
 
+// Place is a photograph's location as a person would say it. Source names what
+// resolved it — "geonames" today — so a later source is distinguishable from
+// this one without re-running anything.
+type Place struct {
+	City    string
+	Admin1  string
+	Country string
+	Source  string
+}
+
+// Empty reports that nothing was resolved. A geocoded asset can legitimately
+// have one of these: a photograph taken over open water has coordinates and no
+// place, and the row records that somebody looked.
+func (p Place) Empty() bool { return p.City == "" && p.Admin1 == "" && p.Country == "" }
+
 // Derivative states, shared by DerivedState and PlaybackState.
 const (
 	DerivedPending = "pending"
@@ -241,12 +266,23 @@ func (s *Store) Close() { s.pool.Close() }
 // opening a second one against the same database.
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
-// Migrate brings the schema up to date. goose needs a database/sql handle, so
-// this borrows one through the pgx stdlib adapter rather than holding it open.
+// Migrate brings the schema up to date.
 func (s *Store) Migrate() error {
+	_, err := s.MigrateUp()
+	return err
+}
+
+// MigrateUp brings the schema up to date and names the migrations it applied,
+// newest last. A deployment can then say what it changed rather than only that
+// it succeeded, which is the difference between a silent schema change and one
+// that appears in the log next to the binary that needed it.
+//
+// goose needs a database/sql handle, so this borrows one through the pgx stdlib
+// adapter rather than holding it open.
+func (s *Store) MigrateUp() ([]string, error) {
 	cfg, err := pgx.ParseConfig(s.url)
 	if err != nil {
-		return fmt.Errorf("parse database url: %w", err)
+		return nil, fmt.Errorf("parse database url: %w", err)
 	}
 	sqlDB := stdlib.OpenDB(*cfg)
 	defer sqlDB.Close()
@@ -254,12 +290,55 @@ func (s *Store) Migrate() error {
 	goose.SetBaseFS(migrationFS)
 	goose.SetLogger(goose.NopLogger())
 	if err := goose.SetDialect("postgres"); err != nil {
-		return fmt.Errorf("set goose dialect: %w", err)
+		return nil, fmt.Errorf("set goose dialect: %w", err)
+	}
+
+	pending, err := pendingMigrations(sqlDB)
+	if err != nil {
+		return nil, err
 	}
 	if err := goose.Up(sqlDB, "migrations"); err != nil {
-		return fmt.Errorf("run migrations: %w", err)
+		return nil, fmt.Errorf("run migrations: %w", err)
 	}
-	return nil
+	return pending, nil
+}
+
+// PendingMigrations names the migrations that MigrateUp would apply, without
+// applying them. It creates goose's bookkeeping table if the database has never
+// been migrated, which is the only write it makes.
+func (s *Store) PendingMigrations() ([]string, error) {
+	cfg, err := pgx.ParseConfig(s.url)
+	if err != nil {
+		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	sqlDB := stdlib.OpenDB(*cfg)
+	defer sqlDB.Close()
+
+	goose.SetBaseFS(migrationFS)
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.SetDialect("postgres"); err != nil {
+		return nil, fmt.Errorf("set goose dialect: %w", err)
+	}
+	return pendingMigrations(sqlDB)
+}
+
+func pendingMigrations(sqlDB *sql.DB) ([]string, error) {
+	current, err := goose.GetDBVersion(sqlDB)
+	if err != nil {
+		return nil, fmt.Errorf("read schema version: %w", err)
+	}
+	ahead, err := goose.CollectMigrations("migrations", current, math.MaxInt64)
+	if errors.Is(err, goose.ErrNoMigrationFiles) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("collect migrations: %w", err)
+	}
+	names := make([]string, 0, len(ahead))
+	for _, m := range ahead {
+		names = append(names, path.Base(m.Source))
+	}
+	return names, nil
 }
 
 const assetColumns = `id, sha256, md5, byte_size, original_filename, ext,
@@ -271,6 +350,8 @@ const assetColumns = `id, sha256, md5, byte_size, original_filename, ext,
 	coalesce(description, ''), favorite, archived, import_source,
 	overlay_asset_id::text, is_overlay,
 	deleted_at, purge_after, vault,
+	coalesce(place_city, ''), coalesce(place_admin1, ''), coalesce(place_country, ''),
+	coalesce(place_source, ''), geocoded_at,
 	sort_time, derived_state, playback_state`
 
 // RecordAsset stores an asset and the mapping from the local asset that
@@ -518,6 +599,7 @@ func scanAsset(s scanner) (Asset, error) {
 		&a.Description, &a.Favorite, &a.Archived, &a.ImportSource,
 		&a.OverlayAssetID, &a.IsOverlay,
 		&a.DeletedAt, &a.PurgeAfter, &a.Vault,
+		&a.Place.City, &a.Place.Admin1, &a.Place.Country, &a.Place.Source, &a.GeocodedAt,
 		&a.SortTime, &a.DerivedState, &a.PlaybackState)
 	return a, err
 }

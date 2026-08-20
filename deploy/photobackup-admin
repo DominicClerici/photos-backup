@@ -14,7 +14,7 @@
 #
 #   sudo install -m 0755 deploy/photobackup-admin /usr/local/bin/
 #
-# Usage: photobackup-admin <pair|devices|ca|verify|export|reindex|import|reset> [args...]
+# Usage: photobackup-admin <pair|devices|ca|verify|export|reindex|geocode|import|reset|migrate> [args...]
 #        photobackup-admin redeploy [--src DIR] [--dry-run]
 #
 # `redeploy` is the one subcommand that is not a photobackup subcommand. It
@@ -34,6 +34,17 @@ die() {
 	exit 1
 }
 
+# Every photobackup invocation goes through here: systemd-run reads the env
+# file as root before dropping to photod, so the database password never
+# reaches a command line or `ps`.
+as_photod() {
+	sudo systemd-run --pty --quiet --collect \
+		--uid=photod --gid=photod \
+		--property="EnvironmentFile=$ENV_FILE" \
+		--property=WorkingDirectory=/ \
+		"$BIN_DIR/photobackup" "$@"
+}
+
 # ---------------------------------------------------------------- redeploy ---
 
 DRY=
@@ -44,8 +55,9 @@ redeploy_usage() {
 usage: photobackup-admin redeploy [--src DIR] [--dry-run]
 
 Rebuild photod and photobackup from the source tree, sync the systemd units,
-and restart photod. Everything is built before anything is stopped, so a tree
-that does not compile leaves the running service exactly where it was.
+apply any pending database migrations, and restart photod. Everything is built
+before anything is stopped, so a tree that does not compile leaves the running
+service exactly where it was.
 
   --src DIR   repository to build from. Defaults to $PHOTOBACKUP_SRC, then to
               the repository containing the current directory.
@@ -212,6 +224,22 @@ redeploy() {
 		run sudo systemctl daemon-reload
 	fi
 
+	# With photod down and the new binary in place: the migrations that ship
+	# with this build are applied by the build that needs them, and a schema
+	# change that fails is a failed deploy here rather than a daemon that will
+	# not start. photod migrates on its own start too, so this is belt and
+	# braces — but the braces are the ones that report.
+	step "applying migrations"
+	if [ -n "$DRY" ]; then
+		printf '  would: photobackup migrate\n'
+	elif ! as_photod migrate; then
+		echo >&2
+		echo "photobackup-admin: migrations failed — photod left stopped" >&2
+		echo "  the new binaries are installed; fix the schema and run:" >&2
+		echo "    photobackup-admin migrate && sudo systemctl start photod" >&2
+		return 1
+	fi
+
 	step "starting photod"
 	run sudo systemctl start photod
 
@@ -254,8 +282,4 @@ if [ ! -r "$ENV_FILE" ] && [ "$(id -u)" -ne 0 ]; then
 	}
 fi
 
-exec sudo systemd-run --pty --quiet --collect \
-	--uid=photod --gid=photod \
-	--property="EnvironmentFile=$ENV_FILE" \
-	--property=WorkingDirectory=/ \
-	/usr/local/bin/photobackup "$@"
+as_photod "$@"

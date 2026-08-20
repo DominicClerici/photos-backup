@@ -1,6 +1,12 @@
 services:
   postgres:
-    image: postgres:18-alpine
+    # pgvector rather than the stock image, because `vector` is not among the
+    # extensions postgres:18-alpine ships and the search schema (migration 0016)
+    # opens with `create extension vector`. Same PostgreSQL 18, same data
+    # directory layout — the only difference that reaches the archive is libc,
+    # and switching from the alpine image means every text index was built under
+    # musl's collation and has to be rebuilt under glibc's. See deploy/README.md.
+    image: pgvector/pgvector:pg18
     environment:
       POSTGRES_USER: photobackup
       POSTGRES_PASSWORD: photobackup

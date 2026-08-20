@@ -12,12 +12,14 @@ package derivstore
 import (
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
-// Suffixes appended to the digest. All three are part of the on-disk contract,
-// so changing one orphans every derivative already generated.
+// Suffixes appended to the digest. Every one of them is part of the on-disk
+// contract, so changing one orphans every derivative already generated.
 const (
 	Thumb    = ".thumb.webp"
 	Playback = ".mp4"
@@ -32,7 +34,54 @@ const (
 	// rendition a paired video keeps: the viewer's larger one is rendered per
 	// request, the way a photo's 2048px preview is.
 	LiveThumb = ".live.mp4"
+	// JoinPreview is a joined recording the merge worker built and then refused
+	// to archive, kept so that somebody can watch it and say whether it is
+	// right after all. See video.DurationMismatch.
+	//
+	// The one file in this tree that is not a rendition of an original, and the
+	// one keyed by something other than an asset's digest: its name is the
+	// merge group's fingerprint, because the thing it is a picture of is a
+	// group rather than an asset. That makes it invisible to RemoveAll, which
+	// works per asset — the group is what owns it, and db.SegmentPreviews plus
+	// the sweep in photod are what stop it outliving one.
+	JoinPreview = ".join.mp4"
+	// MLStill is what a vision model reads: the whole photograph, uncropped, at
+	// MLEdge on its longest side.
+	//
+	// Uncropped is the entire point, and it is why this is a fourth rendition
+	// rather than a reuse of .thumb512.webp. That file is a square centre crop,
+	// which is exactly right for a grid of fixed square cells and exactly wrong
+	// here — the dog is often at the edge, and a centre crop is a machine
+	// deciding in advance what the photograph was about.
+	//
+	// It is also what keeps the model out of the archive. photo-ml receives
+	// these bytes over loopback and never opens /mnt/photos, so the vault is
+	// excluded by construction rather than by a WHERE clause somebody can
+	// forget to write. See ML_IMAGES.md §3.
+	MLStill = ".ml.webp"
 )
+
+// MLEdge bounds the ML rendition's longest side.
+//
+// 512 because that is comfortably above what the encoders in question actually
+// see — a SigLIP-class model resizes its input to 384 or 448 — and because the
+// renditions are the thing a model swap re-reads. Storing them larger than any
+// candidate needs buys nothing; storing them smaller would mean the next model
+// cannot be tried without decoding 73GB of HEIC again.
+const MLEdge = 512
+
+// MLFrameCount is how many frames are taken from a video.
+//
+// One rendition per still and several per clip, because a video is not one
+// picture. A clip that starts on a beach and ends in a restaurant is findable
+// as both only if both were looked at; averaging a whole clip into one
+// description would make it neither.
+const MLFrameCount = 6
+
+// MLFrameSuffix names one sampled frame, numbered from zero.
+func MLFrameSuffix(frame int) string {
+	return fmt.Sprintf(".ml.%d.webp", frame)
+}
 
 // ThumbSizes are the square edge lengths every still is rendered at, smallest
 // first, and the sizes a Live Photo's motion is rendered at beside it. The
@@ -128,6 +177,26 @@ func (s *Store) Stage(name string) (path string, cleanup func(), err error) {
 	return path, func() { os.Remove(path) }, nil
 }
 
+// StageDir creates an empty directory in the staging area and returns it with a
+// cleanup that removes it and everything under it.
+//
+// It exists for the one output that is a set of files rather than a file:
+// ffmpeg writes a sampled sequence through an image2 pattern — frame-1.webp,
+// frame-2.webp — and a pattern needs a directory to expand into. The
+// alternative is one ffmpeg per frame, which is one decode of the clip per
+// frame.
+func (s *Store) StageDir(name string) (dir string, cleanup func(), err error) {
+	parent := filepath.Join(s.root, "tmp")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return "", func() {}, fmt.Errorf("create staging dir: %w", err)
+	}
+	dir, err = os.MkdirTemp(parent, name)
+	if err != nil {
+		return "", func() {}, fmt.Errorf("create staging directory: %w", err)
+	}
+	return dir, func() { os.RemoveAll(dir) }, nil
+}
+
 // Commit moves a staged file into its final location, replacing whatever was
 // there. Replacing rather than refusing is what makes a re-run of a job safe:
 // the output is a deterministic function of the blob, so rewriting it is a
@@ -182,14 +251,28 @@ func (s *Store) Remove(sha256hex, suffix string) error {
 // Suffixes is every rendition this store can hold for one original: the stills
 // at each size, the motion at each size, and the two video renditions.
 //
+// JoinPreview is deliberately not among them. It belongs to a merge group
+// rather than to an asset, so every caller here — purging one photograph,
+// sealing one into the vault, restoring one out of it — would be reaching for
+// a file that is not theirs.
+//
 // Written as a function rather than a var because it is derived from
 // ThumbSizes, and a list that had to be kept in step with that one by hand is a
 // list that would be wrong the first time a size was added — which is exactly
 // the moment a purge would start leaving files behind.
 func Suffixes() []string {
-	out := make([]string, 0, len(ThumbSizes)*2+2)
+	out := make([]string, 0, len(ThumbSizes)*2+MLFrameCount+3)
 	for _, size := range ThumbSizes {
 		out = append(out, ThumbSuffix(size), LiveSuffix(size))
+	}
+	// The ML renditions belong here for both of the reasons this list exists.
+	// Purging a photograph has to take them — they are a description of it, at
+	// 512px, and leaving them behind would be leaving the picture behind. And
+	// hiding one has to seal them: a rendition of a photograph in the vault
+	// cannot stay readable on the SSD.
+	out = append(out, MLStill)
+	for frame := range MLFrameCount {
+		out = append(out, MLFrameSuffix(frame))
 	}
 	return append(out, Playback, PlaybackPlain)
 }
@@ -198,7 +281,7 @@ func Suffixes() []string {
 // there were and the bytes they took.
 //
 // Missing files are the ordinary case rather than a failure: most assets have
-// three of these and no asset has all eight.
+// four of these and no asset has all fifteen.
 func (s *Store) RemoveAll(sha256hex string) (files int, bytes int64, err error) {
 	for _, suffix := range Suffixes() {
 		path := s.Path(sha256hex, suffix)
@@ -216,4 +299,97 @@ func (s *Store) RemoveAll(sha256hex string) (files int, bytes int64, err error) 
 		bytes += info.Size()
 	}
 	return files, bytes, err
+}
+
+// Usage adds up every rendition on disk, grouped by whatever classify makes of
+// the digest it came from. A digest classify has no opinion about — one whose
+// asset has since been purged, or one in the vault — is returned under the
+// empty string, so nothing on the disk goes uncounted.
+//
+// The walk is the only way to ask this. Derivatives are files rather than rows:
+// nothing records their sizes, they are rebuilt whenever a job re-runs, and a
+// count kept in the database would be wrong the first time somebody deleted the
+// tree to reclaim the SSD — which is a supported thing to do, because every
+// byte here can be regenerated from a blob.
+//
+// The vault's encrypted renditions sit under `vault/` and the staging files
+// under `tmp/`; both are skipped. The first is not attributable to anything
+// without the vault key, and the second is not a derivative yet.
+func (s *Store) Usage(classify func(sha256hex string) string) (map[string]int64, error) {
+	usage := make(map[string]int64)
+
+	err := filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// A tree that is not there yet is an archive with no thumbnails,
+			// not a failure to report one.
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			if path != s.root && (d.Name() == "vault" || d.Name() == "tmp") {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+
+		// Every name in this tree is a 64-character digest plus a suffix, by
+		// construction — see Path. Anything else was put here by hand.
+		name := d.Name()
+		var sha string
+		if len(name) > 64 {
+			sha = name[:64]
+		}
+		usage[classify(sha)] += info.Size()
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("measure derivatives: %w", err)
+	}
+	return usage, nil
+}
+
+// Keys lists the digests this store holds a file of one suffix for.
+//
+// It exists for the one derivative nothing else can account for. Every other
+// file here is named after an asset, so "is this still wanted" is answered by
+// looking the asset up; a join preview is named after a merge group, and a
+// group can stop wanting one in ways that never touch this package — its parts
+// purged out from under it, its question answered on another machine. The
+// sweep that reconciles the two needs the list.
+func (s *Store) Keys(suffix string) ([]string, error) {
+	var keys []string
+
+	err := filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			if path != s.root && (d.Name() == "vault" || d.Name() == "tmp") {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		name := d.Name()
+		if len(name) == 64+len(suffix) && strings.HasSuffix(name, suffix) {
+			keys = append(keys, name[:64])
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list %s derivatives: %w", suffix, err)
+	}
+	return keys, nil
 }

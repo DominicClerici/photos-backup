@@ -4,20 +4,41 @@ import { useMemo, useState } from "react";
 import Link from "next/link";
 import {
   ArrowLeft,
+  BadgeCheck,
   Check,
   Heart,
   Loader2,
   Play,
   RefreshCw,
+  RotateCcw,
+  TriangleAlert,
   Undo2,
   X,
 } from "lucide-react";
 
-import { thumbUrl, type MergeGroup, type MergeKind, type MergeMember } from "@/lib/api";
-import { formatBytes, formatDuration } from "@/lib/format";
+import {
+  joinPreviewUrl,
+  originalUrl,
+  playbackUrl,
+  thumbUrl,
+  type MergeGroup,
+  type MergeKind,
+  type MergeMember,
+} from "@/lib/api";
+import { formatBytes, formatDuration, formatSince } from "@/lib/format";
 import { useMerges } from "@/hooks/useMerges";
 import { cn } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 
 /**
@@ -39,17 +60,18 @@ const VISIBLE = 12;
 
 export function MergeReview() {
   const [tab, setTab] = useState<MergeKind>("duplicate");
-  // Pending duplicates are the review; joined recordings are already done, so
-  // the only list worth showing of those is what was merged.
-  const state = tab === "duplicate" ? "pending" : "merged";
-  const { groups, error, scanning, merge, dismiss, unmerge, rescan, retry } = useMerges(tab, state);
+  // Off by default, and the whole point of approving: the joined recordings tab
+  // is what is left to look at rather than everything that ever happened.
+  const [showApproved, setShowApproved] = useState(false);
+  const { groups, error, scanning, merge, dismiss, unmerge, approve, force, rescan, retry } =
+    useMerges(tab, showApproved);
 
   return (
     <div className="flex h-dvh flex-col">
       <header className="flex h-13 flex-none items-center gap-3 border-b bg-card px-2 sm:px-4">
         <Link
-          href="/overview"
-          aria-label="Back to overview"
+          href="/status"
+          aria-label="Back to status"
           className="flex size-9 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
         >
           <ArrowLeft className="size-[18px]" aria-hidden="true" />
@@ -77,6 +99,19 @@ export function MergeReview() {
               </ToggleGroupItem>
             ))}
           </ToggleGroup>
+
+          {/* Beside the switch rather than inside it, because it is not a third
+              thing to look at: it is how much of the second one to show. Only
+              on that tab, since nothing else here can be approved. */}
+          {tab === "video-segments" ? (
+            <Label className="gap-2 text-[13px] font-normal text-muted-foreground">
+              <Checkbox
+                checked={showApproved}
+                onCheckedChange={(next) => setShowApproved(next === true)}
+              />
+              <span className="max-sm:sr-only">Show approved</span>
+            </Label>
+          ) : null}
 
           <Button variant="outline" size="sm" onClick={rescan} disabled={scanning}>
             {scanning ? (
@@ -111,7 +146,9 @@ export function MergeReview() {
             <Notice>
               {tab === "duplicate"
                 ? "No duplicates waiting. Scan again after an import, or once the library has finished being analysed."
-                : "Nothing has been joined yet. Recordings that Snapchat exported in ten-second pieces are put back together automatically."}
+                : showApproved
+                  ? "Nothing has been joined yet. Recordings that Snapchat exported in ten-second pieces are put back together automatically."
+                  : "Nothing left to look at. Recordings you have approved are hidden — tick “Show approved” to see them again."}
             </Notice>
           ) : null}
 
@@ -124,8 +161,22 @@ export function MergeReview() {
                   onMerge={(keeper) => merge(group.id, keeper)}
                   onDismiss={() => dismiss(group.id)}
                 />
+              ) : group.state === "merged" ? (
+                <JoinedCard
+                  key={group.id}
+                  group={group}
+                  onUndo={() => unmerge(group.id)}
+                  onApprove={(approved) => approve(group.id, approved)}
+                />
               ) : (
-                <JoinedCard key={group.id} group={group} onUndo={() => unmerge(group.id)} />
+                /* Still pending, and on this list at all only because its join
+                   gave up — see useMerges, which asks for those separately. */
+                <FailedCard
+                  key={group.id}
+                  group={group}
+                  onForce={() => force(group.id)}
+                  onDismiss={() => dismiss(group.id)}
+                />
               ),
             )}
           </div>
@@ -325,12 +376,23 @@ function Candidate({
  * candidates. The only control is the undo, which is the whole reason this tab
  * exists: everything else in this feature asks first.
  */
-function JoinedCard({ group, onUndo }: { group: MergeGroup; onUndo: () => void }) {
+function JoinedCard({
+  group,
+  onUndo,
+  onApprove,
+}: {
+  group: MergeGroup;
+  onUndo: () => void;
+  onApprove: (approved: boolean) => void;
+}) {
   const [busy, setBusy] = useState(false);
   const seconds = group.members.reduce((sum, m) => sum + (m.duration ?? 0), 0);
+  const approved = Boolean(group.approved_at);
 
   return (
-    <section className="overflow-hidden rounded-xl border bg-card">
+    <section
+      className={cn("overflow-hidden rounded-xl border bg-card", approved && "opacity-70")}
+    >
       <header className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-3">
         <h2 className="text-sm font-medium">
           {group.members.length} clips joined
@@ -341,8 +403,50 @@ function JoinedCard({ group, onUndo }: { group: MergeGroup; onUndo: () => void }
         <span className="text-[13px] text-faint">
           {new Date(group.detected_at).toLocaleDateString()}
         </span>
+        {/* Two badges that mean opposite things, and both are worth a word. The
+            first says somebody signed this off; the second says this archive
+            built a file it had doubts about, which outlives any approval. */}
+        {approved ? (
+          <Badge variant="outline" className="border-primary/40 text-primary">
+            <BadgeCheck className="size-3" aria-hidden="true" />
+            Approved
+          </Badge>
+        ) : null}
+        {group.forced ? (
+          <Badge variant="outline" className="border-warning/40 text-warning">
+            Saved anyway
+          </Badge>
+        ) : null}
 
         <div className="ml-auto flex shrink-0 items-center gap-2">
+          {group.keeper_asset_id ? (
+            <Watch
+              label="Preview merged"
+              title={`${group.members.length} clips, joined`}
+              description="The recording as it is now in the library, played from the joined file itself."
+              src={playbackUrl(group.keeper_asset_id)}
+              // The joined original is an H.264 MP4 this server wrote, so it
+              // plays in a browser as it stands. That makes it the right
+              // fallback for the minutes before the playback rendition of it
+              // has been built.
+              fallback={originalUrl(group.keeper_asset_id)}
+            />
+          ) : null}
+
+          <Button
+            variant={approved ? "ghost" : "outline"}
+            size="sm"
+            disabled={busy}
+            onClick={() => onApprove(!approved)}
+          >
+            {approved ? (
+              <RotateCcw className="size-3.5" aria-hidden="true" />
+            ) : (
+              <Check className="size-3.5" aria-hidden="true" />
+            )}
+            {approved ? "Unapprove" : "Approve"}
+          </Button>
+
           <Button
             variant="ghost"
             size="sm"
@@ -395,6 +499,196 @@ function JoinedCard({ group, onUndo }: { group: MergeGroup; onUndo: () => void }
         </ol>
       </div>
     </section>
+  );
+}
+
+/**
+ * A recording the worker tried to put back together and would not archive.
+ *
+ * The pieces are still in the library and nothing has been trashed: this is a
+ * question rather than a log entry, which is why it looks less like the card
+ * above it than its position on the page suggests. The question is always the
+ * same one, and it is not one the server can answer — the join came out a
+ * different length from the sum of its parts, which is what a dropped part
+ * looks like and also what a container that overstates its own length looks
+ * like. Watching it is the only way to tell, so the preview is not a
+ * convenience here; it is the evidence, and the two buttons beside it are the
+ * two answers.
+ */
+function FailedCard({
+  group,
+  onForce,
+  onDismiss,
+}: {
+  group: MergeGroup;
+  onForce: () => void;
+  onDismiss: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const seconds = group.members.reduce((sum, m) => sum + (m.duration ?? 0), 0);
+
+  return (
+    <section className="overflow-hidden rounded-xl border bg-card ring-1 ring-destructive/25">
+      <header className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-3">
+        <Badge variant="outline" className="border-destructive/40 text-destructive">
+          <TriangleAlert className="size-3" aria-hidden="true" />
+          Failed
+        </Badge>
+        <h2 className="text-sm font-medium">{group.members.length} clips not joined</h2>
+        {seconds > 0 ? (
+          <span className="text-[13px] text-faint">{formatDuration(seconds)} of video</span>
+        ) : null}
+        {group.failure ? (
+          <span className="text-[13px] text-faint">
+            <time dateTime={group.failure.failed_at} title={group.failure.failed_at}>
+              {formatSince(group.failure.failed_at)}
+            </time>
+            {" · "}
+            {group.failure.attempts}{" "}
+            {group.failure.attempts === 1 ? "attempt" : "attempts"}
+          </span>
+        ) : null}
+
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          {group.preview ? (
+            <Watch
+              label="Preview merged"
+              title={`${group.members.length} clips, as they would be joined`}
+              description="The file the join produced and refused to archive. Nothing is in the library yet — watch it through, and if none of the clips is missing, save it anyway."
+              src={joinPreviewUrl(group.id)}
+            />
+          ) : null}
+
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true);
+              onDismiss();
+            }}
+          >
+            <X className="size-3.5" aria-hidden="true" />
+            Don&apos;t join
+          </Button>
+
+          <Button
+            size="sm"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true);
+              onForce();
+            }}
+          >
+            <Check className="size-3.5" aria-hidden="true" />
+            Save anyway
+          </Button>
+        </div>
+      </header>
+
+      <div className="flex flex-col gap-3 p-4">
+        {/* Verbatim, in the same shape the status page shows it. It is the one
+            thing on this card that says which of the two failures this is. */}
+        <pre className="min-w-0 overflow-auto rounded-md bg-tile/60 px-2.5 py-1.5 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap text-muted-foreground">
+          {group.failure?.error || "The job recorded no error text."}
+        </pre>
+
+        <ol className="flex min-w-0 gap-1.5 overflow-x-auto">
+          {group.members.map((member) => (
+            <li key={member.id} className="shrink-0">
+              <div className="relative size-14 overflow-hidden rounded bg-tile">
+                <img
+                  src={thumbUrl(member.id, 96)}
+                  alt=""
+                  loading="lazy"
+                  decoding="async"
+                  draggable={false}
+                  className="block size-full object-cover"
+                />
+              </div>
+            </li>
+          ))}
+        </ol>
+      </div>
+    </section>
+  );
+}
+
+/**
+ * A button that plays one video, and the dialog it opens.
+ *
+ * The <video> is mounted only while the dialog is open. A page of forty joined
+ * recordings would otherwise hand the browser forty video elements to
+ * preload — and on the failed rows, forty requests for files the server has to
+ * read off the archive drive.
+ */
+function Watch({
+  label,
+  title,
+  description,
+  src,
+  fallback,
+}: {
+  label: string;
+  title: string;
+  description: string;
+  src: string;
+  fallback?: string;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <>
+      <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
+        <Play className="size-3.5 fill-current" aria-hidden="true" />
+        <span className="max-sm:sr-only">{label}</span>
+      </Button>
+
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>{title}</DialogTitle>
+            <DialogDescription>{description}</DialogDescription>
+          </DialogHeader>
+          {open ? <Player src={src} fallback={fallback} /> : null}
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+function Player({ src, fallback }: { src: string; fallback?: string }) {
+  const [current, setCurrent] = useState(src);
+  const [broken, setBroken] = useState(false);
+
+  if (broken) {
+    return (
+      <p className="rounded-lg bg-tile/60 px-3 py-8 text-center text-[13px] text-muted-foreground">
+        This video could not be played. The file may still be being built, or it may not be
+        there at all.
+      </p>
+    );
+  }
+
+  return (
+    // eslint-disable-next-line jsx-a11y/media-has-caption -- a Snapchat memory
+    // from 2018 has no captions to offer, and inventing an empty track would
+    // say it does.
+    <video
+      key={current}
+      src={current}
+      controls
+      autoPlay
+      playsInline
+      className="max-h-[70dvh] w-full rounded-lg bg-black"
+      onError={() => {
+        if (fallback && current !== fallback) {
+          setCurrent(fallback);
+          return;
+        }
+        setBroken(true);
+      }}
+    />
   );
 }
 

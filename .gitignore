@@ -5,6 +5,11 @@ photos/
 # Where the Phase 4 load runs put their archive.
 server/loaddata/
 
+# The offline geocoder's reference tables. ~40MB of GeoNames text that is
+# downloaded rather than committed, and re-downloadable at any time; server
+# README says which three files and where from.
+geonames/
+
 node_modules/
 .DS_Store
 

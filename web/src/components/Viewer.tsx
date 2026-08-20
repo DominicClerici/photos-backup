@@ -587,6 +587,12 @@ function MetadataPanel({ detail }: { detail: AssetDetail | null }) {
 
   const capture = formatCaptureTime(detail.taken_at, detail.offset_minutes);
   const camera = [detail.camera_make, detail.camera_model].filter(Boolean).join(" ");
+  // City, state, country, dropping whatever the geocoder had no answer for —
+  // an island nation has no first-order division, and a photograph over open
+  // water has none of the three.
+  const place = [detail.place_city, detail.place_admin1, detail.place_country]
+    .filter(Boolean)
+    .join(", ");
   const reported = detail.reported_at ? new Date(detail.reported_at) : null;
   const taken = new Date(detail.taken_at);
   // Worth showing only when the two disagree: if the phone and the file tell the
@@ -634,8 +640,17 @@ function MetadataPanel({ detail }: { detail: AssetDetail | null }) {
               target="_blank"
               rel="noreferrer"
             >
-              {formatCoords(detail.gps_lat, detail.gps_lon)}
+              {place || formatCoords(detail.gps_lat, detail.gps_lon)}
             </a>
+            {/* The coordinates stay, underneath, when there is a name for them.
+                The name is what the photograph is of; the numbers are what the
+                camera recorded, and dropping them would hide a bad fix behind a
+                plausible-looking city. */}
+            {place ? (
+              <span className={PANEL_HINT}>
+                {formatCoords(detail.gps_lat, detail.gps_lon)}
+              </span>
+            ) : null}
           </Row>
         ) : null}
 

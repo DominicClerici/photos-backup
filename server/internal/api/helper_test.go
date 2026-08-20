@@ -118,7 +118,10 @@ func newHarness(t *testing.T) *harness {
 			Log:              slog.New(slog.DiscardHandler),
 		},
 		Nudge: func() { h.nudges.Add(1) },
-		Log:   slog.New(slog.DiscardHandler),
+		// The harness is a whole server: it has workers, so the status page's
+		// degraded-server warnings are off unless a test turns one on.
+		WorkerEnabled: true,
+		Log:           slog.New(slog.DiscardHandler),
 	}
 
 	ts := httptest.NewServer(h.srv.Handler())

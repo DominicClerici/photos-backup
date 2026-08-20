@@ -34,7 +34,7 @@ import { cn } from "@/lib/utils";
  * thing people aim at without looking. See TabBar.
  *
  * It draws nothing at all unless a grid is on screen to select from, which is
- * what keeps it off the collections and overview pages.
+ * what keeps it off the collections and status pages.
  */
 export function SelectionPill() {
   const { active, count, ranges, grid, actions, sheet, setSheet, enter, exit } = useSelection();

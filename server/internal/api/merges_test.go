@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"testing"
 
 	"github.com/dominicclerici/photos-backup/server/internal/db"
+	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
+	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/merge"
 )
 
@@ -41,7 +44,7 @@ func seedGroup(t *testing.T, h *harness, kind string, n int) (string, []string) 
 		t.Fatalf("RecordGroups: %v", err)
 	}
 
-	groups, err := h.store.Groups(context.Background(), kind, db.MergePending, 10)
+	groups, err := h.store.Groups(context.Background(), db.MergeQuery{Kind: kind, State: db.MergePending, Limit: 10})
 	if err != nil {
 		t.Fatalf("Groups: %v", err)
 	}
@@ -471,5 +474,215 @@ func TestMergeRoutesAreServedOnThePlaintextListener(t *testing.T) {
 	}
 	if got := decodeGroups(t, resp); len(got) != 1 {
 		t.Errorf("%d groups, want 1", len(got))
+	}
+}
+
+// failJoin puts the group's queued join into the state a worker that gave up
+// leaves it in, and writes a rejected join to disk under the group.
+func failJoin(t *testing.T, h *harness, group, head, message string, preview []byte) {
+	t.Helper()
+	ctx := context.Background()
+
+	if err := jobs.Enqueue(ctx, h.store.Pool(), jobs.KindMerge, head); err != nil {
+		t.Fatalf("enqueue the join: %v", err)
+	}
+	if _, err := h.store.Pool().Exec(ctx, `
+		update jobs set state = 'failed', attempts = 5, last_error = $3, updated_at = now()
+		where kind = $1 and asset_id = $2::uuid`, jobs.KindMerge, head, message); err != nil {
+		t.Fatalf("fail the join: %v", err)
+	}
+	if preview == nil {
+		return
+	}
+
+	g, err := h.store.Group(ctx, group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := derivstore.New(h.derivRoot)
+	if err := store.Write(g.Fingerprint, derivstore.JoinPreview, func(w io.Writer) error {
+		_, err := w.Write(preview)
+		return err
+	}); err != nil {
+		t.Fatalf("write the rejected join: %v", err)
+	}
+}
+
+// The failed half of the joined-recordings tab: groups that are still pending,
+// carrying the error that stopped them and the offer of the file to watch.
+func TestMergeGroupsListsTheJoinsThatFailed(t *testing.T) {
+	h := newHarness(t)
+	group, ids := seedGroup(t, h, merge.KindSegments, 3)
+	const why = "join: 3 parts totalling 28.643s came out as 28.797s; refusing to archive that"
+	failJoin(t, h, group, ids[0], why, []byte("not really an mp4"))
+
+	resp := h.get(t, "/v1/merges/groups?kind=video-segments&state=failed")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var out struct {
+		Groups []struct {
+			db.MergeGroup
+			Preview bool `json:"preview"`
+		} `json:"groups"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode groups: %v", err)
+	}
+	if len(out.Groups) != 1 {
+		t.Fatalf("%d failed groups, want 1", len(out.Groups))
+	}
+	got := out.Groups[0]
+	if got.Failure == nil || got.Failure.Error != why {
+		t.Errorf("failure = %+v, want the error verbatim", got.Failure)
+	}
+	if !got.Preview {
+		t.Error("preview = false, so the page would not offer the file that is right there")
+	}
+}
+
+// The one video this server serves that belongs to no asset.
+func TestJoinPreviewServesTheRefusedFile(t *testing.T) {
+	h := newHarness(t)
+	group, ids := seedGroup(t, h, merge.KindSegments, 3)
+	body := []byte("the minute of video nobody archived")
+	failJoin(t, h, group, ids[0], "did not add up", body)
+
+	resp := h.get(t, "/v1/merges/"+group+"/preview")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "video/mp4" {
+		t.Errorf("Content-Type = %q, want video/mp4", ct)
+	}
+	served, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(served) != string(body) {
+		t.Errorf("served %q, want the refused join", served)
+	}
+
+	// A group with nothing kept for it is a 404 rather than an empty video.
+	other, otherIDs := seedGroup(t, h, merge.KindSegments, 2)
+	failJoin(t, h, other, otherIDs[0], "part missing from the blob store", nil)
+	if resp := h.get(t, "/v1/merges/"+other+"/preview"); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d for a group with no kept join, want 404", resp.StatusCode)
+	}
+}
+
+// Approving takes an entry off the list and out of the count, and the same
+// click puts it back.
+func TestApproveAndUnapproveAJoinedRecording(t *testing.T) {
+	h := newHarness(t)
+	group, _ := seedGroup(t, h, merge.KindSegments, 3)
+
+	// Resolved the way the worker resolves one: the keeper is a file that did
+	// not exist when the group was found, and is not a member of it.
+	resp := h.upload(t, []byte("the joined recording"), map[string]string{
+		"X-Photo-Filename": "2018-10-07_piece0-joined.mp4",
+		"X-Photo-Local-Id": "local-joined",
+	})
+	var made struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&made); err != nil {
+		t.Fatalf("decode the joined upload: %v", err)
+	}
+	if _, err := h.store.MergeSegments(context.Background(), group, made.ID); err != nil {
+		t.Fatalf("MergeSegments: %v", err)
+	}
+
+	if groups := decodeGroups(t, h.get(t, "/v1/merges/groups?kind=video-segments&state=merged")); len(groups) != 1 {
+		t.Fatalf("%d merged groups before approving, want 1", len(groups))
+	}
+
+	if resp := h.postJSON(t, "/v1/merges/"+group+"/approve", "{}"); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("approve: status = %d, want 204", resp.StatusCode)
+	}
+	if groups := decodeGroups(t, h.get(t, "/v1/merges/groups?kind=video-segments&state=merged")); len(groups) != 0 {
+		t.Errorf("%d merged groups after approving, want none on the default list", len(groups))
+	}
+	groups := decodeGroups(t, h.get(t, "/v1/merges/groups?kind=video-segments&state=merged&approved=true"))
+	if len(groups) != 1 || groups[0].ApprovedAt == nil {
+		t.Fatalf("show-approved returned %d groups, want the approved one with its date", len(groups))
+	}
+
+	if resp := h.postJSON(t, "/v1/merges/"+group+"/unapprove", "{}"); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("unapprove: status = %d, want 204", resp.StatusCode)
+	}
+	if groups := decodeGroups(t, h.get(t, "/v1/merges/groups?kind=video-segments&state=merged")); len(groups) != 1 {
+		t.Errorf("%d merged groups after unapproving, want it back", len(groups))
+	}
+
+	// A group that was never merged has nothing to have been read.
+	pending, _ := seedGroup(t, h, merge.KindSegments, 2)
+	if resp := h.postJSON(t, "/v1/merges/"+pending+"/approve", "{}"); resp.StatusCode != http.StatusConflict {
+		t.Errorf("approving a pending group: status = %d, want 409", resp.StatusCode)
+	}
+}
+
+// Overruling the duration check queues the join again with the objection
+// disabled, and says so on the group.
+func TestForceJoinQueuesTheWorkAgain(t *testing.T) {
+	h := newHarness(t)
+	group, ids := seedGroup(t, h, merge.KindSegments, 3)
+	failJoin(t, h, group, ids[0], "did not add up", []byte("kept"))
+
+	resp := h.postJSON(t, "/v1/merges/"+group+"/force", "{}")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	g, err := h.store.Group(context.Background(), group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !g.Forced {
+		t.Error("the override was not recorded, so the next attempt would refuse again")
+	}
+
+	var state string
+	if err := h.store.Pool().QueryRow(context.Background(),
+		`select state from jobs where kind = $1 and asset_id = $2::uuid`,
+		jobs.KindMerge, ids[0]).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(jobs.StatePending) {
+		t.Errorf("job is %s, want pending", state)
+	}
+
+	// A pile of duplicates is not something to join.
+	dupes, _ := seedGroup(t, h, merge.KindDuplicate, 2)
+	if resp := h.postJSON(t, "/v1/merges/"+dupes+"/force", "{}"); resp.StatusCode != http.StatusConflict {
+		t.Errorf("forcing a duplicate group: status = %d, want 409", resp.StatusCode)
+	}
+}
+
+// Refusing a join takes it off the queue with it, so the status page stops
+// reporting a job that gave up on work nobody wants done.
+func TestDismissingAFailedJoinClearsItsJobAndItsFile(t *testing.T) {
+	h := newHarness(t)
+	group, ids := seedGroup(t, h, merge.KindSegments, 3)
+	failJoin(t, h, group, ids[0], "did not add up", []byte("kept"))
+
+	g, err := h.store.Group(context.Background(), group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp := h.postJSON(t, "/v1/merges/"+group+"/dismiss", "{}"); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("dismiss: status = %d, want 204", resp.StatusCode)
+	}
+
+	var left int
+	if err := h.store.Pool().QueryRow(context.Background(),
+		`select count(*)::int from jobs where kind = $1`, jobs.KindMerge).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 0 {
+		t.Errorf("%d merge jobs left after the group was refused, want none", left)
+	}
+	if derivstore.New(h.derivRoot).Exists(g.Fingerprint, derivstore.JoinPreview) {
+		t.Error("the refused join is still on disk after the group was refused")
 	}
 }

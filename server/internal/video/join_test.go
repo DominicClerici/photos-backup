@@ -2,6 +2,7 @@ package video
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -58,7 +59,7 @@ func TestJoinCopiesIdenticalParts(t *testing.T) {
 	}
 	dst := filepath.Join(dir, "joined.mp4")
 
-	res, err := New().Join(context.Background(), parts, dst)
+	res, err := New().Join(context.Background(), parts, dst, JoinOptions{})
 	if err != nil {
 		t.Fatalf("Join: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestJoinNormalizesPartsThatDisagree(t *testing.T) {
 	}
 	dst := filepath.Join(dir, "joined.mp4")
 
-	res, err := New().Join(context.Background(), parts, dst)
+	res, err := New().Join(context.Background(), parts, dst, JoinOptions{})
 	if err != nil {
 		t.Fatalf("Join: %v", err)
 	}
@@ -127,7 +128,7 @@ func TestJoinGivesASilentPartASoundTrack(t *testing.T) {
 	}
 	dst := filepath.Join(dir, "joined.mp4")
 
-	res, err := New().Join(context.Background(), parts, dst)
+	res, err := New().Join(context.Background(), parts, dst, JoinOptions{})
 	if err != nil {
 		t.Fatalf("Join: %v", err)
 	}
@@ -164,7 +165,7 @@ func TestJoinBurnsInACaptionLayer(t *testing.T) {
 	}
 	dst := filepath.Join(dir, "joined.mp4")
 
-	res, err := New().Join(context.Background(), parts, dst)
+	res, err := New().Join(context.Background(), parts, dst, JoinOptions{})
 	if err != nil {
 		t.Fatalf("Join: %v", err)
 	}
@@ -181,7 +182,7 @@ func TestJoinRefusesFewerThanTwoParts(t *testing.T) {
 	one := []Part{{Path: synth(t, dir, "a.mp4", 1, 320, 240)}}
 
 	for _, parts := range [][]Part{nil, one} {
-		if _, err := New().Join(context.Background(), parts, filepath.Join(dir, "out.mp4")); err == nil {
+		if _, err := New().Join(context.Background(), parts, filepath.Join(dir, "out.mp4"), JoinOptions{}); err == nil {
 			t.Errorf("Join accepted %d parts", len(parts))
 		}
 	}
@@ -193,7 +194,7 @@ func TestJoinReportsAMissingPart(t *testing.T) {
 		{Path: synth(t, dir, "a.mp4", 1, 320, 240)},
 		{Path: filepath.Join(dir, "gone.mp4")},
 	}
-	if _, err := New().Join(context.Background(), parts, filepath.Join(dir, "out.mp4")); err == nil {
+	if _, err := New().Join(context.Background(), parts, filepath.Join(dir, "out.mp4"), JoinOptions{}); err == nil {
 		t.Fatal("Join succeeded with a part that does not exist")
 	}
 }
@@ -208,7 +209,7 @@ func TestJoinCleansUpAfterItself(t *testing.T) {
 		{Path: synth(t, dir, "big.mp4", 1, 640, 480)},
 	}
 	dst := filepath.Join(dir, "joined.mp4")
-	if _, err := New().Join(context.Background(), parts, dst); err != nil {
+	if _, err := New().Join(context.Background(), parts, dst, JoinOptions{}); err != nil {
 		t.Fatalf("Join: %v", err)
 	}
 
@@ -285,5 +286,80 @@ func TestSampleFramesRefusesAClipWithNoDuration(t *testing.T) {
 	_, err := New().SampleFrames(context.Background(), src, 8, 32, Info{Width: 320, Height: 240})
 	if err == nil {
 		t.Fatal("SampleFrames accepted a clip whose duration is unknown")
+	}
+}
+
+// lopsided writes a clip whose sound outlasts its picture by two seconds.
+//
+// It exists to produce the one join failure that leaves a playable file behind.
+// profile reads the video stream's duration, so two of these are expected to
+// add up to two seconds; the concat demuxer offsets each part by the *format*
+// duration of the one before it, so the join comes out at four. Real Snapchat
+// exports miss by a tenth of a second rather than by a factor of two, but the
+// arithmetic that catches them is the arithmetic being tested here.
+func lopsided(t *testing.T, dir, name string) string {
+	t.Helper()
+	dst := filepath.Join(dir, name)
+	cmd := exec.Command("ffmpeg", "-nostdin", "-y", "-v", "error",
+		"-f", "lavfi", "-i", "testsrc=size=320x240:rate=15:duration=1",
+		"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=3",
+		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+		"-c:a", "aac", "-ac", "2", "-ar", "44100", dst)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("could not build a fixture clip (is ffmpeg installed?): %v: %s", err, out)
+	}
+	return dst
+}
+
+// A join whose running time does not add up is refused — and the file it
+// refused is left where it is, because it is the only evidence of what went
+// wrong that anybody can look at, and the merge worker files it under the group
+// for exactly that.
+func TestJoinRefusesADurationMismatchAndKeepsTheFile(t *testing.T) {
+	dir := t.TempDir()
+	parts := []Part{
+		{Path: lopsided(t, dir, "a.mp4")},
+		{Path: lopsided(t, dir, "b.mp4")},
+	}
+	dst := filepath.Join(dir, "joined.mp4")
+
+	_, err := New().Join(context.Background(), parts, dst, JoinOptions{})
+	var mismatch *DurationMismatch
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("Join error = %v, want a *DurationMismatch", err)
+	}
+	if mismatch.Parts != 2 || math.Abs(mismatch.Expected-2) > 0.2 {
+		t.Errorf("mismatch = %+v, want 2 parts expected to add up to ~2s", mismatch)
+	}
+	if math.Abs(mismatch.Actual-mismatch.Expected) <= joinDurationSlack {
+		t.Errorf("mismatch = %+v, but those are within the slack", mismatch)
+	}
+
+	info, err := os.Stat(dst)
+	if err != nil || info.Size() == 0 {
+		t.Fatalf("the refused join is not on disk to be watched: %v", err)
+	}
+}
+
+// The same join, overruled. Somebody has watched the file above and can see
+// that none of the parts is missing, which is a judgement the arithmetic cannot
+// make.
+func TestJoinArchivesAMismatchWhenToldTo(t *testing.T) {
+	dir := t.TempDir()
+	parts := []Part{
+		{Path: lopsided(t, dir, "a.mp4")},
+		{Path: lopsided(t, dir, "b.mp4")},
+	}
+
+	res, err := New().Join(context.Background(), parts,
+		filepath.Join(dir, "joined.mp4"), JoinOptions{AllowDurationMismatch: true})
+	if err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	if !res.Mismatch {
+		t.Error("Mismatch = false; the sidecar would not record that this file was doubted")
+	}
+	if math.Abs(res.Expected-2) > 0.2 {
+		t.Errorf("Expected = %v, want the ~2s the parts add up to", res.Expected)
 	}
 }

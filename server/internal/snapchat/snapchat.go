@@ -414,6 +414,13 @@ type Joined struct {
 	DurationSeconds float64   `json:"durationSeconds"`
 	JoinedAt        time.Time `json:"joinedAt"`
 
+	// ExpectedSeconds is what the parts added up to, written down only when it
+	// disagrees with the line above — which is to say only when somebody
+	// watched a join this archive had refused to make and said to make it
+	// anyway. The disagreement is the reason the file exists in the form it
+	// does, and it belongs beside the file rather than in a log nobody keeps.
+	ExpectedSeconds float64 `json:"expectedSeconds,omitempty"`
+
 	// Parts are the pieces, in the order they were joined. By digest as well as
 	// by name, because the digest is what finds the blob again — and because if
 	// somebody ever wants to take this apart, the parts are still exactly those

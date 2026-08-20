@@ -1,7 +1,7 @@
-import { describe, it } from "node:test";
+import { describe, it, test } from "node:test";
 import assert from "node:assert/strict";
 
-import { describeAction, nounFor } from "./format.ts";
+import { describeAction, formatSince, nounFor } from "./format.ts";
 
 // The labels are the feature's most visible surface: every menu item and every
 // button in the gallery is one of these strings, and getting the count or the
@@ -61,4 +61,18 @@ describe("describeAction", () => {
     // The selection sheet has no tile under a pointer to ask.
     assert.equal(describeAction("Archive", { kind: "items", count: 1 }), "Archive photo");
   });
+});
+
+test("how long ago picks the unit somebody would say out loud", () => {
+  const now = new Date("2026-08-20T12:00:00Z");
+  const since = (iso: string) => formatSince(iso, now);
+
+  assert.equal(since("2026-08-20T11:59:40Z"), "just now");
+  assert.equal(since("2026-08-20T11:56:00Z"), "4 minutes ago");
+  assert.equal(since("2026-08-20T09:00:00Z"), "3 hours ago");
+  assert.equal(since("2026-08-19T12:00:00Z"), "yesterday");
+  assert.equal(since("2026-07-20T12:00:00Z"), "last month");
+  // A job whose row says something no Date can be made of should not put
+  // "Invalid Date" on the page.
+  assert.equal(since("not a time"), "at an unknown time");
 });

@@ -18,9 +18,10 @@ exists there. Reach for a raw element only when a shadcn component genuinely can
 the job, or when asked to.
 
 Currently installed: accordion, alert-dialog, aspect-ratio, badge, button, calendar,
-card, carousel, checkbox, combobox, command, context-menu, dialog, drawer,
-dropdown-menu, field, input, input-group, kbd, label, pagination, popover, progress,
-scroll-area, select, separator, slider, switch, textarea, toast, toggle, toggle-group.
+card, carousel, chart, checkbox, combobox, command, context-menu, dialog, drawer,
+dropdown-menu, field, hover-card, input, input-group, kbd, label, pagination, popover,
+progress, scroll-area, select, separator, skeleton, slider, switch, textarea, toast,
+toggle, toggle-group, tooltip.
 
 Add more with `pnpm dlx shadcn@latest add <name>` — do not write them by hand. Files
 under `src/components/ui/` are generated; they are meant to be edited in place once
@@ -58,4 +59,6 @@ is bound to shadcn's token names, so stock components already match the app. A l
 `#16161a` or `bg-neutral-900` in a component is a bug.
 
 App-specific tokens beyond the shadcn set: `text-faint` (dimmest text), `bg-tile`
-(thumbnail backing), `bg-viewer` (full-screen viewer backdrop).
+(thumbnail backing), `bg-viewer` (full-screen viewer backdrop), and `--warning`
+(degraded, as distinct from `--destructive`'s broken — the status page needs three
+health states and shadcn ships two).

@@ -7,9 +7,11 @@
 //	photobackup verify [--deep] [--fix] [--retry-failed]
 //	photobackup export --to DIR [--from DATE] [--until DATE] [--copy]
 //	photobackup reindex [--adopt-orphans] [--dry-run]
+//	photobackup geocode [--all] [--dry-run]
 //	photobackup import --from DIR [--dry-run]
 //	photobackup import-snapchat --from DIR [--half memories|chat] [--dry-run]
 //	photobackup reset [--dry-run] [--yes] [--force]
+//	photobackup migrate [--check]
 //	photobackup pair [--ttl 10m]
 //	photobackup devices [--revoke ID]
 //	photobackup ca [--serve] [--export PATH]
@@ -39,17 +41,19 @@ const usage = `photobackup — maintenance for the photo archive
   verify [--deep] [--fix] [--retry-failed]  audit the archive against itself
   export --to DIR [--copy]             materialize a date tree of hardlinks
   reindex [--adopt-orphans]            rebuild the database from manifest.jsonl
+  geocode [--all] [--dry-run]          name the places photographs were taken
   import --from DIR [--dry-run]        ingest a Google Photos export
   import-snapchat --from DIR           ingest a Snapchat export, one half at a
     [--half memories|chat]             time; pass --from once per unzipped zip
   reset [--dry-run] [--yes]            erase the archive, keep paired devices
+  migrate [--check]                    apply pending schema migrations
 
   pair [--ttl 10m]                     mint a single-use code to pair a device
   devices [--revoke ID]                list paired devices, or unpair one
   ca [--serve] [--export PATH]         the CA to install on a device, and how
 
-Reads PHOTOS_ROOT, DERIVATIVES_ROOT, DATABASE_URL and TLS_DIR, the same as
-photod. Run a subcommand with --help for its own flags.
+Reads PHOTOS_ROOT, DERIVATIVES_ROOT, DATABASE_URL, GEONAMES_DIR and TLS_DIR,
+the same as photod. Run a subcommand with --help for its own flags.
 `
 
 // Exit codes, so a timer or a cron job can tell the three outcomes apart
@@ -83,12 +87,16 @@ func main() {
 		code, err = runExport(ctx, os.Args[2:])
 	case "reindex":
 		code, err = runReindex(ctx, os.Args[2:])
+	case "geocode":
+		code, err = runGeocode(ctx, os.Args[2:])
 	case "import":
 		code, err = runImport(ctx, os.Args[2:])
 	case "import-snapchat":
 		code, err = runImportSnapchat(ctx, os.Args[2:])
 	case "reset":
 		code, err = runReset(ctx, os.Args[2:])
+	case "migrate":
+		code, err = runMigrate(ctx, os.Args[2:])
 	case "pair":
 		code, err = runPair(ctx, os.Args[2:])
 	case "devices":

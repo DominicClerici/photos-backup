@@ -43,6 +43,47 @@ type JoinResult struct {
 	// fact about an archived original that somebody will want the reason for
 	// long after the parts have been purged.
 	Why string
+	// Expected is what the parts add up to, which is only interesting when it
+	// disagrees with the line above — see Mismatch.
+	Expected float64
+	// Mismatch is true when the running times did not agree and the join was
+	// archived anyway, on the caller's insistence. It goes into the sidecar for
+	// the same reason Why does: an original that this archive built and had
+	// doubts about should say so where somebody will find it years later.
+	Mismatch bool
+}
+
+// DurationMismatch is a join whose running time disagrees with the sum of its
+// parts.
+//
+// It is its own type rather than an error string because it is the one join
+// failure that leaves a playable file behind, and the only one worth
+// overriding. Both of those are decisions for the caller: the merge worker
+// keeps the rejected file so it can be watched, and archives it afterwards if
+// somebody says to.
+type DurationMismatch struct {
+	Parts    int
+	Expected float64
+	Actual   float64
+}
+
+func (e *DurationMismatch) Error() string {
+	return fmt.Sprintf("join: %d parts totalling %.3fs came out as %.3fs; refusing to archive that",
+		e.Parts, e.Expected, e.Actual)
+}
+
+// JoinOptions are the ways of asking Join for something other than its careful
+// default. Zero-valued is the careful default.
+type JoinOptions struct {
+	// AllowDurationMismatch archives a join whose running time does not add up
+	// instead of refusing it, and records the fact in the result.
+	//
+	// There is exactly one caller, and it is a person: somebody who has watched
+	// the rejected file and can see that none of the parts is missing. Snapchat
+	// exports whose container duration overstates their last frame by a tenth
+	// of a second are real, they are indistinguishable from a dropped part by
+	// arithmetic alone, and they are distinguishable by watching.
+	AllowDurationMismatch bool
 }
 
 // joinDurationSlack is how far the joined file may fall from the sum of its
@@ -70,7 +111,7 @@ const joinDurationSlack = 0.1
 // the same shape of decision derive makes about composing an overlay: do the
 // cheap exact thing when the inputs allow it, and be explicit about the
 // occasion when they do not.
-func (t *Tool) Join(ctx context.Context, parts []Part, dst string) (JoinResult, error) {
+func (t *Tool) Join(ctx context.Context, parts []Part, dst string, opts JoinOptions) (JoinResult, error) {
 	if len(parts) < 2 {
 		return JoinResult{}, fmt.Errorf("join: %d parts is not something to join", len(parts))
 	}
@@ -121,13 +162,26 @@ func (t *Tool) Join(ctx context.Context, parts []Part, dst string) (JoinResult, 
 	if err != nil {
 		return JoinResult{}, fmt.Errorf("join: %w", err)
 	}
-	if math.Abs(joined.DurationSeconds-expected) > joinDurationSlack {
-		return JoinResult{}, fmt.Errorf(
-			"join: %d parts totalling %.3fs came out as %.3fs; refusing to archive that",
-			len(parts), expected, joined.DurationSeconds)
+	result := JoinResult{
+		Copied:          why == "",
+		DurationSeconds: joined.DurationSeconds,
+		Why:             why,
+		Expected:        expected,
 	}
-
-	return JoinResult{Copied: why == "", DurationSeconds: joined.DurationSeconds, Why: why}, nil
+	if math.Abs(joined.DurationSeconds-expected) > joinDurationSlack {
+		if !opts.AllowDurationMismatch {
+			// dst is left where it is. It is the only evidence of what went
+			// wrong that anybody can actually look at, and the caller is the
+			// one that knows whether it is worth keeping — see
+			// worker.runMerge, which files it under the group and offers it to
+			// the review page.
+			return result, &DurationMismatch{
+				Parts: len(parts), Expected: expected, Actual: joined.DurationSeconds,
+			}
+		}
+		result.Mismatch = true
+	}
+	return result, nil
 }
 
 // concat writes the demuxer's list file and runs the copy.

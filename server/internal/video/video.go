@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -28,6 +29,11 @@ import (
 // gallery gains nothing visible and starts costing real disk and encode time;
 // the original is always one click away for anything more.
 const PlaybackMaxEdge = 1920
+
+// sampleQuality is the WebP quality of a frame sampled for the vision service.
+// It matches derive.Converter's ML rendition, so a still and a video frame reach
+// the model having been through the same amount of compression.
+const sampleQuality = 80
 
 // LiveThumbTarget is one square size of a Live Photo's motion and the file it
 // should be written to. The sizes match the still thumbnails exactly, because
@@ -621,6 +627,105 @@ func (t *Tool) SampleFrames(ctx context.Context, src string, count, edge int, in
 		frames[i] = raw[i*plane : (i+1)*plane]
 	}
 	return frames, nil
+}
+
+// SampleImages writes count still frames spread across a clip as WebP files,
+// bounded by edge on the longest side, and returns the paths in order.
+//
+// This is SampleFrames' sibling and the difference between them is who reads
+// the output. SampleFrames produces headerless grey planes for a hash function;
+// this produces pictures for a model, in colour, in the aspect ratio they were
+// shot in, through the same image2 sequence any other tool would expect. The
+// two share their sampling rule and nothing else.
+//
+// Sampled by time rather than by frame number, for the reason SampleFrames
+// spells out: the fps filter picks the frame nearest each instant, so a clip and
+// a re-encode of it at another frame rate are sampled at the same moments.
+//
+// One ffmpeg for the whole clip. Six accurate seeks into a 60-second video is
+// six decodes from the preceding keyframe; this is one pass, and over 2,818
+// videos that is the difference between an afternoon and a coffee.
+//
+// The caption layer is burned in, unlike in SampleFrames. There the asymmetry
+// was free — two copies of a memory hash the same with or without it. Here it
+// is the opposite: the handwriting over a Snapchat memory is text, and text is
+// exactly what the OCR pass downstream is for.
+func (t *Tool) SampleImages(ctx context.Context, src, dir, overlay string, count, edge int, info Info) ([]string, error) {
+	switch {
+	case count <= 0:
+		return nil, fmt.Errorf("sample %s: %d is not a number of frames", src, count)
+	case edge <= 0:
+		return nil, fmt.Errorf("sample %s: %d is not an edge length", src, edge)
+	case info.DurationSeconds <= 0:
+		// Refused rather than guessed at, exactly as in SampleFrames: with no
+		// duration there is no way to space the samples, and six frames from
+		// the opening second describe the opening second.
+		return nil, fmt.Errorf("sample %s: the clip has no duration to sample across", src)
+	}
+
+	if err := t.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer t.release()
+
+	// Fit inside the box without ever enlarging. ffmpeg's scaler has no
+	// shrink-only mode, so the box itself is clamped to the frame — a 320px
+	// clip gets a 320px box and comes out untouched.
+	fit := fmt.Sprintf("scale=w='min(%d,iw)':h='min(%d,ih)':force_original_aspect_ratio=decrease:flags=lanczos", edge, edge)
+	sample := fmt.Sprintf("fps=%d/%f", count, info.DurationSeconds)
+
+	args := []string{"-nostdin", "-y", "-v", "error"}
+	args = append(args, t.decodeArgs()...)
+	args = append(args, "-i", src)
+	if overlay != "" {
+		// Read once, not looped — see Transcode for what -loop 1 does to a
+		// silent clip.
+		args = append(args, "-i", overlay)
+		graph, err := overlayGraph(info)
+		if err != nil {
+			return nil, fmt.Errorf("sample %s: %w", src, err)
+		}
+		args = append(args, "-filter_complex", graph+","+sample+","+fit+"[ml]", "-map", "[ml]")
+	} else {
+		args = append(args, "-vf", sample+","+fit)
+	}
+
+	pattern := filepath.Join(dir, "ml-%d.webp")
+	args = append(args,
+		"-frames:v", strconv.Itoa(count),
+		"-c:v", "libwebp",
+		"-quality", strconv.Itoa(sampleQuality),
+		// An animated WebP is what libwebp produces if left to itself when it is
+		// handed a stream; image2 is what makes these separate stills.
+		"-f", "image2",
+		pattern,
+	)
+
+	cmd := exec.CommandContext(ctx, t.ffmpeg(), args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("sample %s: %w: %s", src, err, strings.TrimSpace(stderr.String()))
+	}
+
+	// image2 numbers from one and stops when the frames run out, which happens
+	// on a clip whose last sampling instant lands past its final frame. Short is
+	// allowed for the same reason it is in SampleFrames: the frames that were
+	// written are at the instants they would have been at anyway.
+	var written []string
+	for i := 1; i <= count; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("ml-%d.webp", i))
+		info, err := os.Stat(path)
+		if err != nil || info.Size() == 0 {
+			break
+		}
+		written = append(written, path)
+	}
+	if len(written) == 0 {
+		return nil, fmt.Errorf("sample %s: ffmpeg wrote no frames (stderr: %s)",
+			src, orNone(strings.TrimSpace(stderr.String())))
+	}
+	return written, nil
 }
 
 // encode runs one ffmpeg and insists that something playable came out of every

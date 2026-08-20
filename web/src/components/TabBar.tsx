@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Ellipsis, Images, LayoutDashboard, Library, Search } from "lucide-react";
+import { Activity, Ellipsis, Images, Library, Search } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { FilterPill } from "./FilterPill";
@@ -12,7 +12,7 @@ import { SelectionPill } from "./SelectionPill";
 const TABS = [
   { href: "/", label: "Gallery", Icon: Images },
   { href: "/collections", label: "Collections", Icon: Library },
-  { href: "/overview", label: "Overview", Icon: LayoutDashboard },
+  { href: "/status", label: "Status", Icon: Activity },
   { href: "/search", label: "Search", Icon: Search },
   { href: "/other", label: "Other", Icon: Ellipsis },
 ];
