@@ -206,6 +206,12 @@ redeploy() {
 	sync_unit "$src/deploy/photod.service" "$UNIT_DIR/photod.service"
 	sync_unit "$src/deploy/photobackup-verify.service" "$UNIT_DIR/photobackup-verify.service"
 	sync_unit "$src/deploy/photobackup-verify.timer" "$UNIT_DIR/photobackup-verify.timer"
+	# Skipped on a machine that never installed it, which is most of them:
+	# photo-ml is optional and this is the unit file, not the service. Its
+	# Python and its venv are updated separately — see deploy/README.md
+	# § photo-ml — because rebuilding a 4GB venv is not something a two-second
+	# photod redeploy should do on every run.
+	sync_unit "$src/deploy/photo-ml.service" "$UNIT_DIR/photo-ml.service"
 	sync_unit "$src/deploy/photobackup.avahi.service" "$AVAHI_SERVICE"
 
 	step "stopping photod"

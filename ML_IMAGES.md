@@ -4,10 +4,12 @@ The plan for the search feature: a plain-text box that answers questions about
 dates, places, people, objects and vibes, over a library the archive already
 holds. This document is the design and the order of work.
 
-It was a plan and is now partly a record: **steps 2, 3 and 4 of §9 are built** —
-pgvector, migration `0016_search.sql`, the offline geocoder, and the `mlprep`
-job that writes the renditions a model will read. Everything from step 5 onward,
-which is everything involving a GPU, is still design.
+It was a plan and is now partly a record: **steps 2, 3, 4 and 5 of §9 are
+built** — pgvector, migrations `0016_search.sql` and `0017_vision.sql`, the
+offline geocoder, the `mlprep` job that writes the renditions a model reads, and
+photo-ml itself with the `vision` pool feeding it. Semantic search is real; it
+just has no endpoint yet. Everything from step 6 onward — captions, tags, OCR,
+the query parser and the page — is still design.
 
 The rule from PROJECT.md §4 governs everything below: **photo-ml is optional
 forever.** If it is down, mid-model-swap, or saturating the GPU, backups still
@@ -190,6 +192,16 @@ nobody has measured or cover every model at once, which is the thing the
 predicate exists to avoid. Everything else in that block is in 0016 and is
 inert until something writes to it.
 
+*(That migration is now `0017_vision.sql` and the model is
+`siglip2-so400m-patch14-384`. The bench was skipped rather than run: §4 had
+already pinned the width at 1152, which pins the family, and `model` in the
+primary key means measuring a second encoder later is a delete and a fifteen-
+minute requeue rather than a project. The one consequence worth knowing is that
+a partial index is only reachable from a query repeating its predicate
+literally — leave `where model = ...` off a search and Postgres answers the same
+rows by sequential scan over sixty thousand vectors, which is correct and slow
+enough to look like a bug in the model. `db.VisionModel` is that literal.)*
+
 **`model` is on every row, and it is in the index predicate.** A model swap
 becomes `delete where model = <old>` plus a requeue. Never a migration, never a
 truncate, and the old and the new can sit in the table together while they are
@@ -221,6 +233,19 @@ Three additions to the pipeline, and one of them is not ML at all.
 | `mlprep` | new **prep** pool (Go, CPU) | writes the ML renditions; samples video frames |
 | `vision` | new **vision** pool (Go, GPU via HTTP) | one call to photo-ml; writes embeddings, caption, tags, OCR |
 | — | the existing metadata job | reverse-geocodes on ingest |
+
+*(Both built. `vision` writes embeddings only — the caption, tags and OCR
+columns of that row are step 6. One thing came out differently and it is the
+part of this design that took the most care: the pool is **gated**, not merely
+retried. It asks photo-ml whether it is up before it claims anything, so an
+absent service means an idle pool rather than sixty thousand failures; and for
+the job already in flight when the service is restarted there is `jobs.Defer`,
+which returns it to the queue with its **attempt rolled back**. Without that,
+`systemctl restart photo-ml` during a backfill would spend five attempts per
+asset against a closed socket and mark the library permanently failed. The
+`internal/mlclient` boundary is where the two kinds of failure are separated:
+5xx and every transport error cost nothing, a 4xx is a bad rendition and burns
+attempts as it should. server/README.md § What a photograph shows.)*
 
 `vision` gets its own pool for the reason `signature` got one, and the reason is
 stronger here: it is a pass over the whole archive that nothing is waiting for.
@@ -262,12 +287,21 @@ it is the enforcement of §3: if the service cannot open the archive, no future
 change to it can quietly start reading the vault.
 
 ```
-POST /embed     images[] → vectors[]           vision encoder, 1152-d
-POST /describe  image    → {caption, tags[]}   VLM, free-form tags
-POST /ocr       image    → {text, boxes[]}     dedicated text recognition
-POST /parse     query    → filter JSON         small instruct model, constrained decode
-GET  /health             → which models are resident
+POST /embed     images[] → vectors[]           vision encoder, 1152-d   built
+                texts[]  → vectors[]           the same space           built
+POST /describe  image    → {caption, tags[]}   VLM, free-form tags      step 6
+POST /ocr       image    → {text, boxes[]}     dedicated text recognition  step 6
+POST /parse     query    → filter JSON         small instruct model     step 7
+GET  /health             → which models are resident                    built
 ```
+
+*(`texts[]` was not in the original sketch and had to be: a query becomes a
+vector before it becomes a search, and SigLIP's two towers are one model and one
+residency, so splitting them into two routes would have been two names for one
+thing. Images arrive base64 in JSON rather than multipart — a third more bytes
+over a loopback socket that is not the bottleneck, in exchange for every
+endpoint being exercisable with curl and a here-document, which for the piece of
+this system that gets debugged at 1am mid-backfill is the better trade.)*
 
 `/parse` lives here rather than in Go because it is the only other thing in the
 system that wants a GPU and a tokenizer. Putting it here means `photod` has
@@ -287,7 +321,17 @@ about 1.4 GB.
 | OCR (ONNX) | 0.5 GB | on demand |
 
 The two heavy ones load when a `vision` job arrives and unload once the queue
-has been dry for a few minutes. Interactive search then costs about 5 GB
+has been dry for a few minutes.
+
+*(The mechanism is `photo_ml/residency.py` and it is built, with only the
+encoder registered against it so far. Two details in it turned out to matter
+more than the design did. A model in use is never a reap candidate, because the
+reaper runs on its own thread and unloading weights another thread is
+mid-forward-pass on is a segfault rather than an error. And unloading calls
+`torch.cuda.empty_cache()` rather than dropping the last reference — dropping it
+returns the blocks to torch's caching allocator, which keeps them reserved
+against the driver, so `nvidia-smi` goes on showing 6GB held and NVENC goes on
+failing to allocate. That one line is the whole of what §11 is watching for.)* Interactive search then costs about 5 GB
 steady-state while the desktop is in use, and the overnight backfill gets the
 whole card.
 
@@ -371,9 +415,23 @@ Each of steps 3, 5 and 6 ships something searchable on its own.
    worker pool sized by `PREP_CONCURRENCY`, writing `<sha>.ml.webp` and
    `<sha>.ml.0.webp`…`.5`. Backfill ≈ 1–1.5 h, CPU-bound, and it is queued by
    the worker's reconcile rather than by the migration.
-5. **`photo-ml` with `/embed` and `/health` only**, plus the `vision` job writing
-   embeddings. Backfill ≈ 15 min on the GPU. Semantic search is real at the end
-   of this step; everything after it is refinement.
+5. ~~**`photo-ml` with `/embed` and `/health` only**, plus the `vision` job
+   writing embeddings.~~ **Done** — a uv project at `photo-ml/`, a fifth worker
+   pool sized by `VISION_CONCURRENCY`, and `deploy/photo-ml.service` running as
+   a user that cannot see `/mnt/photos`. Three things came out differently from
+   this sketch, each noted where it belongs: `/embed` takes `texts[]` as well as
+   `images[]`, because a query has to become a vector and the two towers are one
+   model and one residency; the encoder is `siglip2-so400m-patch14-384`,
+   committed to rather than benched, since §4 had already pinned the width at
+   1152 and `model` in the primary key makes a later bench a delete and a
+   requeue; and the pool is gated on the service being up rather than retried
+   against it. §6 and §5 have the details.
+
+   Backfilled in **16m04s** over 17,792 assets, and the first thing asked of it
+   — `snow` — came back with Christmas Day 2019 in Tahoe Vista and March 2025 in
+   Breckenridge, from pixels alone: the encoder has never seen a place name.
+   `photo-ml/README.md` and server/README.md § What a photograph shows have the
+   query, which is two commands until step 7 gives it an endpoint.
 6. **`/describe` and `/ocr`**, the tags and captions tables, the `asset_search`
    tsvector. Overnight backfill ≈ 2–4 h.
 7. **`/parse`**, `GET /v1/search`, RRF ranking, and the degraded path.
@@ -397,11 +455,25 @@ is one column and is reversible.
 
 | step | work | wall clock |
 |---|---|---|
-| geocode | 11,045 fixes against an in-memory k-d tree | seconds |
-| mlprep | decode 17,788 originals, sample 2,818 videos | 1–1.5 h |
-| embed | ~61,000 renditions through the vision encoder | ~15 min |
+| geocode | 11,045 fixes against an in-memory k-d tree | seconds — measured |
+| mlprep | decode 17,792 originals, sample the videos | ~1 h — measured |
+| embed | 31,422 renditions through the vision encoder | **16m04s — measured** |
 | ocr | 14,970 stills | 10–15 min |
 | describe | ~23,000 images through the VLM | 2–4 h |
+
+*(The embed row is now a measurement rather than an estimate, and the estimate
+was wrong in the useful direction. 61,000 renditions assumed six frames from
+every video in the library; the pass actually sends 31,422 — 14,970 stills at
+one frame each and 16,452 frames from the videos the timeline shows, the rest
+having fallen out as Live Photo halves and overlays before mlprep ever ran. It
+held steady at about 1,300 assets a minute on the RTX 5060 Ti, at 2.6GB of VRAM
+and 69% utilisation, while photod went on serving the gallery.*
+
+*80 videos came out with no vector: clips mlprep could not sample, which have no
+renditions for the encoder to look at. That is the tolerance clipRenditions
+applies reaching the far end of the pipe intact rather than turning into 80
+photographs marked permanently broken — and it is the case jobs.ReconcileVision
+notes it will re-offer on every restart, at a claim and a stat each.)*
 
 One overnight run, once per model generation. Re-running everything except
 `mlprep` after a model swap is under five hours; re-running `embed` alone is

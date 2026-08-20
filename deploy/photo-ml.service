@@ -1,0 +1,122 @@
+# photo-ml — the archive's optional GPU service. Renditions in, vectors out.
+#
+#   sudo cp deploy/photo-ml.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now photo-ml
+#
+# deploy/README.md § photo-ml has the whole install, including the user, the
+# venv under /opt and the model cache under /var/lib.
+
+[Unit]
+Description=photo-ml vision service for the photo archive
+Documentation=https://github.com/dominicclerici/photos-backup
+# Only for the first start, which pulls 1.8GB of weights. Every start after that
+# reads them off the local cache.
+After=network-online.target
+Wants=network-online.target
+
+# Deliberately no RequiresMountsFor. photod refuses to start without the archive
+# drive, because starting without it would create an empty blob tree at the
+# mount point and quietly archive into it. This service has the opposite
+# relationship to that disk: it must never touch it, so whether it is mounted is
+# none of its business.
+#
+# And deliberately no Before= or PartOf= relationship with photod. photo-ml is
+# optional forever — PROJECT.md §4 — and a unit ordering that made photod wait
+# for this one would be the first quiet step towards it not being.
+
+[Service]
+Type=simple
+User=photo-ml
+Group=photo-ml
+EnvironmentFile=-/etc/photo-ml/photo-ml.env
+# The venv's own console script rather than `uv run`. uv is an install-time tool
+# here: at runtime it would want to resolve, lock and possibly write, and none
+# of those are things a service holding a GPU should do on the way up.
+ExecStart=/opt/photo-ml/.venv/bin/photo-ml
+Restart=on-failure
+RestartSec=5s
+
+# Loopback, and the port beside photod's 8787 and 8788.
+Environment=PHOTO_ML_ADDR=127.0.0.1
+Environment=PHOTO_ML_PORT=8789
+# Where the weights live. One writable directory, named explicitly, because the
+# service has no home directory to fall back on — see ProtectHome below.
+Environment=PHOTO_ML_CACHE_DIR=/var/lib/photo-ml/cache
+Environment=HF_HOME=/var/lib/photo-ml/cache
+Environment=XDG_CACHE_HOME=/var/lib/photo-ml/cache
+# torch compiles CUDA kernels through triton on first use and caches them.
+# Without somewhere to put them it either recompiles on every start or fails.
+Environment=TRITON_CACHE_DIR=/var/lib/photo-ml/triton
+
+# Unloading a model has to survive a stop as well: a service killed mid-forward
+# pass leaves VRAM held until the process actually exits, and NVENC is waiting
+# for it.
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# ---------------------------------------------------------------------------
+# The sandbox, which is the point of this file.
+#
+# ML_IMAGES.md §3 says photo-ml never touches /mnt/photos, and §6 says that is
+# not belt-and-braces but the enforcement: if the service cannot open the
+# archive, no future change to it can quietly start reading the vault. Below is
+# where that stops being a sentence in a design document.
+# ---------------------------------------------------------------------------
+
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/photo-ml
+
+# The archive, out of reach. Not by file mode — /mnt/photos is 0755 on this
+# machine and a photograph's bytes are readable by anyone who can name them —
+# but by mount namespace: these paths do not exist inside this unit at all.
+#
+# The derivatives are here for the same reason and it is the less obvious half.
+# A 512px WebP of a photograph is a picture of it, and this service is handed
+# the bytes of exactly the ones it is meant to see, over a socket, by a process
+# that has already decided which those are. Being able to open the directory
+# would let it see the vault's sealed renditions, the trash, and the 5,292
+# Live Photo halves the timeline deliberately excludes.
+InaccessiblePaths=/mnt/photos
+InaccessiblePaths=/var/lib/photod
+
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+
+# Loopback, the HTTPS the first start needs to fetch weights — and AF_UNIX,
+# which is not optional and is not obvious.
+#
+# The CUDA driver opens a unix socket during initialisation. Without AF_UNIX the
+# service starts perfectly, loads the model, answers every request, and does it
+# all on the CPU about fifty times too slowly. What torch reports is
+# `cudaGetDeviceCount() ... Error 304: OS call failed or operation not supported
+# on this OS`, which names neither the socket nor this line. AF_NETLINK, having
+# been suspected, is genuinely not needed.
+#
+# /health reporting "device": "cpu" on a machine with a card is the symptom, and
+# it is why that field is in /health at all.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# PrivateDevices is deliberately NOT set: it would hide /dev/nvidia*, and the
+# service would start, load the model onto the CPU, and answer every request
+# fifty times too slowly with nothing in the log to say why.
+#
+# MemoryDenyWriteExecute is deliberately not set either. torch compiles CUDA
+# kernels at runtime, which is exactly a W+X mapping.
+
+# The card and the cores are shared with a desktop session and with NVENC. An
+# overnight backfill should be something the machine does in the background.
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+
+[Install]
+WantedBy=multi-user.target

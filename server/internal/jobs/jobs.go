@@ -51,6 +51,21 @@ const (
 	// did exactly that, correctly, for a change that genuinely needed it. This
 	// one does not.
 	KindMLPrep Kind = "mlprep"
+	// KindVision is one call to photo-ml per asset: the ML renditions go out
+	// over loopback and 1152 numbers per frame come back. It is the Python half
+	// of ML_IMAGES.md §3, and the only kind of work in this table that depends
+	// on a process the archive is allowed not to have.
+	//
+	// Its own pool, for the reason KindSignature has one and with a stronger
+	// case: it is a pass over the whole archive that nothing is waiting for,
+	// and it is a queue in front of one GPU, so more claimants would only mean
+	// more processes waiting on the same card.
+	//
+	// The kind that is deferred rather than failed. Every other job here can
+	// only be stopped by something wrong with a photograph; this one can be
+	// stopped by a service being restarted, and Defer below is what keeps an
+	// outage from marking sixty thousand perfectly good photographs broken.
+	KindVision Kind = "vision"
 	// KindMerge concatenates a set of Snapchat segments into one archived
 	// recording. ffmpeg, so it runs in the transcode pool; the asset it names is
 	// the first piece, which is as close as this table gets to naming a group.
@@ -144,6 +159,43 @@ func Discard(ctx context.Context, q Execer, kind Kind, assetID string) error {
 		where kind = $1 and asset_id = $2::uuid and state <> 'running'`
 	if _, err := q.Exec(ctx, remove, string(kind), assetID); err != nil {
 		return fmt.Errorf("discard %s job: %w", kind, err)
+	}
+	return nil
+}
+
+// Defer puts a running job back without spending an attempt on it.
+//
+// The third thing that can happen to a claimed job, and it exists because of
+// one that is optional. Complete says the work is done and Fail says the work
+// was tried and did not go; Defer says the work was never tried, because the
+// thing that does it was not there.
+//
+// Rolling the attempt back is the whole point and it is not bookkeeping. An
+// attempt is a claim on the file — five of them mean five real goes at the same
+// bytes, which is how a genuinely broken original gives up within the hour
+// instead of burning ffmpeg forever. A job that never reached the bytes has not
+// used one. Without this, restarting photo-ml during a backfill would take five
+// swings at a closed socket for every queued asset and park the lot as
+// permanently failed, and the way back would be a hand-written UPDATE against
+// sixty thousand rows.
+//
+// The delay is the caller's, because only the caller knows what it is waiting
+// for. The running guard is for the job the lease sweep reclaimed while this
+// was deciding: that row belongs to the queue again, and writing to it here
+// would put a stale run_after on work another worker may already have.
+func (q *Queue) Defer(ctx context.Context, j Job, delay time.Duration, reason string) error {
+	const put = `
+		update jobs set
+			state = 'pending',
+			attempts = greatest(attempts - 1, 0),
+			run_after = now() + make_interval(secs => $2),
+			last_error = $3,
+			locked_at = null,
+			locked_by = null,
+			updated_at = now()
+		where id = $1 and state = 'running'`
+	if _, err := q.pool.Exec(ctx, put, j.ID, delay.Seconds(), reason); err != nil {
+		return fmt.Errorf("defer job %d: %w", j.ID, err)
 	}
 	return nil
 }
@@ -309,6 +361,50 @@ func ReconcileMLPrep(ctx context.Context, q Execer) (int64, error) {
 	tag, err := q.Exec(ctx, insert)
 	if err != nil {
 		return 0, fmt.Errorf("reconcile mlprep jobs: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// ReconcileVision queues an embedding pass for everything that has renditions
+// and no vector from the named model.
+//
+// The mlprep job being done is the predicate, and it is doing two jobs. It is
+// how this finds the backfill — seventeen thousand assets whose renditions were
+// written by a pool that finished hours ago and queued nothing. And it is the
+// dependency: there is no point handing photo-ml an asset whose 512px WebP has
+// not been written yet, and the timeline exclusions that decide which assets get
+// one are already baked into the mlprep row rather than restated here.
+//
+// The model is the version, in the sense ReconcileSignatures means it. Swapping
+// encoders is `delete from asset_embeddings where model = <old>` and a restart:
+// the not-exists goes true again for every asset, the done rows go back to
+// pending, and fifteen minutes later the library has been described by a
+// different model. Never a migration, and the two models can sit in the table
+// together while somebody measures one against the other.
+//
+// One honest cost. A video that could not be sampled has no renditions, so its
+// vision job finds nothing to send, completes, and writes no embedding — which
+// makes it indistinguishable here from one that has never run, and it is
+// offered again on every start. It costs a claim and a stat per restart for a
+// handful of clips, and the alternative is a row recording that a model looked
+// at nothing, which is a heavier thing to carry than the churn.
+func ReconcileVision(ctx context.Context, q Execer, model string) (int64, error) {
+	const upsert = `
+		insert into jobs (kind, asset_id)
+		select 'vision', a.id
+		from assets a
+		join jobs prep on prep.asset_id = a.id
+		     and prep.kind = 'mlprep' and prep.state = 'done'
+		where a.vault = '' and a.deleted_at is null
+		  and not exists (
+		      select 1 from asset_embeddings e
+		      where e.asset_id = a.id and e.model = $1)
+		on conflict (asset_id, kind) do update
+		    set state = 'pending', run_after = now(), attempts = 0, last_error = null
+		    where jobs.state = 'failed' or jobs.state = 'done'`
+	tag, err := q.Exec(ctx, upsert, model)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile vision jobs: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }

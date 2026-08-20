@@ -1,0 +1,43 @@
+[project]
+name = "photo-ml"
+version = "0.1.0"
+description = "The archive's optional GPU service: what a photograph looks like, as a vector."
+readme = "README.md"
+# 3.12 rather than whatever the host ships. This machine's system Python is
+# 3.14, which no torch release supports, and pinning here means `uv run` fetches
+# an interpreter rather than failing in a way that looks like a torch problem.
+requires-python = "==3.12.*"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    # 4.49 is the first release that knows what a SigLIP-2 checkpoint is.
+    "transformers>=4.49",
+    "torch>=2.7",
+    "pillow>=11",
+    "numpy>=2",
+    # The Gemma tokenizer the text tower is built on.
+    "sentencepiece>=0.2",
+]
+
+[project.scripts]
+photo-ml = "photo_ml.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/photo_ml"]
+
+# The RTX 5060 Ti is Blackwell — compute capability 12.0 — and the wheels on
+# PyPI are built for nothing newer than Hopper. Without this the service
+# installs cleanly, starts cleanly, and then reports
+# "no kernel image is available for execution on the device" on the first
+# forward pass. cu128 is the first CUDA toolkit with sm_120 kernels.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]

@@ -2,13 +2,18 @@
 // what happens to an asset and in what order; the queue below it knows nothing
 // about images, and the media packages above it know nothing about queues.
 //
-// It runs four independent pools rather than one. A single shared pool lets a
+// It runs five independent pools rather than one. A single shared pool lets a
 // handful of 4K transcodes claim every slot, and every thumbnail queued behind
 // them waits minutes for work that takes 80ms — so during a backfill the
-// gallery would appear to be doing nothing at all. The two pools past the first
+// gallery would appear to be doing nothing at all. The pools past the first
 // exist for the same reason pointed at slower work: a pass over the whole
 // archive that nobody is waiting for must not be in front of the work somebody
 // is.
+//
+// The fifth is the only one that can be absent. It talks to photo-ml, which the
+// archive is allowed not to have, so it is started only when one is configured
+// and it asks whether the service is there before it claims anything. See
+// vision.go.
 package worker
 
 import (
@@ -30,6 +35,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/geocode"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
+	"github.com/dominicclerici/photos-backup/server/internal/mlclient"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
 )
 
@@ -56,7 +62,14 @@ type Deps struct {
 	// job refuses rather than archiving something unrecoverable, and every
 	// other kind of work is unaffected.
 	Manifest *manifest.Log
-	Log      *slog.Logger
+	// ML is the GPU service: renditions out over loopback, vectors back. Nil
+	// means it was not configured, and nil is a supported way to run this
+	// archive forever — PROJECT.md §4's hard rule, in a struct field. Without
+	// it the vision pool is not started, no vision work is queued, and the
+	// library is searchable by date, place, camera and filename exactly as it
+	// was before any of this existed. See internal/mlclient.
+	ML  *mlclient.Client
+	Log *slog.Logger
 }
 
 type Runner struct {
@@ -91,6 +104,19 @@ type Runner struct {
 	// than by the database, and two ImageMagicks fit comfortably beside the
 	// metadata pool on any machine that can run this at all.
 	PrepWorkers int
+	// VisionWorkers hand the renditions to photo-ml and store what comes back.
+	//
+	// A fifth pool, for the fourth time and with the strongest case yet: this
+	// one is a queue in front of a single GPU. One by default and rarely worth
+	// more — a second worker does not make the card faster, it makes two
+	// requests wait on it, and the batching that would help lives on the other
+	// side of the socket.
+	//
+	// The only pool that is gated. It asks photo-ml whether it is there before
+	// it claims anything, so a machine whose GPU service is down or being
+	// upgraded has a vision pool that is idle rather than one turning sixty
+	// thousand assets into failures. See mlAvailable.
+	VisionWorkers int
 
 	// PollInterval is the floor on how often an idle worker looks for work.
 	// Uploads nudge the pools directly, so this only matters for work that
@@ -108,6 +134,16 @@ type Runner struct {
 	// noGeocoder makes "the extract is not installed" a single line in the log
 	// rather than one per photograph with a GPS fix.
 	noGeocoder sync.Once
+	// wrongModel does the same for a photo-ml running a checkpoint this
+	// database is not indexed for: worth saying, not worth saying per asset.
+	wrongModel sync.Once
+
+	// The vision pool's shared view of whether photo-ml is up. Shared so that
+	// the probe rate is a property of the interval rather than of
+	// VISION_CONCURRENCY.
+	mlMu        sync.Mutex
+	mlOK        bool
+	mlCheckedAt time.Time
 }
 
 func New(deps Deps) *Runner {
@@ -117,6 +153,7 @@ func New(deps Deps) *Runner {
 		TranscodeWorkers:  1,
 		SignatureWorkers:  1,
 		PrepWorkers:       2,
+		VisionWorkers:     1,
 		PollInterval:      5 * time.Second,
 		SweepInterval:     time.Minute,
 		HeartbeatInterval: jobs.DefaultLease / 3,
@@ -137,6 +174,9 @@ func (r *Runner) Start(ctx context.Context) {
 	if err := r.reconcileMLPrep(ctx); err != nil {
 		r.log().Error("reconcile mlprep jobs", "error", err)
 	}
+	if err := r.reconcileVision(ctx); err != nil {
+		r.log().Error("reconcile vision jobs", "error", err)
+	}
 
 	for i := range r.metadataWorkers() {
 		r.spawn(ctx, fmt.Sprintf("metadata-%d", i), []jobs.Kind{jobs.KindMetadata})
@@ -152,6 +192,14 @@ func (r *Runner) Start(ctx context.Context) {
 	}
 	for i := range r.prepWorkers() {
 		r.spawn(ctx, fmt.Sprintf("prep-%d", i), []jobs.Kind{jobs.KindMLPrep})
+	}
+	// Not started at all when photo-ml was not configured, rather than started
+	// and permanently idle. A pool that exists is a promise that the work will
+	// eventually happen, and on a machine with no GPU service it will not.
+	if r.ML != nil {
+		for i := range r.visionWorkers() {
+			r.spawnGated(ctx, fmt.Sprintf("vision-%d", i), []jobs.Kind{jobs.KindVision}, r.mlAvailable)
+		}
 	}
 
 	r.wg.Add(1)
@@ -178,6 +226,17 @@ func (r *Runner) Nudge() {
 }
 
 func (r *Runner) spawn(ctx context.Context, id string, kinds []jobs.Kind) {
+	r.spawnGated(ctx, id, kinds, nil)
+}
+
+// spawnGated is spawn for a pool whose work depends on something outside this
+// process. The gate is asked before every claim, and a false answer means the
+// worker waits rather than taking a job it cannot do.
+//
+// Only the vision pool uses one. Every other kind of work here needs a file and
+// a subprocess, both of which are either there at startup or reported missing
+// then; this one needs a service that is allowed to be restarted underneath it.
+func (r *Runner) spawnGated(ctx context.Context, id string, kinds []jobs.Kind, gate func(context.Context) bool) {
 	nudge := make(chan struct{}, 1)
 	r.mu.Lock()
 	r.nudges = append(r.nudges, nudge)
@@ -186,15 +245,29 @@ func (r *Runner) spawn(ctx context.Context, id string, kinds []jobs.Kind) {
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		r.loop(ctx, id, kinds, nudge)
+		r.loop(ctx, id, kinds, nudge, gate)
 	}()
 }
 
-func (r *Runner) loop(ctx context.Context, id string, kinds []jobs.Kind, nudge <-chan struct{}) {
+func (r *Runner) loop(ctx context.Context, id string, kinds []jobs.Kind, nudge <-chan struct{}, gate func(context.Context) bool) {
 	ticker := time.NewTicker(r.pollInterval())
 	defer ticker.Stop()
 
 	for {
+		// Before the claim, deliberately. A gated pool that claimed first would
+		// spend a lease and a heartbeat goroutine per asset discovering
+		// something that is true of the whole queue at once, and the nudge is
+		// ignored here for the same reason: an upload does not make an absent
+		// GPU service present.
+		if gate != nil && !gate(ctx) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			continue
+		}
+
 		job, err := r.Queue.Claim(ctx, kinds, id)
 		switch {
 		case errors.Is(err, jobs.ErrNoJob):
@@ -242,6 +315,21 @@ func (r *Runner) execute(ctx context.Context, workerID string, job jobs.Job) {
 	// lets the lease sweep return it to the queue on the next start; marking it
 	// failed would spend an attempt on an interruption the job had no part in.
 	if ctx.Err() != nil {
+		return
+	}
+
+	// The service went away mid-job. Nothing was learned about this asset, so
+	// nothing is charged to it: the job goes back to pending with the attempt
+	// rolled off, and the gate on the pool holds the rest of the queue until
+	// photo-ml is answering again. Without this, restarting the GPU service
+	// during a backfill would take five swings at a closed socket per asset and
+	// park the library as permanently failed. See jobs.Defer.
+	if errors.Is(err, mlclient.ErrUnavailable) {
+		if deferErr := r.Queue.Defer(context.WithoutCancel(ctx), job, visionRetryDelay, err.Error()); deferErr != nil {
+			r.log().Error("defer job", "job", job.ID, "error", deferErr)
+		}
+		r.log().Warn("photo-ml went away mid-job; the work was put back without spending an attempt",
+			"job", job.ID, "asset", job.AssetID, "retry_in", visionRetryDelay, "error", err)
 		return
 	}
 
@@ -298,6 +386,11 @@ func (r *Runner) run(ctx context.Context, job jobs.Job) (err error) {
 		return r.runSignature(ctx, job.AssetID)
 	case jobs.KindMLPrep:
 		return r.runMLPrep(ctx, job.AssetID)
+	case jobs.KindVision:
+		if r.ML == nil {
+			return errors.New("no photo-ml configured; set ML_URL or this work has nothing to run on")
+		}
+		return r.runVision(ctx, job.AssetID)
 	case jobs.KindMerge:
 		if r.Manifest == nil {
 			return errors.New("no manifest log configured; refusing to archive a joined recording that a rebuild could not recover")
@@ -919,6 +1012,13 @@ func (r *Runner) prepWorkers() int {
 		return 1
 	}
 	return r.PrepWorkers
+}
+
+func (r *Runner) visionWorkers() int {
+	if r.VisionWorkers <= 0 {
+		return 1
+	}
+	return r.VisionWorkers
 }
 
 func (r *Runner) pollInterval() time.Duration {

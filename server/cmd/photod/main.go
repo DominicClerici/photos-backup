@@ -28,6 +28,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/livecache"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
+	"github.com/dominicclerici/photos-backup/server/internal/mlclient"
 	"github.com/dominicclerici/photos-backup/server/internal/purge"
 	"github.com/dominicclerici/photos-backup/server/internal/tlsca"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
@@ -200,6 +201,20 @@ func run(log *slog.Logger) error {
 		exif := exifdata.New()
 		exif.Binary = cfg.ExiftoolBin
 
+		// The one dependency the archive is designed to be able to lose. A
+		// missing photo-ml is reported the way a missing geocoder is — once, at
+		// startup, saying what is lost — and everything else runs unchanged.
+		// See PROJECT.md §4.
+		var ml *mlclient.Client
+		if cfg.MLURL != "" {
+			ml = mlclient.New(cfg.MLURL)
+			log.Info("photo-ml configured; photographs will be searchable by what they show",
+				"url", cfg.MLURL, "model", db.VisionModel, "vision_workers", cfg.VisionConcurrency)
+		} else {
+			log.Info("no ML_URL; photographs keep their dates, places and filenames and will not be searchable by what they show",
+				"hint", "photo-ml/README.md, then set ML_URL=http://127.0.0.1:8789")
+		}
+
 		workers := worker.New(worker.Deps{
 			Store:       store,
 			Queue:       queue,
@@ -210,12 +225,14 @@ func run(log *slog.Logger) error {
 			Exif:        exif,
 			Places:      geocode.NewLoader(geoDir),
 			Manifest:    srv.Manifest,
+			ML:          ml,
 			Log:         log,
 		})
 		workers.MetadataWorkers = cfg.WorkerConcurrency
 		workers.TranscodeWorkers = cfg.TranscodeConcurrency
 		workers.SignatureWorkers = cfg.SignatureConcurrency
 		workers.PrepWorkers = cfg.PrepConcurrency
+		workers.VisionWorkers = cfg.VisionConcurrency
 
 		workers.Start(ctx)
 		defer workers.Wait()
@@ -239,6 +256,8 @@ func run(log *slog.Logger) error {
 			"metadata", workers.MetadataWorkers,
 			"transcode", workers.TranscodeWorkers,
 			"signature", workers.SignatureWorkers,
+			"prep", workers.PrepWorkers,
+			"vision", visionPoolSize(ml, workers.VisionWorkers),
 			"derivatives_root", derivRoot)
 	} else {
 		log.Warn("derivative workers disabled; uploads will queue work that nothing drains")
@@ -317,6 +336,16 @@ func run(log *slog.Logger) error {
 		}
 		return shutdownErr
 	}
+}
+
+// visionPoolSize reports zero when there is no photo-ml, because that is what
+// is actually running. A log line claiming one vision worker on a machine with
+// no GPU service would be describing a pool that was never started.
+func visionPoolSize(ml *mlclient.Client, configured int) int {
+	if ml == nil {
+		return 0
+	}
+	return configured
 }
 
 func serveErr(errs chan<- error, err error) {

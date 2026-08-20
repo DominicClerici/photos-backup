@@ -90,6 +90,141 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now photod photobackup-verify.timer
 ```
 
+## photo-ml
+
+Optional, and optional forever. Everything above works without it; what it adds
+is being able to find a photograph by what is in it. Skip this section and the
+archive is exactly what it was.
+
+It is a `uv` project rather than a Go binary, so it installs differently from
+everything else here: the source goes to `/opt/photo-ml` with its virtualenv
+beside it, the model weights go to `/var/lib/photo-ml`, and the service runs as
+its own user that cannot see the archive.
+
+```sh
+sudo useradd --system --home-dir /var/lib/photo-ml --shell /usr/sbin/nologin photo-ml
+sudo install -d -o photo-ml -g photo-ml /var/lib/photo-ml \
+        /var/lib/photo-ml/cache /var/lib/photo-ml/triton
+
+# The source, and a venv built beside it. ~5GB: torch and CUDA are most of it.
+sudo rsync -a --delete --exclude .venv --exclude .cache photo-ml/ /opt/photo-ml/
+sudo chown -R photo-ml:photo-ml /opt/photo-ml
+sudo -u photo-ml env HOME=/var/lib/photo-ml \
+        sh -c 'cd /opt/photo-ml && uv sync --frozen'
+
+# Pull the weights now, as the service user, so the first start is a start
+# rather than a 1.8GB download with systemd watching.
+sudo -u photo-ml env HOME=/var/lib/photo-ml HF_HOME=/var/lib/photo-ml/cache \
+        /opt/photo-ml/.venv/bin/python -c \
+        "from photo_ml.encoder import HF_ID; from transformers import AutoModel, AutoProcessor; \
+         AutoModel.from_pretrained(HF_ID); AutoProcessor.from_pretrained(HF_ID)"
+
+sudo cp deploy/photo-ml.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now photo-ml
+```
+
+Then tell photod about it — `ML_URL` in `/etc/photod/photod.env`, which
+`photod.env.example` already carries — and restart:
+
+```sh
+sudoedit /etc/photod/photod.env       # ML_URL=http://127.0.0.1:8789
+sudo systemctl restart photod
+```
+
+That restart is the backfill. photod's `ReconcileVision` finds every asset whose
+ML renditions exist and that this model has said nothing about, queues one
+`vision` job each, and the pool drains them at roughly a thousand an hour per
+GPU-second — about fifteen minutes for a library this size.
+
+### Checking it
+
+```sh
+curl -s localhost:8789/health | python3 -m json.tool
+```
+
+`ready: true` and the encoder listed as resident. Then, from the source tree:
+
+```sh
+photo-ml/check-space.sh some-photo.webp "a dog" "a spreadsheet"
+```
+
+The right phrase should score higher. That check exists because this is the
+failure that does not announce itself: a text tower padded to the wrong length
+produces vectors that are unit length, well-formed, and quietly meaningless.
+
+And the sandbox, which is the reason this service has a user of its own:
+
+```sh
+sudo systemd-run --uid=photo-ml -p InaccessiblePaths=/mnt/photos \
+     --pty --wait ls /mnt/photos          # ls: cannot access: No such file or directory
+```
+
+The unit puts both `/mnt/photos` and `/var/lib/photod` out of reach by mount
+namespace rather than by file mode — `/mnt/photos` is 0755 here, so anyone who
+can name a blob can read it, and the namespace is what actually stops this
+process. That is ML_IMAGES.md §3 enforced by the kernel: photo-ml is handed the
+bytes of the photographs it is meant to see, over a socket, by a process that
+has already decided which those are. It cannot go looking for the others, and no
+future change to it can start.
+
+### Updating it
+
+`photobackup-admin redeploy` syncs `photo-ml.service` if it is installed, and
+deliberately does nothing else here: rebuilding a 5GB venv is not something a
+two-second photod redeploy should do on every run. When the Python changes:
+
+```sh
+sudo rsync -a --delete --exclude .venv --exclude .cache photo-ml/ /opt/photo-ml/
+sudo chown -R photo-ml:photo-ml /opt/photo-ml
+sudo -u photo-ml env HOME=/var/lib/photo-ml sh -c 'cd /opt/photo-ml && uv sync --frozen'
+sudo systemctl restart photo-ml
+```
+
+Restarting it under a running backfill costs nothing. The vision pool asks
+whether the service is there before it claims anything, and the one job in
+flight is put back with its attempt returned rather than spent — see
+`jobs.Defer`. The queue pauses and resumes; it does not fail.
+
+### Changing the model
+
+The whole point of `model` being part of `asset_embeddings`' primary key:
+
+```sql
+delete from asset_embeddings where model = 'siglip2-so400m-patch14-384';
+```
+
+Restart photod and the reconcile queues the library again. Two encoders can also
+sit in the table together while they are compared — nothing above requires the
+old rows to go first. What does need writing by hand is the HNSW index for the
+new name, since its predicate names one model literally; migration
+`0017_vision.sql` is the template.
+
+### If it will not start
+
+- `no kernel image is available for execution on the device` — the wheels are
+  built for an older architecture than this card. `pyproject.toml` pins the
+  `pytorch-cu128` index for exactly this; check `uv sync` actually used it.
+- `/health` says `"device": "cpu"` on a machine with a GPU — the sandbox is in
+  the way, and the service will not say so beyond one warning at startup:
+  `cudaGetDeviceCount() ... Error 304: OS call failed`. Three ways to cause it,
+  in the order they have actually happened here:
+  - **`AF_UNIX` missing from `RestrictAddressFamilies`.** The CUDA driver opens
+    a unix socket while initialising. This is the one that caught the first
+    install, and the error message names neither sockets nor the setting.
+  - `PrivateDevices=yes`, which hides `/dev/nvidia*`. It must stay unset.
+  - the device nodes tightened from 0666, which needs
+    `SupplementaryGroups=video render`.
+
+  The bisect is quick and needs no theory — run the probe under the full set of
+  options and then under the set minus one, as your own user:
+
+  ```sh
+  systemd-run --user --quiet --wait --pipe -p RestrictAddressFamilies="AF_INET AF_INET6" \
+      /opt/photo-ml/.venv/bin/python -c 'import torch; print(torch.cuda.is_available())'
+  ```
+- `ready` stays false — it is still pulling weights, or it failed to. The
+  `error` field in `/health`'s model list says which.
+
 ## The database
 
 Postgres runs from the repository's `docker-compose.yml` on this machine — the

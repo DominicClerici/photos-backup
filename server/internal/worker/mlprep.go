@@ -55,9 +55,26 @@ func (r *Runner) runMLPrep(ctx context.Context, assetID string) error {
 	}
 
 	if asset.MediaKind == db.MediaVideo {
-		return r.clipRenditions(ctx, asset, src)
+		if err := r.clipRenditions(ctx, asset, src); err != nil {
+			return err
+		}
+	} else if err := r.stillRendition(ctx, asset, src); err != nil {
+		return err
 	}
-	return r.stillRendition(ctx, asset, src)
+
+	// The embedding pass, queued from here rather than beside this job, for the
+	// reason the signature and this job are queued from the metadata job: the
+	// thing photo-ml is handed is the file the lines above just wrote, and
+	// queueing before it exists would be queueing a job that finds nothing.
+	//
+	// Only when photo-ml is configured. A machine with no GPU service does not
+	// grow a permanent seventeen-thousand-item backlog describing a feature it
+	// does not have; setting ML_URL and restarting is what turns the library
+	// into queued work, in one place, through jobs.ReconcileVision.
+	if r.ML == nil {
+		return nil
+	}
+	return jobs.Enqueue(ctx, r.Store.Pool(), jobs.KindVision, assetID)
 }
 
 // stillRendition renders one photograph, through its caption layer if it has

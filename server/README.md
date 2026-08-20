@@ -30,6 +30,8 @@ proxies `/api/*` here; see its README to bring the browser side up.
 | `TRANSCODE_CONCURRENCY` | `1` | video transcode and merge workers |
 | `SIGNATURE_CONCURRENCY` | `1` | workers hashing originals for the duplicate scan |
 | `PREP_CONCURRENCY` | `2` | workers writing the renditions a vision model reads |
+| `ML_URL` | unset | where photo-ml is listening; absent means no vision pool and no vision work |
+| `VISION_CONCURRENCY` | `1` | workers handing those renditions to photo-ml |
 | `PREVIEW_CONCURRENCY` | `4` | simultaneous on-demand preview conversions |
 | `LIVE_PREVIEW_CONCURRENCY` | `2` | simultaneous on-demand Live Photo renditions |
 | `LIVE_PREVIEW_CACHE_MB` | `64` | memory those renditions are held in between requests |
@@ -400,6 +402,7 @@ Five kinds of job, in four separately sized pools:
 | `merge` | concatenates the pieces of a split Snapchat recording into one archived original | `TRANSCODE_CONCURRENCY` |
 | `signature` | decodes an original into the hashes the duplicate scan compares | `SIGNATURE_CONCURRENCY` |
 | `mlprep` | writes the uncropped 512px renditions a vision model reads | `PREP_CONCURRENCY` |
+| `vision` | posts those renditions to photo-ml and stores the vectors | `VISION_CONCURRENCY` |
 
 The pools are split so a handful of 4K transcodes cannot claim every slot and
 starve the thumbnails behind them — during a backfill that would look like the
@@ -414,6 +417,13 @@ yet, and putting it in front of a thumbnail would trade a gallery somebody is
 looking at for a search feature nobody has typed into. Two workers rather than
 one, because each item here is a single ImageMagick rather than twenty sampled
 frames.
+
+`vision` gets a fifth, and it is the only pool here that can be absent
+altogether. It is a queue in front of a single GPU — a second worker does not
+make the card faster, it makes two requests wait on it — and it depends on a
+process the archive is allowed not to have, so it is started only when `ML_URL`
+is set and it asks photo-ml whether it is there before claiming anything. See
+*What a photograph shows* below.
 
 `merge` shares the transcode pool because it is the same kind of work — ffmpeg
 over a whole video, minutes rather than milliseconds. It is the only job here
@@ -636,6 +646,117 @@ The vault takes the place name too, and the reason is worth stating: "Chicago"
 is legible at a glance in a way `41.85, -87.65` is not, so leaving it on a
 hidden photograph's row would be a worse leak than the coordinates the scrub
 already empties. It goes into the sealed document and comes back on restore.
+
+## What a photograph shows
+
+The `vision` job is the one piece of this server that leaves the machine's own
+process tree. It reads the ML renditions `mlprep` wrote, posts them to photo-ml
+over loopback, and stores the 1152 numbers that come back in
+`asset_embeddings` — one row per frame, so a video that starts on a beach and
+ends in a restaurant is findable as both.
+
+That division is the whole design: **Go decodes, Python does tensors.** photo-ml
+is handed image bytes over a socket by a process that has already decided which
+photographs it is allowed to see. It opens no files, holds no state, and talks
+to no database, which is what lets its systemd unit put `/mnt/photos` and the
+derivatives tree out of reach entirely — the vault is excluded by construction
+rather than by a `WHERE` clause somebody can forget to write.
+
+### Turning it on
+
+```sh
+ML_URL=http://127.0.0.1:8789
+```
+
+That is the whole configuration. Empty or absent means there is no GPU service,
+and that is a supported way to run this archive forever: the vision pool is not
+started, no vision work is queued, and photographs keep their dates, places,
+cameras and filenames. Not "queued and never drained" — a machine with no
+photo-ml would otherwise report a permanent 17,788-item backlog for a feature it
+does not have.
+
+Setting it and restarting is what turns the library into queued work.
+`jobs.ReconcileVision` finds every asset whose renditions exist and that the
+current model has said nothing about, and the pool drains them: about fifteen
+minutes for a library this size. `photo-ml/README.md` and
+`deploy/README.md § photo-ml` have the service side.
+
+### When photo-ml is not there
+
+The pool asks before it claims. A worker probes `/health` — at most once every
+fifteen seconds however many workers there are — and simply does not take a job
+while the answer is no, so a machine whose GPU service is down or being upgraded
+has a vision pool that is genuinely idle rather than one turning sixty thousand
+assets into failures.
+
+For the one job already in flight when the service goes away there is
+`jobs.Defer`: the job returns to pending with its attempt **rolled back**. That
+is not bookkeeping. An attempt is a claim on the file — five of them mean five
+real goes at the same bytes, which is how a genuinely broken original gives up
+within the hour instead of burning ffmpeg forever — and a job that never reached
+the bytes has not used one. Without it, `systemctl restart photo-ml` during a
+backfill would take five swings at a closed socket for every queued asset and
+park the library as permanently failed, recoverable only by a hand-written
+UPDATE over sixty thousand rows.
+
+The distinction that makes this work lives in `internal/mlclient`: every
+transport failure and every 5xx wraps `ErrUnavailable` and costs nothing, while
+a 4xx — a rendition that is not an image — is an ordinary error that burns
+attempts and eventually parks the job with the service's own sentence kept
+verbatim. One undifferentiated error type would make an outage look like sixty
+thousand corrupt files.
+
+### The model, and swapping it
+
+`siglip2-so400m-patch14-384`, at 1152 dimensions, stored as `halfvec`. The name
+is a constant in three places — `db.VisionModel`, the HNSW index predicate in
+`0017_vision.sql`, and photo-ml's `encoder.MODEL_NAME` — because a partial index
+is only reachable from a query that repeats its predicate literally. Leave the
+`where model = ...` off a search and Postgres answers the same rows by
+sequential scan over sixty thousand vectors, which is correct and slow enough to
+look like a bug in the model. A photo-ml reporting a different name is stored
+truthfully and warned about once.
+
+`model` is part of the embeddings' primary key, which is what makes a swap a
+data operation:
+
+```sql
+delete from asset_embeddings where model = 'siglip2-so400m-patch14-384';
+```
+
+Restart, and the reconcile queues the library again — fifteen minutes, not an
+hour and a half, because the renditions are already on disk and decoding them
+again is the expensive half. That is why `mlprep` and `vision` are separate
+kinds. Two models can also sit in the table together while they are compared;
+nothing requires the old rows to go first.
+
+### Searching by it, before there is a search endpoint
+
+`GET /v1/search` is a later step. Until then the query path is two commands —
+embed a phrase, then hand the vector to Postgres:
+
+```sh
+q=$(curl -s localhost:8789/embed -H 'content-type: application/json' \
+      -d '{"texts":["a dog on a beach"]}' \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["vectors"][0])' | tr -d " ")
+
+psql -c "
+  select a.original_filename, a.captured_at,
+         round((1 - min(e.embedding <=> '$q'))::numeric, 4) as similarity
+  from asset_embeddings e join assets a on a.id = e.asset_id
+  where e.model = 'siglip2-so400m-patch14-384'
+  group by a.id
+  order by min(e.embedding <=> '$q')
+  limit 20"
+```
+
+`min(distance)` grouped by asset is the ranking rule: a clip is as relevant as
+its best frame, and averaging its six frames into one number would make a video
+that is half beach and half restaurant neither.
+
+The vectors are unit length — photo-ml normalises before it answers — so cosine
+distance is `1 - dot`, similarities from different frames are comparable, and
+`<=>` over `halfvec_cosine_ops` is what the index was built for.
 
 ## What only the phone knows
 

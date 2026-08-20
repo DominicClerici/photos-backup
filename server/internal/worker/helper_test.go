@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -210,4 +211,32 @@ func ensureTestDatabase(t *testing.T, ctx context.Context, adminURL string) {
 	if _, err := conn.Exec(ctx, fmt.Sprintf("create database %s", pgx.Identifier{testDBName}.Sanitize())); err != nil {
 		t.Fatalf("create test database: %v", err)
 	}
+}
+
+// jobStateAndAttempts reads a job row by id, for the tests that care what a
+// failure cost rather than only that one happened.
+func (h *harness) jobStateAndAttempts(t *testing.T, id int64) (state string, attempts int) {
+	t.Helper()
+	if err := h.store.Pool().QueryRow(context.Background(),
+		"select state, attempts from jobs where id = $1", id).Scan(&state, &attempts); err != nil {
+		t.Fatalf("read job %d: %v", id, err)
+	}
+	return state, attempts
+}
+
+// jobStateOrNone is jobState for the tests where the absence of a job is the
+// thing being asserted — a vision pass on a machine with no photo-ml, or one
+// queued before the renditions it reads exist.
+func (h *harness) jobStateOrNone(t *testing.T, assetID string, kind jobs.Kind) string {
+	t.Helper()
+	var state string
+	err := h.store.Pool().QueryRow(context.Background(),
+		`select state from jobs where asset_id = $1::uuid and kind = $2`, assetID, string(kind)).Scan(&state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("read job state: %v", err)
+	}
+	return state
 }

@@ -85,6 +85,11 @@ type Config struct {
 	// for it — but unlike the signature pass each item is one ImageMagick
 	// rather than twenty sampled frames, so a second worker is worth having.
 	PrepConcurrency int
+	// VisionConcurrency sizes the pool that hands those renditions to photo-ml.
+	// One by default and rarely worth more: it is a queue in front of a single
+	// GPU, and a second worker does not make the card faster — it makes two
+	// requests wait on it.
+	VisionConcurrency int
 	// PreviewConcurrency caps simultaneous on-demand preview conversions, so a
 	// fast scroll cannot fork an ImageMagick per request.
 	PreviewConcurrency int
@@ -99,6 +104,18 @@ type Config struct {
 	// nothing drains it. Useful when the derivative tooling is missing or being
 	// upgraded, and it is what a separate photo-worker process would need.
 	WorkerDisabled bool
+
+	// MLURL is where photo-ml is listening, e.g. http://127.0.0.1:8789. Empty
+	// means there is none, and empty is a supported way to run this archive
+	// forever: PROJECT.md §4's hard rule is that photo-ml is optional, so the
+	// default is off and turning it on is a deliberate line in an env file.
+	//
+	// Without it the vision pool is not started and no vision work is queued —
+	// not "queued and never drained", which would leave a machine with no GPU
+	// service reporting a permanent seventeen-thousand-item backlog for a
+	// feature it does not have. Setting this and restarting is what turns the
+	// whole library into queued work. See jobs.ReconcileVision.
+	MLURL string
 
 	// VideoEncoder is the ffmpeg encoder for playback renditions. libx264 works
 	// everywhere; the archive machine's NVIDIA card runs h264_nvenc, which
@@ -159,11 +176,14 @@ func FromEnv() Config {
 		SignatureConcurrency: positive(os.Getenv("SIGNATURE_CONCURRENCY"), 1),
 		TranscodeConcurrency: positive(os.Getenv("TRANSCODE_CONCURRENCY"), 1),
 		PrepConcurrency:      positive(os.Getenv("PREP_CONCURRENCY"), 2),
+		VisionConcurrency:    positive(os.Getenv("VISION_CONCURRENCY"), 1),
 		PreviewConcurrency:   positive(os.Getenv("PREVIEW_CONCURRENCY"), 4),
 		WorkerDisabled:       truthy(os.Getenv("WORKER_DISABLED")),
 
 		LivePreviewConcurrency: positive(os.Getenv("LIVE_PREVIEW_CONCURRENCY"), 2),
 		LivePreviewCacheBytes:  int64(positive(os.Getenv("LIVE_PREVIEW_CACHE_MB"), 64)) << 20,
+
+		MLURL: strings.TrimSpace(os.Getenv("ML_URL")),
 
 		VideoEncoder: or(os.Getenv("VIDEO_ENCODER"), "libx264"),
 
