@@ -69,7 +69,9 @@ something that is already a square WebP of the right dimensions.
 ## Sections
 
 `/` is the gallery; `/collections`, `/status`, `/search` and `/other` are routes
-of their own. `/status` is the server's dashboard — how much is archived, how
+of their own. Search is the one tab that is not a link: it opens the command
+palette in place, and the route behind it is where that palette sends a question
+it has finished asking. See Searching. `/status` is the server's dashboard — how much is archived, how
 much of the drive is left, what the queue is doing, and every failed job with
 its error and a button that copies the details as Markdown. The bar that
 switches between them is
@@ -257,6 +259,47 @@ The toggle stays where it was put as you step between photos. Memories arrive in
 runs, and someone who turned the captions off to look at one almost always wants
 the next one the same way.
 
+### What the panel knows
+
+`I`, or the button at the top right, opens the details panel — a sidebar on a
+wide screen, a bottom sheet under 700px. It leads with what the models said
+about the photograph and ends with what the camera recorded, because the first
+is what the picture is *of* and the second is how it was taken.
+
+The ML half is `/v1/assets/{id}/analysis`, fetched on its own and only while the
+panel is open: the detail above it is on every arrow-key press, and recognised
+text is unbounded — a photograph of a terminal is kilobytes of it, which nobody
+stepping through the grid with the panel shut has asked to download.
+
+It draws the caption, the tags in the captioner's own confidence order, the
+people, anything a person typed under the photograph at import, and the whole of
+the recognised text in a scrolling block. A tag or a name is a button: clicking
+one asks the archive for everything else it was called that. A search rather
+than a filter on the current view, because "what else did it call a beach" is a
+question about the archive and not a narrowing of the album that happens to be
+open.
+
+**Nothing here is drawn as a blank.** A photograph with no caption is one the
+captioner has not reached, one it failed on, or one nothing has ever queued, and
+the panel says which — a sentence per pass, and none at all for a photograph
+that has been all the way through. That is the parser warning in `ML_IMAGES.md`
+§11 one surface further out: a model that silently says nothing looks exactly
+like a photograph with nothing in it, and the two are not the same news.
+
+Two things the panel deliberately keeps apart. A tag carries an asterisk when a
+merge has folded it into another word, and the tooltip says what was actually
+written — the vocabulary cleanup is a data operation over thousands of strings
+and has to be reviewable from the photographs it changed. And **people are not
+tags**: a name somebody confirmed at import and a word a model produced are
+different kinds of claim, drawn in different chips with the source spelled out,
+because the day face clustering arrives those confirmed names are what will name
+the clusters.
+
+In the vault the panel draws the same fields from the sealed document, and
+nothing in it is clickable. A hidden photograph's names came out of the vault,
+and typing one into `/v1/search` would put it in the URL, in the browser's
+history, and in the list of recent searches this app keeps.
+
 ## Selecting, and deleting
 
 A selection is **runs of timeline indices**, not a set of ids. The grid is
@@ -302,6 +345,84 @@ The reload is not an optimisation to skip. A delete moves every index after it,
 so the day table the grid was drawn from is describing a timeline that no longer
 exists; patching tiles out in place would leave the geometry lying about what is
 where. `timeline.retry()` refetches the table and the pages hanging off it.
+
+## Searching
+
+Two surfaces, one endpoint. The palette is where a question is asked; `/search`
+is where the whole answer lives.
+
+`CommandPalette` is mounted once by the root layout and opened from anywhere —
+`⌘K`/`ctrl-K`, or the Search tab, which is a button rather than a link. A search
+is a question rather than a destination, and sending somebody to an empty
+results page in order to type into it is one screen between the thought and the
+answer. The route still exists and is still what the tab highlights for; it is
+where the palette hands the ranking over to.
+
+It is a *palette* rather than a search box because of what comes next: a typed
+sentence will eventually name an action as well as a subject, and the difference
+between the two should be a group in the list rather than a second surface.
+Nothing in it filters locally — `shouldFilter` is off, because the list is an
+answer the server ranked and cmdk's fuzzy match over six captions would be a
+second, worse opinion drawn on top of a fused one.
+
+Typing waits 300ms before asking. A search here is not a filter over a local
+list: it is a parse, a text encoding on the GPU, and a fused scan of two
+rankings. The previous answer stays on screen, dimmed, while the next one is in
+flight, so the palette never flashes empty between keystrokes. An emptied box
+clears instantly — there is nothing to wait for, and that is what makes
+backspace feel like an undo.
+
+### The URL is the request
+
+`/search` reads its query straight out of the URL and `lib/search.requestOf`
+passes on only the parameters `/v1/search` reads — `asset`, which is the open
+photograph, is the page's own business. So a search is linkable, and Back is an
+undo.
+
+`?q=` alone asks the server to read the sentence. Taking a chip off rewrites the
+URL into the explicit spelling — `parse=0` beside the fields that survived —
+because a parse can be merged on top of but never subtracted from. That is the
+whole of `lib/search`: `explicitParams` materialises a reading into parameters,
+`withoutChip` leaves one out, and both are pure and unit-tested. A date is one
+chip and comes off at both ends; the phrase is emptied rather than dropped,
+since an absent `visual` means "fall back to what was typed". See server/README
+§ The response echoes the parse.
+
+### The grid is the gallery's
+
+`Timeline` draws it, with `ranked` set. The day table is one run with no date,
+which `lib/layout.headless` already renders as a flat wall of tiles with no
+headings and no room reserved for them — relevance is the answer to the question
+that was asked, and chronology is not.
+
+`ranked` also stops the grid claiming the floating sort-and-filter pill. There is
+no order to choose here and the filter is the query; a pill offering "Newest"
+over a relevance ranking would either do nothing or throw the answer away. The
+chips are the filter and they are on the page.
+
+`useSearch` is `useTimeline`'s contract over an offset-paged ranking. Three
+things differ, and each is a property of ranking rather than an omission. It
+never uses a cursor, because this order's sort key is computed from the query
+and exists on no row. The first page settles the question — it comes back with
+the server's reading, and every later page is asked for in that reading's own
+terms, so the parser runs once per search rather than once per page and page
+four cannot disagree with page one. And there is no resync: a photograph
+uploaded mid-search does not shift a ranking it has no place in.
+
+### Selecting in a ranking
+
+Every other grid names a selection by position, because the day table gives
+every photograph a place before any of them are downloaded and "everything below
+here" is one interval rather than forty thousand identifiers. A ranking has no
+such table, so a range means nothing off the page — index 2 of "phoenix at the
+beach" is index 2 of nothing the server can reconstruct.
+
+`useSearchActions` wraps the library's own actions and spells the positions out
+into ids first, fetching whatever pages the selection covers. It travels with no
+filter and no view, and the absence is the point: both exist to make a position
+mean something, and by the time any of this reaches the server there are no
+positions left in it. `SelectionActions.resolve` is the same step for the one
+request the grid builds rather than spends — the create-album dialog.
 
 ## Recently Deleted
 

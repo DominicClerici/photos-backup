@@ -73,11 +73,13 @@ DELETE /v1/uploads/{id}          abandon
 POST /v1/assets/{id}/import-metadata   an export's sidecar for an archived asset
 
 open:
+GET  /v1/search                  a sentence, and the photographs it was about
 GET  /v1/timeline                JSON page; keyset cursor or row offset
 GET  /v1/timeline/days           every heading in the collection and its size
 GET  /v1/timeline/locate         where one asset sits, for a link that names an id
 POST /v1/timeline/states         re-read derivative state for specific ids
 GET  /v1/assets/{id}             JSON metadata for the viewer panel
+GET  /v1/assets/{id}/analysis    what the ML passes said about this one photo
 GET  /v1/assets/{id}/original    exact stored bytes
 GET  /v1/assets/{id}/thumb       stored 256px square WebP
 GET  /v1/assets/{id}/thumb/{px}  the same square at 96, 256 or 512
@@ -730,33 +732,234 @@ again is the expensive half. That is why `mlprep` and `vision` are separate
 kinds. Two models can also sit in the table together while they are compared;
 nothing requires the old rows to go first.
 
-### Searching by it, before there is a search endpoint
+### And what it is of, in words
 
-`GET /v1/search` is a later step. Until then the query path is two commands —
-embed a phrase, then hand the vector to Postgres:
+Two more passes over the same renditions, each its own job kind and each
+draining through the same pool:
+
+| kind | model | cost over the library | what it writes |
+|---|---|---|---|
+| `vision` | `siglip2-so400m-patch14-384` | 16 min | `asset_embeddings`, one row per frame |
+| `ocr` | `rapidocr` (ONNX, CPU) | ~30 min | `asset_ocr` |
+| `describe` | `qwen3-vl-4b-instruct` | 3–7 h | `asset_descriptions`, `tags`, `asset_tags` |
+
+Three kinds rather than one, and the reason is the third column. Re-embedding
+the library is fifteen minutes and re-captioning it is hours, so a single job
+would tie every encoder bench to a full re-captioning — the same coupling
+`mlprep` was split out to avoid, one step further along. Swapping the captioner
+is `delete from asset_descriptions where model = '...'` and one command; it
+touches neither the vectors nor the recognised text.
+
+The pool drains them **in that order**, cheapest first, because they are three
+passes over one archive in front of one GPU and FIFO across them would
+interleave the three so that all three finished at the end. See
+`jobs.ClaimInOrder` — it is the only pool that ranks its kinds, deliberately.
+
+A photograph gets one frame; a video gets three, the first, the middle and the
+last of whatever `mlprep` managed to sample. Their captions are joined and their
+tags unioned, so a clip that opens on a beach and ends in a restaurant is
+findable as both. The recognised text is deduplicated across those frames, which
+matters more than it sounds: a Snapchat memory carries its caption burned into
+every frame by construction, and storing it three times would rank that video as
+though the words were three times as present as they are.
+
+**The backfill is a command, not a reconcile.** Every other pass here is queued
+by a restart; this one is not, because four hours of GPU begun by a
+`systemctl restart photod` is a restart with a surprise in it — the same
+objection migrations 0016 and 0017 made to queueing from a migration. New
+uploads are still described the ordinary way, a minute after they land.
 
 ```sh
-q=$(curl -s localhost:8789/embed -H 'content-type: application/json' \
-      -d '{"texts":["a dog on a beach"]}' \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["vectors"][0])' | tr -d " ")
-
-psql -c "
-  select a.original_filename, a.captured_at,
-         round((1 - min(e.embedding <=> '$q'))::numeric, 4) as similarity
-  from asset_embeddings e join assets a on a.id = e.asset_id
-  where e.model = 'siglip2-so400m-patch14-384'
-  group by a.id
-  order by min(e.embedding <=> '$q')
-  limit 20"
+photobackup ml status                              how far the passes have got
+photobackup ml backfill                            the whole library
+photobackup ml backfill --stills 1000 --videos 20  a sample, newest first
+photobackup ml backfill --kind ocr                 one pass at a time
+photobackup ml reindex                             rebuild the tsvector
 ```
 
-`min(distance)` grouped by asset is the ranking rule: a clip is as relevant as
-its best frame, and averaging its six frames into one number would make a video
-that is half beach and half restaurant neither.
+Because it is typed, it can be bounded — which is what makes a thousand
+photographs and twenty clips an evening's worth of vocabulary to build a search
+page against, rather than a choice between nothing and everything.
 
-The vectors are unit length — photo-ml normalises before it answers — so cosine
-distance is `1 - dot`, similarities from different frames are comparable, and
-`<=>` over `halfvec_cosine_ops` is what the index was built for.
+### Reading it back for one photograph
+
+```
+GET /v1/assets/{id}/analysis
+```
+
+A search read backwards. `/v1/search` takes a sentence and ranks photographs out
+of these four tables; this takes a photograph and hands back the words the
+ranking was built from — the caption, the tags with the merge resolved and the
+model's own word beside it, the recognised text unabridged, and how many frames
+the encoder wrote. It is what the viewer's panel draws, and it is the only way
+to see what the captioner actually called something, which is what step 9's tag
+cleanup has to be read through.
+
+It carries the **state of each ML job** as well, and that is the part worth
+defending. An asset with no caption is one the captioner has not reached, or one
+it failed on, or one nothing has ever queued — three different pieces of news
+that a panel drawing all of them as an empty box would report as the same
+silence. `jobs` is what lets the difference be said out loud.
+
+Its own route rather than four more fields on `/v1/assets/{id}`, for two reasons
+that point the same way: the detail load is on every arrow-key press through the
+viewer and the panel is a toggle, and recognised text is unbounded where every
+other field on that response is a scalar. A screenshot of a terminal is
+kilobytes of it.
+
+Nothing is read for an asset in the vault. The write paths all refuse a sealed
+asset so the tables are empty for those rows anyway — the guard is repeated
+because "the tables happen to be empty" is a fact about the past.
+
+## Searching
+
+```
+GET /v1/search?q=phoenix at the beach last summer
+```
+
+A query is two questions with different right answers. The name and the date
+range must be exact; *at the beach* must be fuzzy. So it is split, answered
+separately, and fused.
+
+```
+"phoenix at the beach last summer"
+   ↓ parse
+ person=Phoenix AND sort_time in [2025-06-01, 2025-09-30]
+   + vector("at the beach") ⊕ fts("at the beach")   → RRF → ranked
+```
+
+The structured half becomes a `db.TimelineFilter` — the same one the gallery's
+own timeline uses, which gained a date range, a place and a tag for this and
+nothing else. No second query engine, and every existing index still applies.
+
+### The parser
+
+`internal/searchquery`, a deterministic Go grammar, and it is the parser. It
+reads dates (`last summer`, `christmas 2019`, `between 2019 and 2021`, `90s`,
+`past three weeks`), matches names and places against **what this archive
+actually contains**, and hands whatever is left to the encoder as the visual
+phrase.
+
+Two properties make it safe to trust.
+
+**It only recognises what is here.** People come from `asset_people`, places from
+the geocoded columns. "Phoenix" is a person because there are 1,601 photographs
+of one; in an archive with no Phoenix it is a word for the fuzzy half. A parser
+that recognised names in general would invent filters matching nothing, which
+from the outside looks exactly like an empty library.
+
+**Every range it produces is generous.** Christmas is a week, summer runs to the
+end of September, and "last summer" in August is last year's — because a window
+slightly too wide costs a few extra tiles at the bottom of a ranked page, and a
+window slightly too narrow costs the answer *and* the reason.
+
+A few words are deliberately not understood. A bare "may" is not a month, a bare
+"fall" is not a season, and "photos" is not a filter — `show me photos of the
+beach` is a question about a beach, not an instruction to exclude every video in
+the archive. `only photos`, `stills` and `no videos` are how you say that.
+
+There is an explicit syntax underneath, for when a guess is not what is wanted:
+`person:chris_morrison`, `place:breckenridge`, `tag:dog`, `after:2019-06-01`,
+`kind:video`, `category:screenshots`. A value this archive does not hold is left
+where it was typed rather than becoming a filter that matches nothing.
+
+### Then the model, on top
+
+photo-ml's `/parse` runs after the grammar and is allowed to speak **only where
+the grammar was silent**. Everything it says is checked against the same
+vocabulary before any of it is believed:
+
+- a person only if the query mentions a word of that name — which is what turns
+  "chris" into `Chris Morrison`, and what stops a small model that parrots its
+  hint list from ANDing five people together
+- a place only if the query mentions it
+- a date range only if the query says something temporal at all, and only both
+  ends together — half a range from a model beside half from a grammar is a
+  window neither of them meant
+- a visual phrase only if every word of it was typed
+
+Media kind, category and favourites are not on its contract at all: the grammar
+answers those completely and a model can only disagree. Tags are not either —
+filtering by a word one model invented, chosen by another, is two guesses
+stacked.
+
+ML_IMAGES.md §11 is blunt about why: *a query parser fails confidently*. It
+decides "last summer" meant 2024, silently removes the right answer, and shows
+an empty grid with nothing to argue with. The asymmetry above means the failure
+mode left over is a parse that is too *narrow* — the model says something true
+and unverifiable and it gets dropped — which is the right direction to fail in.
+
+### Ranking
+
+Two rankings, fused inside the structured `WHERE`:
+
+- **vector** — the visual phrase through the text tower, nearest frames by
+  cosine distance, collapsed to their asset by `min()`. A clip is as relevant as
+  its best frame.
+- **full text** — `websearch_to_tsquery` over `asset_search`, one tsvector per
+  asset: caption and tags at weight A, recognised text and the imported
+  description at B, filename and place name at C.
+
+**Reciprocal-rank fusion**, k=60, rather than a weighted sum. Cosine similarity
+runs about 0.05–0.3 and clusters tightly; `ts_rank_cd` is unbounded and depends
+on how often a word appears in a caption. They are not on comparable scales, no
+rescaling makes them so, and tuning a weight between them is a job with no
+natural end. Fusing the ranks throws the magnitudes away and keeps the only
+thing both lists agree on.
+
+A filtered vector search needs `hnsw.iterative_scan` — without it a search for a
+person who is 9% of the library can walk forty neighbours, find none of them
+match, and return nothing while the photographs sit right there. `db.Search`
+sets it per transaction.
+
+### The response echoes the parse
+
+This is where the UX is won. The response carries back exactly what the server
+understood — people, place, `after`, `before`, kind, category, and the visual
+phrase that went to the encoder — so the page can draw `Phoenix ×` and
+`Jun–Sep 2025 ×` as removable chips. A wrong parse is then visible and fixed
+with one click rather than by retyping the sentence and hoping. **A search is an
+editable filter, not an oracle.**
+
+`parse=0` is the other half of that: with it, nothing is guessed. The filter
+comes from explicit parameters (`person=`, `place=`/`city=`/`admin1=`/`country=`,
+`after=`, `before=`, `kind=`, `category=`, `favorites=`, `tag=`) and the phrase
+from `visual=`, so removing a chip is omitting a parameter. Removing something a
+parser inferred is not expressible any other way.
+
+`visual` is read by presence rather than by content, and that distinction is
+load-bearing. Absent, it falls back to `q` — a caller that sent only a sentence
+meant the whole sentence. *Present and empty* is the opposite claim and is
+believed: "phoenix", all of which is a name, has no phrase for the encoder at
+all, and ranking it by the word the filter has already answered exactly would
+put every photograph with "phoenix" in a caption above the 1,601 of the person.
+Taking the phrase chip off is exactly this, which is why it is spelled rather
+than omitted.
+
+### When photo-ml is down
+
+`/v1/search` still answers, and says so in a `degraded` field. What is lost is
+the vector ranking — the ability to find a beach nobody wrote the word "beach"
+about. What is not lost is the search box, the grammar, the date and place
+filters, or full-text search over every caption, tag, recognised line, filename
+and place name the last backfill left in Postgres.
+
+There is one more fallback inside the ranking itself. When the fuzzy half
+produces no candidates at all but the structured half narrowed something, the
+filter's own answer stands, in date order — because "Phoenix, last summer, and
+no caption in the library mentions a beach" should not be an empty grid. When
+the filter narrowed nothing, an unmatched phrase is genuinely no results, and
+answering it with 17,788 photographs would be worse than saying so.
+
+### Trying it
+
+```sh
+curl -s --get --data-urlencode 'q=phoenix at the beach last summer' \
+     localhost:8788/v1/search | python3 -m json.tool
+```
+
+The `query` object in the response is the parse. If a search surprises you, read
+that first — nine times in ten the answer is there rather than in the model.
 
 ## What only the phone knows
 
@@ -1203,6 +1406,10 @@ photobackup verify [--deep] [--fix]     audit the archive against itself
 photobackup export --to DIR [--copy]    materialize a date tree of hardlinks
 photobackup reindex [--adopt-orphans]   rebuild the database from manifest.jsonl
 photobackup geocode [--all]             name the places photographs were taken
+photobackup ml status                   how far the captioning passes have got
+photobackup ml backfill [--kind K]      queue them; --stills N --videos N bounds
+  [--stills N] [--videos N]             a sample, newest first
+photobackup ml reindex                  rebuild the full-text index
 photobackup import --from DIR [--from…] ingest a Google Photos export
 photobackup import-snapchat --from DIR  ingest a Snapchat export, one half at a
   [--half memories|chat] [--from…]      time; --from once per unzipped zip
@@ -1231,6 +1438,16 @@ longer matches its own name is a human with a second copy.
 | 0 | intact |
 | 1 | findings, none of them lost or damaged originals |
 | 2 | originals missing or no longer matching their hash |
+
+**ml** is the one backfill in this tool that is a command rather than a
+reconcile. Every other pass here is queued by a restart; captioning is hours of
+GPU, and a `systemctl restart photod` that quietly begins hours of GPU work is a
+restart with a surprise in it. Because it is typed, it can also be *bounded* —
+`--stills 1000 --videos 20` takes the newest of each, which is an evening's
+worth of vocabulary to build a search page against rather than a choice between
+nothing and everything. `ml reindex` is for after a tag merge or a re-geocode:
+both change one column somewhere else and neither knows what a tsvector is. See
+[Searching](#searching).
 
 **export** materializes `YYYY/YYYY-MM-DD/original-filename` as hardlinks to the
 blobs, using the same sort time and UTC offset the gallery groups on. The blob

@@ -10,10 +10,13 @@
 // archive that nobody is waiting for must not be in front of the work somebody
 // is.
 //
-// The fifth is the only one that can be absent. It talks to photo-ml, which the
-// archive is allowed not to have, so it is started only when one is configured
-// and it asks whether the service is there before it claims anything. See
-// vision.go.
+// The fifth is the only one that can be absent, and the only one whose kinds
+// are ranked rather than pooled. It talks to photo-ml, which the archive is
+// allowed not to have, so it is started only when one is configured and it asks
+// whether the service is there before it claims anything; and it holds three
+// kinds costing fifteen minutes, twenty minutes and four hours over the same
+// library, which it drains in that order rather than interleaved. See vision.go
+// and describe.go.
 package worker
 
 import (
@@ -134,9 +137,14 @@ type Runner struct {
 	// noGeocoder makes "the extract is not installed" a single line in the log
 	// rather than one per photograph with a GPS fix.
 	noGeocoder sync.Once
-	// wrongModel does the same for a photo-ml running a checkpoint this
-	// database is not indexed for: worth saying, not worth saying per asset.
-	wrongModel sync.Once
+	// wrongModel and its two neighbours do the same for a photo-ml running a
+	// checkpoint this database does not expect: worth saying, not worth saying
+	// per asset. Three of them rather than one, because the three models are
+	// swapped independently and a warning about the encoder must not silence
+	// the one about the captioner.
+	wrongModel      sync.Once
+	wrongCaptioner  sync.Once
+	wrongRecogniser sync.Once
 
 	// The vision pool's shared view of whether photo-ml is up. Shared so that
 	// the probe rate is a property of the interval rather than of
@@ -179,26 +187,38 @@ func (r *Runner) Start(ctx context.Context) {
 	}
 
 	for i := range r.metadataWorkers() {
-		r.spawn(ctx, fmt.Sprintf("metadata-%d", i), []jobs.Kind{jobs.KindMetadata})
+		r.spawn(ctx, pool{id: fmt.Sprintf("metadata-%d", i), kinds: []jobs.Kind{jobs.KindMetadata}})
 	}
 	// The transcode pool takes the merges as well. Both are ffmpeg over a whole
 	// video, both are minutes rather than milliseconds, and a merge that had its
 	// own pool would be a fourth set of goroutines competing for the same cores.
 	for i := range r.transcodeWorkers() {
-		r.spawn(ctx, fmt.Sprintf("transcode-%d", i), []jobs.Kind{jobs.KindPlayback, jobs.KindMerge})
+		r.spawn(ctx, pool{id: fmt.Sprintf("transcode-%d", i), kinds: []jobs.Kind{jobs.KindPlayback, jobs.KindMerge}})
 	}
 	for i := range r.signatureWorkers() {
-		r.spawn(ctx, fmt.Sprintf("signature-%d", i), []jobs.Kind{jobs.KindSignature})
+		r.spawn(ctx, pool{id: fmt.Sprintf("signature-%d", i), kinds: []jobs.Kind{jobs.KindSignature}})
 	}
 	for i := range r.prepWorkers() {
-		r.spawn(ctx, fmt.Sprintf("prep-%d", i), []jobs.Kind{jobs.KindMLPrep})
+		r.spawn(ctx, pool{id: fmt.Sprintf("prep-%d", i), kinds: []jobs.Kind{jobs.KindMLPrep}})
 	}
 	// Not started at all when photo-ml was not configured, rather than started
 	// and permanently idle. A pool that exists is a promise that the work will
 	// eventually happen, and on a machine with no GPU service it will not.
+	//
+	// One pool for all three ML kinds, and the order of that slice is the
+	// order they drain in — see jobs.ClaimInOrder. Cheapest first: fifteen
+	// minutes of embedding, then twenty of reading text, then four hours of
+	// captioning. FIFO across the three would interleave them so that all three
+	// finished at the end, and would have the captioner and the recogniser
+	// loading past each other on a card that fits one of them at a time.
 	if r.ML != nil {
 		for i := range r.visionWorkers() {
-			r.spawnGated(ctx, fmt.Sprintf("vision-%d", i), []jobs.Kind{jobs.KindVision}, r.mlAvailable)
+			r.spawn(ctx, pool{
+				id:      fmt.Sprintf("vision-%d", i),
+				kinds:   []jobs.Kind{jobs.KindVision, jobs.KindOCR, jobs.KindDescribe},
+				gate:    r.mlAvailable,
+				ordered: true,
+			})
 		}
 	}
 
@@ -225,18 +245,30 @@ func (r *Runner) Nudge() {
 	}
 }
 
-func (r *Runner) spawn(ctx context.Context, id string, kinds []jobs.Kind) {
-	r.spawnGated(ctx, id, kinds, nil)
+// pool is one worker: what it claims, in what order, and what has to be true
+// before it claims anything.
+//
+// A struct rather than four parameters because the last two are used by exactly
+// one of the five pools, and a call site reading spawn(ctx, id, kinds, nil,
+// false) says nothing about which nil and which false.
+type pool struct {
+	id    string
+	kinds []jobs.Kind
+	// gate is asked before every claim, and a false answer means the worker
+	// waits rather than taking a job it cannot do.
+	//
+	// Only the ML pool has one. Every other kind of work here needs a file and
+	// a subprocess, both of which are either there at startup or reported
+	// missing then; this one needs a service that is allowed to be restarted
+	// underneath it.
+	gate func(context.Context) bool
+	// ordered makes kinds a priority list rather than a set. See
+	// jobs.ClaimInOrder for why exactly one pool wants that and the others must
+	// not have it.
+	ordered bool
 }
 
-// spawnGated is spawn for a pool whose work depends on something outside this
-// process. The gate is asked before every claim, and a false answer means the
-// worker waits rather than taking a job it cannot do.
-//
-// Only the vision pool uses one. Every other kind of work here needs a file and
-// a subprocess, both of which are either there at startup or reported missing
-// then; this one needs a service that is allowed to be restarted underneath it.
-func (r *Runner) spawnGated(ctx context.Context, id string, kinds []jobs.Kind, gate func(context.Context) bool) {
+func (r *Runner) spawn(ctx context.Context, p pool) {
 	nudge := make(chan struct{}, 1)
 	r.mu.Lock()
 	r.nudges = append(r.nudges, nudge)
@@ -245,11 +277,16 @@ func (r *Runner) spawnGated(ctx context.Context, id string, kinds []jobs.Kind, g
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		r.loop(ctx, id, kinds, nudge, gate)
+		r.loop(ctx, p, nudge)
 	}()
 }
 
-func (r *Runner) loop(ctx context.Context, id string, kinds []jobs.Kind, nudge <-chan struct{}, gate func(context.Context) bool) {
+func (r *Runner) loop(ctx context.Context, p pool, nudge <-chan struct{}) {
+	id, kinds, gate := p.id, p.kinds, p.gate
+	claim := r.Queue.Claim
+	if p.ordered {
+		claim = r.Queue.ClaimInOrder
+	}
 	ticker := time.NewTicker(r.pollInterval())
 	defer ticker.Stop()
 
@@ -268,7 +305,7 @@ func (r *Runner) loop(ctx context.Context, id string, kinds []jobs.Kind, nudge <
 			continue
 		}
 
-		job, err := r.Queue.Claim(ctx, kinds, id)
+		job, err := claim(ctx, kinds, id)
 		switch {
 		case errors.Is(err, jobs.ErrNoJob):
 			// Idle: wait to be told, or look again on the next tick.
@@ -386,11 +423,18 @@ func (r *Runner) run(ctx context.Context, job jobs.Job) (err error) {
 		return r.runSignature(ctx, job.AssetID)
 	case jobs.KindMLPrep:
 		return r.runMLPrep(ctx, job.AssetID)
-	case jobs.KindVision:
+	case jobs.KindVision, jobs.KindOCR, jobs.KindDescribe:
 		if r.ML == nil {
 			return errors.New("no photo-ml configured; set ML_URL or this work has nothing to run on")
 		}
-		return r.runVision(ctx, job.AssetID)
+		switch job.Kind {
+		case jobs.KindVision:
+			return r.runVision(ctx, job.AssetID)
+		case jobs.KindOCR:
+			return r.runOCR(ctx, job.AssetID)
+		default:
+			return r.runDescribe(ctx, job.AssetID)
+		}
 	case jobs.KindMerge:
 		if r.Manifest == nil {
 			return errors.New("no manifest log configured; refusing to archive a joined recording that a rebuild could not recover")

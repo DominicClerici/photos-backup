@@ -229,6 +229,46 @@ type TimelineFilter struct {
 	// Unalbumed keeps what is in no album — the pile left over after the
 	// organising, which is the whole reason to ask for it.
 	Unalbumed bool
+
+	// The three the search box added. They are facets like the ones above —
+	// adjectives, combining freely — rather than collections, which is why they
+	// sit here and not beside AlbumID.
+
+	// After and Before bound sort_time, and both are inclusive of the whole
+	// civil day they name: "June 2025" is 2025-06-01 to 2025-06-30 and holds
+	// everything taken on the 30th. Inclusive because both ends are shown to a
+	// person as a removable chip, and an exclusive end would put a month in the
+	// chip that was not in the question. Compared in UTC, which can file a
+	// photograph taken at 11pm on the last day under the next one — the ranges
+	// the parser produces are generous enough to absorb that, deliberately.
+	//
+	// The comparison lands on assets_timeline_visible_idx's leading column, so
+	// a date range is a narrowed index scan rather than a filter over one.
+	After  *time.Time
+	Before *time.Time
+
+	// Place is where, at whichever of the three levels was named. Exactly one
+	// of its fields is set: which one decides which column is compared, and
+	// matching "California" against place_city would find nothing while looking
+	// like it worked.
+	Place *Place
+
+	// Tags keeps assets carrying any of these, resolved through
+	// tags.canonical_id — so a filter for "dog" finds what the model called a
+	// puppy, and a merge takes effect here without anything being rewritten.
+	//
+	// Any rather than all. The vocabulary is free-form and a model that wrote
+	// "dog" about one photograph and "puppy" about the next is the ordinary
+	// case rather than the pathological one; an intersection over two words
+	// from that vocabulary is usually empty. Precision comes from the ranking,
+	// not from this.
+	Tags []string
+
+	// People is the conjunction Person is not. Person names a collection — one
+	// person's page, at most one at a time — and this is the search's version:
+	// "phoenix and dominic" means both are in the photograph, so every name
+	// here is an AND.
+	People []string
 }
 
 // ErrUnknownKind names a media kind that is neither of the two.
@@ -302,6 +342,10 @@ func (f TimelineFilter) scope() string {
 // ErrUnknownCategory names a category key that no predicate matches.
 var ErrUnknownCategory = errors.New("db: unknown category")
 
+// ErrUnknownPlace names a place filter that carries no level at all, which is a
+// caller bug rather than a request that found nothing.
+var ErrUnknownPlace = errors.New("db: place names no city, state or country")
+
 // where renders the filter as a SQL fragment plus the arguments it needs,
 // numbered from next.
 func (f TimelineFilter) where(next int) (string, []any, error) {
@@ -330,6 +374,54 @@ func (f TimelineFilter) where(next int) (string, []any, error) {
 		// No argument: the predicate is one of ours, from a closed list, and
 		// never carries anything the request supplied.
 		clauses = append(clauses, pred)
+	}
+
+	for _, name := range f.People {
+		clauses = append(clauses, fmt.Sprintf(
+			`exists (select 1 from asset_people p
+			         where p.asset_id = a.id and p.name = $%d)`, next))
+		args = append(args, name)
+		next++
+	}
+
+	if f.After != nil {
+		clauses = append(clauses, fmt.Sprintf(`a.sort_time >= $%d`, next))
+		args = append(args, f.After.UTC())
+		next++
+	}
+	if f.Before != nil {
+		// The day named is included whole, which is what the chip says. A
+		// half-open comparison against the following midnight rather than
+		// `<= 23:59:59`, so nothing taken in the last second of the day falls
+		// through a gap between two representations of "the end".
+		clauses = append(clauses, fmt.Sprintf(`a.sort_time < $%d`, next))
+		args = append(args, f.Before.UTC().AddDate(0, 0, 1))
+		next++
+	}
+
+	if f.Place != nil {
+		column, value := f.Place.column()
+		if column == "" {
+			return "", nil, fmt.Errorf("%w: a place naming nothing", ErrUnknownPlace)
+		}
+		clauses = append(clauses, fmt.Sprintf(`a.%s = $%d`, column, next))
+		args = append(args, value)
+		next++
+	}
+
+	if len(f.Tags) > 0 {
+		// Resolved through the merge on the way out, which is what
+		// canonical_id is for: the row records the word the model wrote, and
+		// this is where "puppy" becomes "dog" — everywhere at once, and
+		// reversibly.
+		clauses = append(clauses, fmt.Sprintf(`exists (
+			select 1 from asset_tags at
+			join tags tag on tag.id = at.tag_id
+			left join tags canonical on canonical.id = tag.canonical_id
+			where at.asset_id = a.id
+			  and coalesce(canonical.name, tag.name) = any($%d::text[]))`, next))
+		args = append(args, f.Tags)
+		next++
 	}
 
 	if f.Kind != "" {

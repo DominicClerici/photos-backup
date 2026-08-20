@@ -94,9 +94,59 @@ export type PhotoKitAsset = {
   isLive: boolean;
 };
 
+/**
+ * One asset in an iCloud Shared Album: everything the library enumerator
+ * reports, plus what the survey needs in order to say what sharing did to it.
+ *
+ * The dimensions and the duration are the answer to "is Apple's copy worth
+ * archiving", and PhotoKit knows them without a byte being fetched. The resource
+ * inventory is the follow-up question: a lone `photo` means the downscaled
+ * render is all there is, and a `fullSizePhoto` beside it would mean it is not.
+ */
+export type SharedAsset = PhotoKitAsset & {
+  pixelWidth: number;
+  pixelHeight: number;
+  /** Zero for a still. */
+  durationSeconds: number;
+  /** Expected to be exactly ['typeCloudShared']. Reported, not assumed. */
+  sourceTypes: OptionSetFact;
+  /** Apple's constant names, one per PHAssetResource the asset carries. */
+  resourceTypes: string[];
+};
+
+/**
+ * One shared album and its contents.
+ *
+ * The assets are nested rather than flattened because the album title is the
+ * only provenance a shared asset has, and one asset can belong to several
+ * albums. Deduplication is the caller's: whether an asset in three albums counts
+ * once or three times depends on what is being counted.
+ */
+export type SharedAlbum = {
+  localId: string;
+  title: string | null;
+  /** The album's own span, as PhotoKit reports it. Milliseconds. */
+  startDate: number | null;
+  endDate: number | null;
+  assets: SharedAsset[];
+};
+
+/** What one shared asset's primary resource turned out to be, once read. */
+export type SharedResourceRead = {
+  bytes: number;
+  /** Wall clock for the whole fetch, including whatever iCloud took. */
+  elapsedMs: number;
+  uniformTypeIdentifier: string | null;
+  originalFilename: string | null;
+  /** Which PHAssetResource was read — `photo`, `fullSizePhoto`, `video`, … */
+  resourceType: string;
+};
+
 type PhotoFactsNativeModule = {
   factsForAssetAsync(localId: string): Promise<PhotoKitFacts | null>;
   enumerateAsync(limit: number): Promise<PhotoKitAsset[]>;
+  sharedAlbumsAsync(): Promise<SharedAlbum[]>;
+  fetchSharedResourceAsync(localId: string): Promise<SharedResourceRead | null>;
   md5ForFileAsync(uri: string): Promise<string>;
 };
 
@@ -155,4 +205,41 @@ export async function photoKitEnumerate(limit: number): Promise<PhotoKitAsset[] 
 export async function photoKitMd5(uri: string): Promise<string | null> {
   if (!carries('md5ForFileAsync')) return null;
   return native!.md5ForFileAsync(uri);
+}
+
+/**
+ * Every iCloud Shared Album on the phone, or null when this build cannot ask.
+ *
+ * Null is "this build has no shared-album enumerator", never "there are none" —
+ * a phone with Shared Albums switched off in Settings answers with an empty
+ * array, and the two have to read differently or the survey reports a missing
+ * feature as an empty result.
+ *
+ * There is no `limit`. The library enumerator takes one because a camera roll is
+ * tens of thousands of assets and the caller may want the newest slice; shared
+ * albums are a handful of collections and the whole point is to see all of them.
+ */
+export async function photoKitSharedAlbums(): Promise<SharedAlbum[] | null> {
+  if (!carries('sharedAlbumsAsync')) return null;
+  return native!.sharedAlbumsAsync();
+}
+
+/**
+ * Reads one shared asset's bytes from iCloud and reports what came back.
+ *
+ * Rejects rather than resolving null when the read fails, for the same reason
+ * md5ForFileAsync does: the survey exists to find out how this fails, so a
+ * timeout, a withdrawn album or a resource that is not there has to arrive as an
+ * error and never as a successful read of zero bytes.
+ *
+ * Null still means the one thing it means everywhere else in this file: the
+ * build cannot. It also resolves null for an identifier that no longer names
+ * anything, which is the same answer photoKitFacts gives and for the same
+ * reason — a photo the owner has since deleted is not an error worth acting on.
+ */
+export async function photoKitReadSharedResource(
+  localId: string
+): Promise<SharedResourceRead | null> {
+  if (!carries('fetchSharedResourceAsync')) return null;
+  return (await native!.fetchSharedResourceAsync(localId)) ?? null;
 }

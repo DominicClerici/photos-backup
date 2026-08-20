@@ -37,10 +37,38 @@ class Settings:
     # wakeup and a comparison.
     sweep_seconds: float
 
-    # Largest batch /embed will accept in one request. The worker sends one
-    # image for a photograph and six for a video, so this is a bound on
-    # mistakes rather than a tuning knob.
+    # Largest batch /embed, /describe and /ocr will accept in one request. The
+    # worker sends one image for a photograph and three or six for a video, so
+    # this is a bound on mistakes rather than a tuning knob.
     max_batch: int
+
+    # How many images the captioner may put through one forward pass, across
+    # however many requests happened to arrive together. See batching.py: this
+    # is the difference between seven hours and two and a half over the whole
+    # library, and it is bounded by VRAM rather than by throughput — 8 images
+    # peaks at about 10.1GB, 16 at 11.2GB, and the card also has the encoder,
+    # the query parser and a desktop session on it.
+    describe_batch: int
+
+    # How long the collector waits for company before running a batch. Small,
+    # because it is latency every request pays and only a backfill benefits
+    # from; with photod's vision pool at its default concurrency the requests
+    # are already in flight and this only matters at the tail of a queue.
+    batch_window: float
+
+    # Which models this instance loads. Every one of them by default.
+    #
+    # Naming a subset is how two instances share one card: a captioning-only
+    # process during a backfill beside a search-only one answering queries, or a
+    # second instance holding a candidate encoder while the first goes on
+    # serving the archive. Nine gigabytes of captioner and two of encoder do not
+    # both fit twice, and "run it twice and compare" is the shape of every bench
+    # ML_IMAGES.md §9 describes.
+    #
+    # A route whose model is not loaded answers 404, which is the honest thing:
+    # photod's vision pool asks /health before it claims, and a service that
+    # does not offer /describe is one whose describe jobs should stay queued.
+    models: frozenset[str]
 
     # Where transformers caches weights. Set explicitly so the systemd unit can
     # give the service one writable directory and no home directory at all.
@@ -55,8 +83,30 @@ def from_env() -> Settings:
         idle_seconds=_positive_float(os.environ.get("PHOTO_ML_IDLE_SECONDS"), 300.0),
         sweep_seconds=_positive_float(os.environ.get("PHOTO_ML_SWEEP_SECONDS"), 15.0),
         max_batch=_positive_int(os.environ.get("PHOTO_ML_MAX_BATCH"), 32),
+        describe_batch=_positive_int(os.environ.get("PHOTO_ML_DESCRIBE_BATCH"), 8),
+        batch_window=_positive_float(os.environ.get("PHOTO_ML_BATCH_WINDOW_MS"), 30.0) / 1000,
+        models=_models(os.environ.get("PHOTO_ML_MODELS")),
         cache_dir=os.environ.get("PHOTO_ML_CACHE_DIR") or None,
     )
+
+
+# The keys, which are also the residency keys and the names in /health.
+ALL_MODELS = frozenset({"vision", "caption", "ocr", "parse"})
+
+
+def _models(value: str | None) -> frozenset[str]:
+    """Every model unless a subset is named, and unknown names are ignored.
+
+    Ignored rather than refused, for the reason every other setting here falls
+    back to its default: a typo in an env file should cost you a model, not the
+    service. What it costs is visible — /health lists what is registered — which
+    is where a typo is noticed.
+    """
+    if not value:
+        return ALL_MODELS
+    named = {name.strip().lower() for name in value.split(",") if name.strip()}
+    chosen = named & ALL_MODELS
+    return frozenset(chosen) if chosen else ALL_MODELS
 
 
 def _positive_int(value: str | None, fallback: int) -> int:

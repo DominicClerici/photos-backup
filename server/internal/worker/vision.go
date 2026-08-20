@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/dominicclerici/photos-backup/server/internal/db"
@@ -80,7 +81,7 @@ func (r *Runner) runVision(ctx context.Context, assetID string) error {
 	if result.Dim != db.VisionDim {
 		return fmt.Errorf("photo-ml returned %d-dimension vectors; asset_embeddings holds %d", result.Dim, db.VisionDim)
 	}
-	r.checkVisionModel(result.Model)
+	r.checkModel(&r.wrongModel, "encoder", result.Model, db.VisionModel)
 
 	embeddings := make([]db.Embedding, len(frames))
 	for i, frame := range frames {
@@ -127,24 +128,30 @@ func (r *Runner) renditions(asset db.Asset) (frames []int, images [][]byte, err 
 	return frames, images, nil
 }
 
-// checkVisionModel says something, once, when photo-ml is not running the model
-// this database is indexed for.
+// checkModel says something, once, when photo-ml is not running the model this
+// database expects.
 //
-// Not an error, because the row records what actually produced the vector and
-// storing it truthfully is more useful than refusing it. But it is worth
-// saying out loud: the HNSW index in migration 0017 names db.VisionModel in its
-// predicate, so vectors written under any other name are correct, searchable,
-// and reached by sequential scan — which looks like the model being slow rather
-// than like a configuration that has drifted.
-func (r *Runner) checkVisionModel(reported string) {
-	if reported == db.VisionModel {
+// Never an error. Every one of these rows records what actually produced its
+// contents, and storing that truthfully is more useful than refusing it — a
+// second model's output sitting beside the first is exactly what makes a bench
+// a delete and a requeue rather than a project.
+//
+// But it is worth saying out loud, because the consequences are quiet ones. The
+// HNSW index in migration 0017 names db.VisionModel in its predicate, so
+// vectors written under any other name are correct, searchable, and reached by
+// sequential scan — which looks like the model being slow. Captions and
+// recognised text written under another name are correct and simply never
+// reach the tsvector, because rebuild_asset_search reads the model it was told
+// about — which looks like the captioner having missed the photograph.
+func (r *Runner) checkModel(once *sync.Once, role, reported, expected string) {
+	if reported == expected {
 		return
 	}
-	r.wrongModel.Do(func() {
-		r.log().Warn("photo-ml is running a different model from the one this database is indexed for",
-			"reported", reported, "indexed", db.VisionModel,
-			"consequence", "the vectors are stored and searchable but the HNSW index does not cover them",
-			"fix", "point photo-ml back at "+db.VisionModel+", or add an index naming "+reported)
+	once.Do(func() {
+		r.log().Warn("photo-ml is running a different "+role+" from the one this database expects",
+			"reported", reported, "expected", expected,
+			"consequence", "the rows are written truthfully and are not read back by search",
+			"fix", "point photo-ml back at "+expected+", or make "+reported+" the name this archive uses")
 	})
 }
 
@@ -234,10 +241,4 @@ func (r *Runner) reconcileVision(ctx context.Context) error {
 			"assets", n, "model", db.VisionModel)
 	}
 	return nil
-}
-
-// visionGate is the pool's claim guard. Named so spawn's signature reads as
-// what it is rather than as a bare func.
-func (r *Runner) visionGate() func(context.Context) bool {
-	return r.mlAvailable
 }

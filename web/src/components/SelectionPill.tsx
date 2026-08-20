@@ -92,13 +92,15 @@ export function SelectionPill() {
   // typing a name takes long enough that the selection may have changed, and
   // every position in it would then mean a different photograph.
   const startCreate = useCallback(
-    (name: string) => {
+    async (name: string) => {
       if (!actions || count === 0) return;
-      setCreating({
-        name,
-        bucket: actions.bucket,
-        target: { ranges, filter: actions.filter, view: actions.view },
-      });
+      // Spelled out into ids first where the grid says its positions do not
+      // travel, which is the search results and nowhere else. See
+      // SelectionActions.resolve.
+      const target = actions.resolve
+        ? await actions.resolve({ ranges })
+        : { ranges, filter: actions.filter, view: actions.view };
+      setCreating({ name, bucket: actions.bucket, target });
     },
     [actions, count, ranges],
   );

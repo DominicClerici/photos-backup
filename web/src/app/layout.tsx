@@ -4,6 +4,7 @@ import "./globals.css";
 import { Geist } from "next/font/google";
 import { SelectionProvider } from "@/hooks/useSelection";
 import { ViewProvider } from "@/hooks/useView";
+import { CommandPalette } from "@/components/CommandPalette";
 import { TabBar } from "@/components/TabBar";
 import { Toaster } from "@/components/ui/toast";
 import { VaultGate } from "@/components/VaultGate";
@@ -45,6 +46,10 @@ export default function RootLayout({
           reloads the timeline it happened on, so the component that started it
           may well be unmounted by the time the toast is showing. The undo it
           offers has to outlive the grid it came from. */}
+      {/* The command palette is here for the same reason as the prompt below it,
+          and one more: ⌘K has to work on a page that is still loading and on one
+          that has nothing to do with searching, so the listener has to outlive
+          every page. It is also where the Search tab goes — see TabBar. */}
       {/* And the vault's password prompt is here because it is asked for from
           everywhere: a right-click in the library, a menu on an album tile, a
           page that has just found out it is locked. One dialog opened from a
@@ -56,6 +61,7 @@ export default function RootLayout({
             <ViewProvider>
               {children}
               <TabBar />
+              <CommandPalette />
               <VaultGate />
             </ViewProvider>
           </SelectionProvider>

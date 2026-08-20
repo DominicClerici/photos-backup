@@ -8,6 +8,7 @@ import {
   useReducer,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 
 import { Archive, EyeOff, ListMinus, RotateCcw, SquareCheck, Trash2 } from "lucide-react";
@@ -178,9 +179,26 @@ interface Props {
    */
   actions: SelectionActions;
   onOpen: (id: string) => void;
+  /**
+   * Whether this grid is an answer rather than a collection.
+   *
+   * The search results are ordered by how well each photograph answered the
+   * question, which is not an order anybody chose and not one they can change.
+   * So a ranked grid does not claim the floating sort-and-filter control: a
+   * pill offering "Newest" here would either do nothing or throw the ranking
+   * away, and the filter it would offer is already on the page as the chips
+   * that say how the sentence was read.
+   */
+  ranked?: boolean;
+  /**
+   * What to say when there is nothing to draw. The library's own answer — "run
+   * a backup from the phone" — is about an empty archive, and a search that
+   * matched nothing is not that.
+   */
+  empty?: ReactNode;
 }
 
-export function Timeline({ timeline, actions, onOpen }: Props) {
+export function Timeline({ timeline, actions, onOpen, ranked = false, empty }: Props) {
   const { days, total, ready, loading, error, retry, at: itemAt, request, patch } = timeline;
   const scroller = useRef<HTMLDivElement>(null);
   const board = useRef<HTMLDivElement>(null);
@@ -451,8 +469,8 @@ export function Timeline({ timeline, actions, onOpen }: Props) {
   // What the sort-and-filter pill needs to act on this grid: what it is a grid
   // of, the shape it has, and the one thing only the scroller can do.
   const published = useMemo(
-    () => ({ filter: actions.filter, days, loading, jump }),
-    [actions.filter, days, loading, jump],
+    () => (ranked ? null : { filter: actions.filter, days, loading, jump }),
+    [ranked, actions.filter, days, loading, jump],
   );
   useViewScope(published);
 
@@ -937,15 +955,22 @@ export function Timeline({ timeline, actions, onOpen }: Props) {
   // The selection is captured here rather than read when the dialog is
   // submitted: by then the menu is gone, and a selection somebody has since
   // changed would put the wrong photographs into the new album.
+  //
+  // Resolved first where the grid says it has to be. Every action on this menu
+  // goes through the same step inside itself; this is the one request the grid
+  // builds rather than spends, so it is the one place that has to ask. On every
+  // grid but the search results there is nothing to resolve and the await is a
+  // microtask. See SelectionActions.resolve.
   const startCreate = useCallback(
-    (name: string) => {
+    async (name: string) => {
+      const target = actions.resolve ? await actions.resolve(menuTarget) : menuTarget;
       setCreating({
         name,
         bucket: actions.bucket,
-        target: { ...menuTarget, filter: actions.filter, view: actions.view },
+        target: { ...target, filter: actions.filter, view: actions.view },
       });
     },
-    [actions.bucket, actions.filter, actions.view, menuTarget],
+    [actions.bucket, actions.filter, actions.view, actions.resolve, menuTarget],
   );
 
   const created = useCallback(
@@ -1100,7 +1125,9 @@ export function Timeline({ timeline, actions, onOpen }: Props) {
                 photographs that are exactly where they left them. */}
             {ready && total === 0 && !error ? (
               <div className={NOTICE}>
-                {isFiltered(view) ? (
+                {empty ? (
+                  empty
+                ) : isFiltered(view) ? (
                   <>
                     <span>Nothing here matches these filters.</span>
                     <Button

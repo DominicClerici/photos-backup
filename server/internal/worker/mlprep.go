@@ -62,19 +62,31 @@ func (r *Runner) runMLPrep(ctx context.Context, assetID string) error {
 		return err
 	}
 
-	// The embedding pass, queued from here rather than beside this job, for the
+	// The three ML passes, queued from here rather than beside this job, for the
 	// reason the signature and this job are queued from the metadata job: the
 	// thing photo-ml is handed is the file the lines above just wrote, and
 	// queueing before it exists would be queueing a job that finds nothing.
 	//
+	// All three, for one asset, even though the library-wide captioning backfill
+	// is a command somebody types. The two are different questions: four hours
+	// of GPU started by a service restart is a surprise, and a photograph
+	// arriving from a phone and being described a minute later is the feature.
+	// The pool drains them in the order of that slice — see jobs.ClaimInOrder.
+	//
 	// Only when photo-ml is configured. A machine with no GPU service does not
 	// grow a permanent seventeen-thousand-item backlog describing a feature it
 	// does not have; setting ML_URL and restarting is what turns the library
-	// into queued work, in one place, through jobs.ReconcileVision.
+	// into queued work, in one place, through jobs.ReconcileVision and
+	// `photobackup ml backfill`.
 	if r.ML == nil {
 		return nil
 	}
-	return jobs.Enqueue(ctx, r.Store.Pool(), jobs.KindVision, assetID)
+	for _, kind := range []jobs.Kind{jobs.KindVision, jobs.KindOCR, jobs.KindDescribe} {
+		if err := jobs.Enqueue(ctx, r.Store.Pool(), kind, assetID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // stillRendition renders one photograph, through its caption layer if it has

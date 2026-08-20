@@ -113,9 +113,25 @@ export function useView(): ViewState {
  *
  * What makes the sort-and-filter pill appear on the pages that have a gallery
  * and nowhere else, and what drops a view when one is navigated away from.
+ *
+ * Null is a grid that does not claim it, which is the search results: the order
+ * there is the ranking and the filter is the query, so a pill offering "Newest"
+ * over a relevance ranking would be a control that either does nothing or
+ * throws the answer away. Its chips are the filter, and they are on the page.
  */
-export function useViewScope(grid: GridView): void {
+export function useViewScope(grid: GridView | null): void {
   const { register, provide } = useView();
-  useEffect(register, [register]);
-  useEffect(() => provide(grid), [provide, grid]);
+  // Whether, not which. Registering is what a grid does once on the way in and
+  // undoes on the way out, and its undoing drops the view — so it must not be
+  // re-run every time the grid has something new to say about itself.
+  const claims = grid !== null;
+
+  useEffect(() => {
+    if (!claims) return;
+    return register();
+  }, [register, claims]);
+
+  useEffect(() => {
+    if (grid) provide(grid);
+  }, [provide, grid]);
 }

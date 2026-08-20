@@ -16,3 +16,14 @@ node_modules/
 PHOTOS_TEST/
 
 *.env
+# photo-ml's virtualenv and its model cache. The venv is ~5GB of torch and CUDA
+# rebuilt by `uv sync` from uv.lock, which is committed; the cache is 1.8GB of
+# weights re-fetched on first start. Neither belongs in git, and neither is
+# lost by being absent.
+photo-ml/.venv/
+photo-ml/.cache/
+# Bytecode, which is rebuilt on import and differs between interpreters. Four of
+# these are already tracked from before this line existed; `git rm -r --cached
+# photo-ml/src/photo_ml/__pycache__` retires them.
+__pycache__/
+.pytest_cache/

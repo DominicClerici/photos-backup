@@ -27,6 +27,16 @@ type fakeML struct {
 	// requests counts the images actually sent, which is how the tests below
 	// assert that a video arrives as six pictures rather than one.
 	requests [][]string
+	// described and recognised are the same record for the two routes that
+	// read pictures rather than compare them, kept apart so a test can say
+	// which model was handed what.
+	described  [][]string
+	recognised [][]string
+	// captions and text are what the fake answers with, per image index, so a
+	// test can assert that three frames of a clip come back as one asset's
+	// worth of words.
+	captions []string
+	text     []string
 }
 
 func newFakeML(t *testing.T) *fakeML {
@@ -57,6 +67,50 @@ func newFakeML(t *testing.T) *fakeML {
 		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"model": db.VisionModel, "dim": db.VisionDim, "normalized": true, "vectors": vectors,
+		})
+	})
+	mux.HandleFunc("POST /describe", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Images []string `json:"images"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		f.described = append(f.described, req.Images)
+
+		results := make([]map[string]any, len(req.Images))
+		for i := range results {
+			caption := "a photograph"
+			if i < len(f.captions) {
+				caption = f.captions[i]
+			}
+			results[i] = map[string]any{
+				"caption": caption,
+				"tags": []map[string]any{
+					{"name": "dog", "confidence": 0.9},
+					{"name": "beach", "confidence": 0.8},
+				},
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"model": db.CaptionModel, "results": results,
+		})
+	})
+	mux.HandleFunc("POST /ocr", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Images []string `json:"images"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		f.recognised = append(f.recognised, req.Images)
+
+		results := make([]map[string]any, len(req.Images))
+		for i := range results {
+			text := ""
+			if i < len(f.text) {
+				text = f.text[i]
+			}
+			results[i] = map[string]any{"text": text, "lines": []any{}}
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"model": db.OCRModel, "results": results,
 		})
 	})
 	f.Server = httptest.NewServer(mux)

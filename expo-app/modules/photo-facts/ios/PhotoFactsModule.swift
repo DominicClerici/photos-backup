@@ -19,10 +19,17 @@
 // Two things it deliberately does not do. It never asks for photo library
 // authorization, because expo-media-library owns that prompt and a second one
 // would be a mystery to the person holding the phone. And it never touches
-// PHImageManager or PHAssetResourceManager for bytes, because those can pull an
-// original down from iCloud and this app runs against a phone with iCloud Photos
-// off — the resource inventory below is metadata PhotoKit already holds, not a
-// request for any of it.
+// PHImageManager or PHAssetResourceManager for bytes on behalf of a *library*
+// asset, because those can pull an original down from iCloud and this app runs
+// against a phone with iCloud Photos off — the resource inventory below is
+// metadata PhotoKit already holds, not a request for any of it.
+//
+// fetchSharedResourceAsync is the one exception, and it is narrow on purpose: an
+// iCloud Shared Album asset has no local original for the rule to protect. The
+// phone holds a cached rendition of somebody else's upload and nothing else, so
+// a fetch is the only way to read one at all, and the function is unreachable
+// for anything that is not in a shared album. The rule above is unchanged for
+// every asset it was written about.
 //
 // The module also carries two things the sync engine cannot get cheaply from
 // expo-media-library, and they are here rather than in a module of their own
@@ -41,6 +48,17 @@
 //                       the server will verify, so "could not read it" has to
 //                       reach the queue as this item's failure rather than as a
 //                       hash of nothing.
+//
+// And two more for the shared-album survey, which is scaffolding rather than
+// backup: nothing in the sync engine calls either of these yet.
+//
+//   sharedAlbumsAsync         never throws, like the enumerator it sits beside.
+//                             A phone with Shared Albums switched off has none,
+//                             which is an empty list rather than a failure.
+//   fetchSharedResourceAsync  does throw. It is a network read and the survey's
+//                             entire purpose is to find out how it fails, so a
+//                             timeout or a withdrawn album has to arrive as an
+//                             error and not as zero bytes.
 
 import CoreLocation
 import CryptoKit
@@ -80,6 +98,21 @@ public class PhotoFactsModule: Module {
     // The whole library in one call. See listAssets for what this replaces.
     AsyncFunction("enumerateAsync") { (limit: Int, promise: Promise) in
       promise.resolve(listAssets(limit: limit))
+    }
+
+    // Every iCloud Shared Album, with what is in it. See sharedAlbums().
+    AsyncFunction("sharedAlbumsAsync") { (promise: Promise) in
+      promise.resolve(sharedAlbums())
+    }
+
+    // The one call in this module that goes to the network, and the only one
+    // allowed to. See fetchResource().
+    AsyncFunction("fetchSharedResourceAsync") { (localId: String, promise: Promise) in
+      guard let asset = findAsset(localId) else {
+        promise.resolve()
+        return
+      }
+      fetchResource(of: asset, promise: promise)
     }
 
     AsyncFunction("md5ForFileAsync") { (uri: String, promise: Promise) in
@@ -188,6 +221,157 @@ private func milliseconds(_ date: Date?) -> Int? {
     return nil
   }
   return Int((date.timeIntervalSince1970 * 1000.0).rounded())
+}
+
+// MARK: - Shared albums
+
+/// Every iCloud Shared Album on the phone, with the assets in each.
+///
+/// A second enumeration rather than a wider one, because a shared album's assets
+/// are not in the library at all. `PHFetchOptions.includeAssetSourceTypes`
+/// defaults to `typeUserLibrary`, so listAssets() above cannot see them however
+/// it is sorted or predicated: they exist only inside collections of subtype
+/// `albumCloudShared`, and the way to them is through the collection.
+///
+/// Nesting the assets inside their album rather than returning one flat list is
+/// the point of going through the collection: the album title is the only
+/// provenance a shared asset carries, and an asset can be in several. Flattening
+/// here would throw that away and then need a second pass to win it back.
+///
+/// Nothing is deduplicated. That is the caller's, because the caller is the one
+/// that knows whether it wants a count of assets or a count of memberships.
+private func sharedAlbums() -> [[String: Any?]] {
+  let collections = PHAssetCollection.fetchAssetCollections(
+    with: .album,
+    subtype: .albumCloudShared,
+    options: nil
+  )
+
+  var albums: [[String: Any?]] = []
+  albums.reserveCapacity(collections.count)
+
+  collections.enumerateObjects { collection, _, _ in
+    let options = PHFetchOptions()
+    options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+
+    let result = PHAsset.fetchAssets(in: collection, options: options)
+    var assets: [[String: Any?]] = []
+    assets.reserveCapacity(result.count)
+    result.enumerateObjects { asset, _, _ in
+      assets.append(describeShared(asset))
+    }
+
+    albums.append([
+      "localId": collection.localIdentifier,
+      "title": collection.localizedTitle,
+      "startDate": milliseconds(collection.startDate),
+      "endDate": milliseconds(collection.endDate),
+      "assets": assets
+    ])
+  }
+  return albums
+}
+
+/// One shared asset: what listAssets() reports, plus the things the survey
+/// exists to find out.
+///
+/// The dimensions and the duration are here because Apple re-encodes everything
+/// that goes into a Shared Album, and PHAsset already knows what came out — so
+/// the question of what resolution survives the sharing can be answered across a
+/// whole album without fetching a single byte.
+///
+/// The resource inventory answers the follow-up. A lone `photo` means the
+/// downscaled render is all there is; a `fullSizePhoto` beside it would mean the
+/// original is reachable after all, which would change the answer entirely.
+private func describeShared(_ asset: PHAsset) -> [String: Any?] {
+  let isImage = asset.mediaType == .image
+  let resources = PHAssetResource.assetResources(for: asset)
+
+  return [
+    "localId": assetUriPrefix + asset.localIdentifier,
+    "kind": isImage ? "still" : "video",
+    "filename": asset.value(forKey: "filename") as? String,
+    "createdAt": milliseconds(asset.creationDate),
+    "modifiedAt": milliseconds(asset.modificationDate),
+    "isLive": isImage && asset.mediaSubtypes.contains(.photoLive),
+    "pixelWidth": asset.pixelWidth,
+    "pixelHeight": asset.pixelHeight,
+    "durationSeconds": asset.duration,
+    // Expected to be exactly ["typeCloudShared"] for everything in here.
+    // Carried anyway, because "expected" is what a survey is for.
+    "sourceTypes": sourceType(of: asset),
+    "resourceTypes": resources.map { resourceTypeName($0.type) }
+  ]
+}
+
+/// Reads one shared asset's primary resource all the way through, and reports
+/// how big it turned out to be and how long it took.
+///
+/// This is the one function in the module that goes to the network, and the
+/// header's rule against it stands everywhere else. A library asset has bytes on
+/// the disk and must never be fetched from iCloud. A shared asset has no local
+/// original to fetch instead — the phone holds a cached rendition and nothing
+/// more — so there is no reading one without asking Apple for it, and what comes
+/// back is the thing the survey is trying to learn.
+///
+/// It counts the bytes rather than keeping them. A survey wants the size, the
+/// elapsed time and the failure modes; writing whole albums' worth of downloads
+/// to disk to learn that would be a backup, which is the thing this is meant to
+/// inform rather than perform.
+private func fetchResource(of asset: PHAsset, promise: Promise) {
+  let resources = PHAssetResource.assetResources(for: asset)
+  guard let resource = primaryResource(from: resources) else {
+    promise.reject("ERR_NO_RESOURCE", "the asset carries no photo, video or audio resource")
+    return
+  }
+
+  let options = PHAssetResourceRequestOptions()
+  options.isNetworkAccessAllowed = true
+
+  var received = 0
+  let started = CFAbsoluteTimeGetCurrent()
+
+  PHAssetResourceManager.default().requestData(
+    for: resource,
+    options: options,
+    dataReceivedHandler: { data in
+      // PhotoKit delivers these serially on a private queue, one chunk after
+      // another, so the accumulation needs no lock of its own.
+      received += data.count
+    },
+    completionHandler: { error in
+      if let error {
+        promise.reject(error)
+        return
+      }
+      // Typed rather than inferred, because two of these are optional strings
+      // and a literal left to itself infers [String: Any] — which boxes the
+      // absent ones as optionals inside Any and bridges them as something no
+      // caller wants. Every other dictionary in this file is coerced by its
+      // function's return type; this one has nothing to be coerced by.
+      let read: [String: Any?] = [
+        "bytes": received,
+        "elapsedMs": Int(((CFAbsoluteTimeGetCurrent() - started) * 1000.0).rounded()),
+        "uniformTypeIdentifier": resource.uniformTypeIdentifier,
+        "originalFilename": resource.originalFilename,
+        "resourceType": resourceTypeName(resource.type)
+      ]
+      promise.resolve(read)
+    }
+  )
+}
+
+/// The resource carrying the asset itself, as opposed to a thumbnail, an
+/// adjustment, or a Live Photo's paired clip.
+///
+/// A full-size variant is preferred where one exists, because its presence is
+/// the interesting case: it would mean the shared copy is not the downscale
+/// everything else here assumes it is.
+private func primaryResource(from resources: [PHAssetResource]) -> PHAssetResource? {
+  if let full = resources.first(where: { $0.type == .fullSizePhoto || $0.type == .fullSizeVideo }) {
+    return full
+  }
+  return resources.first { $0.type == .photo || $0.type == .video || $0.type == .audio }
 }
 
 // MARK: - Hashing
@@ -320,24 +504,28 @@ private func playbackStyle(of asset: PHAsset) -> [String: Any] {
 }
 
 private func resourceType(of resource: PHAssetResource) -> [String: Any] {
-  let type = resource.type
-  let name: String
+  return ["value": resource.type.rawValue, "name": resourceTypeName(resource.type)]
+}
+
+/// The name on its own, for the shared-album survey — which reports an
+/// inventory of types per asset and has no use for twelve copies of the raw
+/// value beside them.
+private func resourceTypeName(_ type: PHAssetResourceType) -> String {
   switch type {
-  case .photo: name = "photo"
-  case .video: name = "video"
-  case .audio: name = "audio"
-  case .alternatePhoto: name = "alternatePhoto"
-  case .fullSizePhoto: name = "fullSizePhoto"
-  case .fullSizeVideo: name = "fullSizeVideo"
-  case .adjustmentData: name = "adjustmentData"
-  case .adjustmentBasePhoto: name = "adjustmentBasePhoto"
-  case .pairedVideo: name = "pairedVideo"
-  case .fullSizePairedVideo: name = "fullSizePairedVideo"
-  case .adjustmentBasePairedVideo: name = "adjustmentBasePairedVideo"
-  case .adjustmentBaseVideo: name = "adjustmentBaseVideo"
-  @unknown default: name = "unrecognized"
+  case .photo: return "photo"
+  case .video: return "video"
+  case .audio: return "audio"
+  case .alternatePhoto: return "alternatePhoto"
+  case .fullSizePhoto: return "fullSizePhoto"
+  case .fullSizeVideo: return "fullSizeVideo"
+  case .adjustmentData: return "adjustmentData"
+  case .adjustmentBasePhoto: return "adjustmentBasePhoto"
+  case .pairedVideo: return "pairedVideo"
+  case .fullSizePairedVideo: return "fullSizePairedVideo"
+  case .adjustmentBasePairedVideo: return "adjustmentBasePairedVideo"
+  case .adjustmentBaseVideo: return "adjustmentBaseVideo"
+  @unknown default: return "unrecognized"
   }
-  return ["value": type.rawValue, "name": name]
 }
 
 // The three below are option sets rather than enumerations, so they answer with

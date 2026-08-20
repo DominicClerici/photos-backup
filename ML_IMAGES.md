@@ -4,12 +4,15 @@ The plan for the search feature: a plain-text box that answers questions about
 dates, places, people, objects and vibes, over a library the archive already
 holds. This document is the design and the order of work.
 
-It was a plan and is now partly a record: **steps 2, 3, 4 and 5 of §9 are
-built** — pgvector, migrations `0016_search.sql` and `0017_vision.sql`, the
-offline geocoder, the `mlprep` job that writes the renditions a model reads, and
-photo-ml itself with the `vision` pool feeding it. Semantic search is real; it
-just has no endpoint yet. Everything from step 6 onward — captions, tags, OCR,
-the query parser and the page — is still design.
+It was a plan and is now largely a record: **steps 2 through 8 of §9 are
+built** — pgvector, migrations `0016`, `0017` and `0018`, the offline geocoder,
+the `mlprep` renditions, photo-ml with all five of its routes, the `vision`,
+`ocr` and `describe` passes, the captions, the free-form tags, the `asset_search`
+tsvector, the Go query grammar, `GET /v1/search` with reciprocal-rank fusion over
+both halves, and the page — a command palette with live results and a ranked
+grid with the parse drawn as removable chips. Search answers, and it is reachable
+by pressing ⌘K. What is left is step 9, the tag merge, which needs a finished
+vocabulary to merge.
 
 The rule from PROJECT.md §4 governs everything below: **photo-ml is optional
 forever.** If it is down, mid-model-swap, or saturating the GPU, backups still
@@ -234,8 +237,17 @@ Three additions to the pipeline, and one of them is not ML at all.
 | `vision` | new **vision** pool (Go, GPU via HTTP) | one call to photo-ml; writes embeddings, caption, tags, OCR |
 | — | the existing metadata job | reverse-geocodes on ingest |
 
-*(Both built. `vision` writes embeddings only — the caption, tags and OCR
-columns of that row are step 6. One thing came out differently and it is the
+*(All built, and the `vision` row turned out to be three rows rather than one.
+`vision` writes embeddings, `ocr` writes recognised text, `describe` writes the
+caption and the tags — three kinds sharing one pool. The reason is the same one
+that split `mlprep` off in the first place, one step further along: re-embedding
+the library is fifteen minutes and re-captioning it is hours, so a single job
+would tie every encoder bench to a full re-captioning. Sharing a pool is right —
+it is still one GPU — but the pool now drains its kinds in **priority order**
+rather than FIFO, cheapest first, because three passes of wildly different cost
+interleaved all finish at the end. See `jobs.ClaimInOrder`.*
+
+*One more thing came out differently and it is the
 part of this design that took the most care: the pool is **gated**, not merely
 retried. It asks photo-ml whether it is up before it claims anything, so an
 absent service means an idle pool rather than sixty thousand failures; and for
@@ -289,11 +301,18 @@ change to it can quietly start reading the vault.
 ```
 POST /embed     images[] → vectors[]           vision encoder, 1152-d   built
                 texts[]  → vectors[]           the same space           built
-POST /describe  image    → {caption, tags[]}   VLM, free-form tags      step 6
-POST /ocr       image    → {text, boxes[]}     dedicated text recognition  step 6
-POST /parse     query    → filter JSON         small instruct model     step 7
+POST /describe  images[] → [{caption, tags[]}] VLM, free-form tags      built
+POST /ocr       images[] → [{text, lines[]}]   dedicated text recognition  built
+POST /parse     query    → filter JSON         small instruct model     built
 GET  /health             → which models are resident                    built
 ```
+
+*(Every route takes a list and answers per item, which the sketch had as
+singular for the middle two. The service holds no state and knows nothing about
+assets, so folding three frames of a clip into one video's caption is a decision
+for the process that knows what a video is — and the list is also what lets the
+captioner batch, which turned out to matter more than anything else in this
+file. See below.)*
 
 *(`texts[]` was not in the original sketch and had to be: a query becomes a
 vector before it becomes a search, and SigLIP's two towers are one model and one
@@ -313,12 +332,29 @@ of two.
 16.3 GB on the RTX 5060 Ti, of which the desktop session is already holding
 about 1.4 GB.
 
-| model | roughly | residency |
-|---|---|---|
-| vision encoder (SigLIP-2 so400m class), fp16 | 1.8 GB | resident |
-| query parser (4B class, 4-bit) | 3 GB | resident |
-| captioner (7–8B VLM, AWQ/GPTQ 4-bit) | 6 GB + KV | on demand |
-| OCR (ONNX) | 0.5 GB | on demand |
+| model | planned | actual | residency |
+|---|---|---|---|
+| vision encoder, SigLIP-2 so400m fp16 | 1.8 GB | **2.3 GB** | resident |
+| query parser | 4B at 4-bit, 3 GB | **Qwen3-0.6B bf16, 1.2 GB** | resident |
+| captioner | 7–8B at 4-bit, 6 GB | **Qwen3-VL-4B bf16, 9.1–10.1 GB** | on demand |
+| OCR (ONNX) | 0.5 GB | **CPU, no VRAM at all** | on demand |
+
+*(Two of those moved and both for the same reason: the card is Blackwell, and
+the AWQ/GPTQ kernels are the part of that ecosystem most likely to be missing an
+architecture this new. The failure is a service that installs, starts, and then
+reports "no kernel image is available" on the first forward pass, which is
+precisely the 1am debugging session this design spends paragraphs avoiding. 4B
+at bf16 costs what 8B at 4-bit would have and needs no extra dependency.*
+
+*The parser shrank to pay for it. 0.6B is small enough to be honest about: the
+gates in §7 reject nearly everything it says, and what survives is occasionally
+useful. That is the arrangement §11 asks for rather than a disappointment — but
+it is worth writing down that the Go grammar is doing essentially all of the
+work, and that `PHOTO_ML_PARSER_MODEL` is there for the day the card is not also
+holding a captioner.*
+
+*OCR on the CPU was a straight win nobody planned: the pass costs the card
+nothing and can run while the captioner is loaded.)*
 
 The two heavy ones load when a `vision` job arrives and unload once the queue
 has been dry for a few minutes.
@@ -373,6 +409,36 @@ GET /v1/search?q=phoenix at the beach last summer
 wrong parse is visible and fixed with one click rather than by retyping the
 sentence and hoping. A search is an editable filter, not an oracle.
 
+*(Built, and step 1 came out inverted — which is the change in this document that
+matters most. §11 says the parser is the weakest link and the last step; it was
+built **first**, in Go, and the model was layered on top of it afterwards rather
+than the other way round.*
+
+*`internal/searchquery` is the parser: a deterministic grammar that reads dates,
+matches names and places against what this archive actually contains, and hands
+the rest to the encoder. photo-ml's `/parse` runs after it and may speak only
+where the grammar was silent — and every claim is checked against the query
+itself before it is believed. A person only if the query mentions a word of that
+name; a place only if the query mentions it; a date range only if the query says
+anything temporal at all, and only both ends together. Media kind, category and
+favourites are not on the model's contract, because the grammar answers those
+completely and a model can only disagree.*
+
+*That last rule was not theoretical. A 0.6B model handed the archive's eleven
+people as a spelling hint returns **the whole list on every query**, and every
+name on it passes a naive vocabulary check because they are all real people
+here. Six ANDed people is a filter that matches nothing — §11's silent exclusion
+arriving through the front door on day one. `searchquery.mentions` is what stops
+it, and it is also what makes the model useful when it is: "chris" earns
+"Chris Morrison" because the word is there.*
+
+*One thing was added that the sketch does not have. When the fuzzy half produces
+no candidates but the structured half narrowed something, the filter's own
+answer stands in date order — because "Phoenix, last summer, and no caption
+mentions a beach" should not be an empty grid. When the filter narrowed nothing,
+an unmatched phrase is genuinely no results. server/README.md § Searching has
+the whole path.)*
+
 ### When photo-ml is down
 
 `/v1/search` still answers. A small Go date-and-name grammar covers the common
@@ -394,6 +460,58 @@ Each tile can say why it matched: the matched tag, or the OCR line with the
 match highlighted. With free-form tags this is not a nicety. Being able to see
 what the model called a photograph is what makes the cleanup pass in step 9
 possible at all.
+
+*(Built, and it came out as two surfaces rather than one. The query box is a
+**command palette** — ⌘K from anywhere, or the Search tab, which stopped being a
+link — showing six live results on a 300ms debounce with "Search for …" at the
+top of the list. A search is a question rather than a destination, and an empty
+results page somebody has to walk to before typing is one screen between the
+thought and the answer. It is a palette rather than a search box because of what
+this file already says is coming: a sentence will name an action as well as a
+subject, and that should be a group in a list rather than a second surface.*
+
+*The grid is the gallery's own, which took two props rather than a rewrite:
+`lib/layout.headless` already drew a run with no date as a flat wall of tiles —
+it was written for "order by length" and turns out to be exactly what a ranking
+is — and `ranked` also stops the grid claiming the floating sort-and-filter
+pill, because an order nobody chose is not one they can change.*
+
+*The pills are chips and the mechanism behind them is the thing worth writing
+down. The URL **is** the request: `?q=` asks the server to read the sentence, and
+taking a chip off rewrites the URL into `parse=0` beside the fields that
+survived. §7's escape hatch needed one correction to carry it — `visual` is now
+read by presence rather than by content, so "phoenix", all of which is a name,
+can say it has no phrase for the encoder rather than falling back to the word
+the filter already answered exactly. Back is then an undo, and a search is a
+link.*
+
+*One thing had to be built that this section does not mention. Every grid in the
+app names a selection by position, and a ranking has no positions anything else
+can reconstruct — so `useSearchActions` spells them out into ids before they
+leave, and travels with no filter and no view, because both exist to make a
+position mean something. The evidence per tile is in the palette rather than on
+the grid: caption, tags, and the OCR line with the match marked, which is what
+step 9 will be read through.)*
+
+*(And one surface after that, which this section did not anticipate at all: the
+**viewer's details panel**, which is a search read backwards.
+`GET /v1/assets/{id}/analysis` takes a photograph and returns the words the
+ranking was built out of — caption, tags with the merge resolved and the model's
+own word beside it, the whole of the recognised text, and how many frames the
+encoder wrote. Its own route rather than more fields on the detail, because that
+load is on every arrow-key press and recognised text is unbounded.*
+
+*Two things in it are worth writing down here rather than in web/README.md. It
+carries the **state of each ML job**, because §11's warning has a second reading
+one surface out: a photograph with no caption is one the captioner has not
+reached, one it failed on, or one nothing has queued, and a panel drawing all
+three as an empty box reports them as the same silence. And it keeps §11's seam
+visible where somebody can actually see it — a name an import confirmed and a
+word a model wrote are drawn as different chips with the source named, because
+the panel is exactly where the two would otherwise become one list of things
+"in" the photograph. Tags and names are clickable and search the archive; in the
+vault nothing is, since a hidden photograph's name in `?q=` is that name in the
+URL, the history and the recent-search list.)*
 
 ---
 
@@ -432,10 +550,25 @@ Each of steps 3, 5 and 6 ships something searchable on its own.
    Breckenridge, from pixels alone: the encoder has never seen a place name.
    `photo-ml/README.md` and server/README.md § What a photograph shows have the
    query, which is two commands until step 7 gives it an endpoint.
-6. **`/describe` and `/ocr`**, the tags and captions tables, the `asset_search`
-   tsvector. Overnight backfill ≈ 2–4 h.
-7. **`/parse`**, `GET /v1/search`, RRF ranking, and the degraded path.
-8. The search page and the pills.
+6. ~~**`/describe` and `/ocr`**, the tags and captions tables, the `asset_search`
+   tsvector.~~ **Done** — migration `0018_describe.sql`, two more job kinds
+   sharing the vision pool in priority order, `Qwen3-VL-4B-Instruct` for the
+   captions and rapidocr on the CPU for the text. Three things came out
+   differently. The captioner is bf16 rather than 4-bit, because Blackwell and
+   quantisation kernels are a bad bet; the backfill is a typed command rather
+   than a reconcile, because hours of GPU begun by a service restart is a
+   restart with a surprise in it; and photo-ml learned to **batch**, which was
+   the difference between 7.3 hours and 2.4 over this library and is the single
+   most consequential thing measured in this whole feature. §10 has the numbers.
+7. ~~**`/parse`**, `GET /v1/search`, RRF ranking, and the degraded path.~~
+   **Done**, and built in the opposite order to the one written here: the
+   degraded path first. §7 has why, and why the model ended up being the small
+   part.
+8. ~~The search page and the pills.~~ **Done** — a command palette on ⌘K with
+   live results, and `/search` as a ranked grid whose chips edit the parse
+   through `parse=0`. §8 has what came out differently, and §11's paragraph
+   about a parse that fails confidently is now answered by something somebody
+   can click.
 9. The tag-merge UI, run once over the finished vocabulary.
 
 ### The tag merge, step 9
@@ -458,8 +591,8 @@ is one column and is reversible.
 | geocode | 11,045 fixes against an in-memory k-d tree | seconds — measured |
 | mlprep | decode 17,792 originals, sample the videos | ~1 h — measured |
 | embed | 31,422 renditions through the vision encoder | **16m04s — measured** |
-| ocr | 14,970 stills | 10–15 min |
-| describe | ~23,000 images through the VLM | 2–4 h |
+| ocr | 31,422 renditions, on the CPU | ~30 min |
+| describe | ~23,400 images through the VLM | **2.4–7.3 h, and it depends** |
 
 *(The embed row is now a measurement rather than an estimate, and the estimate
 was wrong in the useful direction. 61,000 renditions assumed six frames from
@@ -474,6 +607,30 @@ renditions for the encoder to look at. That is the tolerance clipRenditions
 applies reaching the far end of the pipe intact rather than turning into 80
 photographs marked permanently broken — and it is the case jobs.ReconcileVision
 notes it will re-offer on every restart, at a claim and a stat each.)*
+
+*The describe row is a range rather than a number because it is the one figure
+in this table that is a choice. The captioner is memory-bandwidth bound — 8.8GB
+of weights read per generated token, whether that token is for one image or
+twelve — so, measured on this card over these renditions:*
+
+| batch | per image | over the library | peak VRAM |
+|---|---|---|---|
+| 1 | 1.47 s | 7.3 h | 9.1 GB |
+| 4 | 0.78 s | 3.9 h | 9.6 GB |
+| 8 | 0.48 s | 2.4 h | 10.1 GB |
+| 16 | 0.38 s | 1.9 h | 11.2 GB |
+
+*Threads buy nothing: four concurrent single-image calls take exactly four times
+as long as one, because they serialise on the same kernels. Only a real batch
+does. So the requests have to meet somewhere, and the only place they can is
+inside photo-ml — a job is a claim on one photograph and must stay that way, or
+a lease and a failure would be shared between eight unrelated files. One
+collector thread and a 30ms window is the whole mechanism.*
+
+*Which retroactively makes `VISION_CONCURRENCY` a throughput knob rather than
+the no-op the original design correctly said it was. It is 4 by default and 8 is
+worth setting for an overnight run. 16 is not: the peak leaves too little for
+NVENC, which is the number §11 says to watch.)*
 
 One overnight run, once per model generation. Re-running everything except
 `mlprep` after a model swap is under five hours; re-running `embed` alone is
@@ -490,6 +647,18 @@ the user sees an empty grid with no evidence of why. The pills in §7 are the
 mitigation and they are not optional — a wrong parse has to be visible and
 removable, or the search will be trusted exactly once.
 
+*(Acted on, by inverting the order: the grammar was built first and the model
+second, and the model may only speak where the grammar was silent and only in
+words the query contains. This paragraph earned its place within an hour of the
+parser existing — see §7 for the hint-list failure, which was exactly this,
+found because the paragraph said to look for it. The pills are now built, and
+the × works: a chip removed rewrites the URL into the explicit spelling and asks
+again, so a wrong reading costs one click rather than a retyped sentence. The
+first thing it caught was its own: "snow in december 2025" reads the date
+correctly and returns 79, and taking the date off returns 388 — because only
+500 photographs have been through the captioner so far, so a narrow date range
+is mostly ranking a filter's leftovers. Which is visible now, and was not.)*
+
 **Free-form tags are a bet on cleanup happening.** `canonical_id` and tag-name
 clustering are what make that bet safe. If step 9 slips, search still works
 through the embeddings and FTS; the tag browser is what stays messy.
@@ -504,3 +673,17 @@ automatically — which only works if they are still a clean, separate table.
 lifecycle in §6 is the mechanism; the number to watch after step 5 is whether
 NVENC transcodes ever fail to allocate during a backfill. If they do, the
 vision pool needs a pause on transcode pressure rather than a bigger card.
+
+*(Still the number to watch, and now with an actual budget behind it: 2.3GB of
+encoder and 1.2 of parser resident, 10.1 more while the captioner is loaded, and
+1.4 for the desktop — about 15 of 16.3 at the peak of a captioning pass. The
+first lever if NVENC starts failing is `PHOTO_ML_DESCRIBE_BATCH`, 8 → 4, which
+gives back half a gigabyte and costs about ninety minutes over the library. The
+second is the pause this paragraph asks for, and it is still not built.)*
+
+**Nothing rebuilds the tsvector by itself.** `asset_search` is written by the
+describe and OCR jobs, and by nothing else — so a tag merge, a re-geocode, or a
+changed recipe in `rebuild_asset_search` leaves every row already written out of
+date. `photobackup ml reindex` is the answer and it takes seconds, but it has to
+be *remembered*, which is the same shape of bet as the free-form tags above and
+is worth naming as one.

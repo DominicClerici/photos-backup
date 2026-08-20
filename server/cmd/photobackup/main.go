@@ -8,6 +8,7 @@
 //	photobackup export --to DIR [--from DATE] [--until DATE] [--copy]
 //	photobackup reindex [--adopt-orphans] [--dry-run]
 //	photobackup geocode [--all] [--dry-run]
+//	photobackup ml status | backfill [--kind K] [--stills N] [--videos N] | reindex
 //	photobackup import --from DIR [--dry-run]
 //	photobackup import-snapchat --from DIR [--half memories|chat] [--dry-run]
 //	photobackup reset [--dry-run] [--yes] [--force]
@@ -42,6 +43,9 @@ const usage = `photobackup — maintenance for the photo archive
   export --to DIR [--copy]             materialize a date tree of hardlinks
   reindex [--adopt-orphans]            rebuild the database from manifest.jsonl
   geocode [--all] [--dry-run]          name the places photographs were taken
+  ml status | backfill | reindex       what photographs are of, in words: the
+                                       captions, tags and recognised text the
+                                       search box is built on
   import --from DIR [--dry-run]        ingest a Google Photos export
   import-snapchat --from DIR           ingest a Snapchat export, one half at a
     [--half memories|chat]             time; pass --from once per unzipped zip
@@ -89,6 +93,8 @@ func main() {
 		code, err = runReindex(ctx, os.Args[2:])
 	case "geocode":
 		code, err = runGeocode(ctx, os.Args[2:])
+	case "ml":
+		code, err = runML(ctx, os.Args[2:])
 	case "import":
 		code, err = runImport(ctx, os.Args[2:])
 	case "import-snapchat":

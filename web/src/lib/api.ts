@@ -405,6 +405,56 @@ export function fetchAsset(id: string, signal?: AbortSignal): Promise<AssetDetai
   return get<AssetDetail>(`/v1/assets/${id}`, signal);
 }
 
+/** One word a model wrote, as it is searched and as it was written. */
+export interface AnalysisTag {
+  /** What a search resolves this to, after any merge. */
+  name: string;
+  /**
+   * What the captioner actually wrote, present only when a merge has folded it
+   * into something else. Seeing that a photograph was called "puppy" and is
+   * findable as "dog" is what makes the tag cleanup reviewable.
+   */
+  raw?: string;
+  confidence?: number;
+}
+
+/**
+ * What the ML passes have said about one photograph — the mirror of a search.
+ *
+ * Every field is optional and an absent one is not the same as an empty one,
+ * which is what `jobs` is for: a photograph with no caption may be one the
+ * captioner has not reached, or one it failed on, and a panel that drew both as
+ * blank would be a filter with no evidence of itself.
+ */
+export interface AssetAnalysis {
+  caption?: string;
+  caption_model?: string;
+  captioned_at?: string;
+  tags?: AnalysisTag[];
+  /** Everything the text recogniser read, unabridged. */
+  text?: string;
+  text_model?: string;
+  read_at?: string;
+  /** How many vectors the encoder wrote: 1 for a still, one per sampled frame. */
+  frames?: number;
+  vision_model?: string;
+  /** State of each ML job that has a row: mlprep, vision, ocr, describe. */
+  jobs?: Record<string, string>;
+}
+
+/**
+ * Fetched on its own rather than with the detail, because the panel that draws
+ * it is a toggle and recognised text is unbounded — a screenshot of a terminal
+ * is kilobytes of it, and nobody arrow-keying through the viewer with the panel
+ * shut should be carrying that.
+ */
+export function fetchAnalysis(
+  id: string,
+  signal?: AbortSignal,
+): Promise<AssetAnalysis> {
+  return get<AssetAnalysis>(`/v1/assets/${id}/analysis`, signal);
+}
+
 export interface Health {
   ok: boolean;
   failed_jobs: number;
@@ -430,6 +480,97 @@ export async function fetchStates(
   if (!res.ok) throw new ApiError(res.status, await errorText(res));
   const body = (await res.json()) as { items: TimelineItem[] };
   return body.items ?? [];
+}
+
+/**
+ * Where a photograph was taken, at whichever of the three levels the query
+ * named it. Exactly one field is set — see searchquery.Place.
+ */
+export interface SearchPlace {
+  city?: string;
+  admin1?: string;
+  country?: string;
+}
+
+/**
+ * What the server thought the question was.
+ *
+ * Echoed back with every result page, and the whole of why the chips can exist:
+ * a parser fails *confidently* — it decides "last summer" meant 2024, silently
+ * removes the right answer, and shows an empty grid. Sending the reading back
+ * out is what lets somebody see it and click the × . See internal/api/search.go.
+ */
+export interface ParsedQuery {
+  /** What was typed, verbatim. */
+  text: string;
+  people?: string[];
+  place?: SearchPlace;
+  tags?: string[];
+  /** Civil days, YYYY-MM-DD, both inclusive. */
+  after?: string;
+  before?: string;
+  kind?: MediaKind;
+  category?: string;
+  favorites?: boolean;
+  /**
+   * The leftover phrase that went to the encoder, which is not what was typed.
+   * Echoed because "why did searching for my dog return the ocean" is answered
+   * by seeing that the phrase became "ocean".
+   */
+  visual?: string;
+  /** "grammar" when the Go parser answered alone, "model" when photo-ml added. */
+  source: string;
+}
+
+/**
+ * One ranked photograph, and why it is here.
+ *
+ * A timeline item with the evidence bolted on, so the grid draws a search
+ * result with the component it draws everything else with.
+ */
+export interface SearchResult extends TimelineItem {
+  /** The fused rank. Comparable within one result set and meaningless between two. */
+  score: number;
+  /** Cosine similarity to the query phrase, absent when nothing was embedded. */
+  similarity?: number;
+  caption?: string;
+  tags?: string[];
+  /** The matching stretch of recognised text, with the match marked by []. */
+  snippet?: string;
+}
+
+export interface SearchPage {
+  query: ParsedQuery;
+  items: SearchResult[];
+  /**
+   * How many candidates the ranking had to choose from, not how many
+   * photographs in the archive could conceivably match. For a fused ranking
+   * that is the honest number.
+   */
+  total: number;
+  /** What this search could not do, in a sentence. Empty when nothing was lost. */
+  degraded?: string;
+}
+
+/**
+ * One page of a ranked search.
+ *
+ * The request is the caller's own parameters rather than a record, because they
+ * are the API's: `q` alone asks the server to parse, and the explicit spelling
+ * — `parse=0` beside `person`, `after`, `visual` and the rest — is what a chip
+ * row edits. Materialising the parse into parameters is the only way to say
+ * "and not the date it found"; see lib/search.
+ */
+export function fetchSearch(
+  params: URLSearchParams,
+  limit: number,
+  offset: number,
+  signal?: AbortSignal,
+): Promise<SearchPage> {
+  const query = new URLSearchParams(params);
+  query.set("limit", String(limit));
+  if (offset > 0) query.set("offset", String(offset));
+  return get<SearchPage>(`/v1/search?${query}`, signal);
 }
 
 /**

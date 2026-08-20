@@ -66,6 +66,29 @@ const (
 	// stopped by a service being restarted, and Defer below is what keeps an
 	// outage from marking sixty thousand perfectly good photographs broken.
 	KindVision Kind = "vision"
+	// KindOCR is a dedicated text recogniser over the same renditions: what a
+	// screenshot says, what is on the receipt, what the road sign read.
+	//
+	// Its own kind rather than part of KindDescribe, because it is a different
+	// model with a different cost — minutes over the library against hours —
+	// and because it is the one of the two that runs on the CPU. Folding them
+	// together would mean a captioner swap re-reading every screenshot in the
+	// archive to learn nothing new.
+	KindOCR Kind = "ocr"
+	// KindDescribe is the captioner: a sentence and a handful of free-form tags
+	// per frame, from a 4B vision-language model.
+	//
+	// The expensive pass in the whole system — hours, where re-embedding the
+	// library is fifteen minutes — which is exactly why it is separate from
+	// KindVision. One job for both would tie every encoder bench to a full
+	// re-captioning, the same coupling ML_IMAGES.md §5 split mlprep out to
+	// avoid, one step further along.
+	//
+	// Unlike every other kind here, there is no reconcile that queues this on
+	// startup. A restart may not begin four hours of GPU work: the backfill is
+	// `photobackup ml backfill`, typed deliberately. New uploads are queued by
+	// the mlprep job the ordinary way.
+	KindDescribe Kind = "describe"
 	// KindMerge concatenates a set of Snapchat segments into one archived
 	// recording. ffmpeg, so it runs in the transcode pool; the asset it names is
 	// the first piece, which is as close as this table gets to naming a group.
@@ -230,6 +253,36 @@ var ErrNoJob = errors.New("jobs: nothing to claim")
 // Attempts is incremented here rather than on failure, so a job that kills its
 // worker outright still burns an attempt and cannot loop forever.
 func (q *Queue) Claim(ctx context.Context, kinds []Kind, workerID string) (Job, error) {
+	return q.claim(ctx, kinds, workerID, false)
+}
+
+// ClaimInOrder is Claim for a pool whose kinds are a priority list rather than
+// a set: every runnable job of the first kind goes before any job of the
+// second.
+//
+// One pool uses it, and it is the pool in front of the GPU. Its three kinds cost
+// wildly different amounts — fifteen minutes to embed the library, twenty to
+// read the text in it, four hours to caption it — and FIFO across the three
+// would interleave them so that all three finish at the end. Draining in order
+// means the fifteen-minute pass is done fifteen minutes in, and the four-hour
+// one runs on a machine that has nothing else to do. It is also what keeps the
+// captioner and the recogniser from thrashing the card by loading and unloading
+// past each other.
+//
+// Starvation is the obvious objection and it does not apply here: these queues
+// are finite passes over a library that is not growing during a backfill, and a
+// photograph uploaded mid-run jumps to the front of all three rather than
+// waiting behind the caption pass — which is the right way round.
+//
+// Every other pool keeps Claim's plain FIFO, deliberately. The transcode pool
+// holds playbacks and merges, neither of which anybody is waiting for, and
+// ranking one over the other would be a behaviour change made as a side effect
+// of something unrelated.
+func (q *Queue) ClaimInOrder(ctx context.Context, kinds []Kind, workerID string) (Job, error) {
+	return q.claim(ctx, kinds, workerID, true)
+}
+
+func (q *Queue) claim(ctx context.Context, kinds []Kind, workerID string, ordered bool) (Job, error) {
 	if len(kinds) == 0 {
 		return Job{}, ErrNoJob
 	}
@@ -238,7 +291,12 @@ func (q *Queue) Claim(ctx context.Context, kinds []Kind, workerID string) (Job, 
 		names[i] = string(k)
 	}
 
-	const claim = `
+	order := "run_after, id"
+	if ordered {
+		order = "array_position($1::text[], kind), run_after, id"
+	}
+
+	claim := `
 		update jobs set
 			state = 'running',
 			attempts = attempts + 1,
@@ -250,7 +308,7 @@ func (q *Queue) Claim(ctx context.Context, kinds []Kind, workerID string) (Job, 
 			where state = 'pending'
 			  and run_after <= now()
 			  and kind = any($1::text[])
-			order by run_after, id
+			order by ` + order + `
 			for update skip locked
 			limit 1
 		)
@@ -405,6 +463,73 @@ func ReconcileVision(ctx context.Context, q Execer, model string) (int64, error)
 	tag, err := q.Exec(ctx, upsert, model)
 	if err != nil {
 		return 0, fmt.Errorf("reconcile vision jobs: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// Unbounded asks QueueWords for every asset that is owed work.
+const Unbounded = -1
+
+// QueueWords queues the captioner or the text recogniser over assets nothing has
+// described yet, newest first, and bounded.
+//
+// It is a command rather than a reconcile, and that is the difference between
+// this and ReconcileVision. Embedding the library is fifteen minutes and is a
+// reasonable consequence of a restart. Captioning it is four hours of GPU, and a
+// `systemctl restart photod` that quietly begins four hours of work is a service
+// restart with a surprise in it — the same objection migrations 0016 and 0017
+// made to queueing from a migration, applied to the other thing that runs
+// without anybody typing. `photobackup ml backfill` is where it is typed.
+//
+// Bounded separately for stills and videos, because that is how a sample is
+// asked for: a thousand photographs and twenty clips is an evening's worth of
+// vocabulary to build a search page against, and it is a different question from
+// "how many assets". Unbounded for either means all of them.
+//
+// Newest first, because a bounded run is a sample and the most recent
+// photographs are the ones somebody is about to search for.
+//
+// The conflict clause requeues what already ran, so a captioner swap is a delete
+// from asset_descriptions and this command — never a migration.
+func QueueWords(ctx context.Context, q Execer, kind Kind, model string, stills, videos int) (int64, error) {
+	var written string
+	switch kind {
+	case KindDescribe:
+		written = `select 1 from asset_descriptions d where d.asset_id = a.id and d.model = $1`
+	case KindOCR:
+		written = `select 1 from asset_ocr o where o.asset_id = a.id and o.model = $1`
+	default:
+		return 0, fmt.Errorf("queue words: %q is not a captioning kind", kind)
+	}
+
+	// The mlprep job being done is the dependency and the scope at once: there
+	// is no point handing photo-ml an asset whose renditions have not been
+	// written, and the timeline's exclusions — vault, trash, overlays, paired
+	// videos — are already baked into which assets have an mlprep row rather
+	// than restated here.
+	insert := `
+		with candidates as (
+			select a.id, a.media_kind,
+			       row_number() over (
+			           partition by a.media_kind
+			           order by a.sort_time desc, a.id desc) as rank
+			from assets a
+			join jobs prep on prep.asset_id = a.id
+			     and prep.kind = 'mlprep' and prep.state = 'done'
+			where a.vault = '' and a.deleted_at is null
+			  and not exists (` + written + `)
+		)
+		insert into jobs (kind, asset_id)
+		select $2, id from candidates
+		where (media_kind = 'image' and ($3 < 0 or rank <= $3))
+		   or (media_kind = 'video' and ($4 < 0 or rank <= $4))
+		on conflict (asset_id, kind) do update
+		    set state = 'pending', run_after = now(), attempts = 0, last_error = null
+		    where jobs.state = 'failed' or jobs.state = 'done'`
+
+	tag, err := q.Exec(ctx, insert, model, string(kind), stills, videos)
+	if err != nil {
+		return 0, fmt.Errorf("queue %s jobs: %w", kind, err)
 	}
 	return tag.RowsAffected(), nil
 }

@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 
 import {
+  fetchAnalysis,
   fetchAsset,
   livePreviewUrl,
   originalUrl,
@@ -11,6 +13,8 @@ import {
   playbackUrl,
   previewUrl,
   thumbUrl,
+  type AnalysisTag,
+  type AssetAnalysis,
   type AssetDetail,
   type TimelineItem,
 } from "@/lib/api";
@@ -21,8 +25,10 @@ import {
   formatDuration,
   mapLink,
 } from "@/lib/format";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useLiveFade } from "@/hooks/useLiveFade";
+import { askFor } from "@/lib/search";
 import { cn } from "@/lib/utils";
 
 /** The bar's controls are 34px, between shadcn's icon (32px) and icon-lg (36px). */
@@ -69,11 +75,25 @@ interface Props {
   index: number;
   onClose: () => void;
   onNavigate: (index: number) => void;
+  /**
+   * This collection is the vault, so the panel may show what the sealed
+   * document says and may not offer to look anything up.
+   *
+   * The names on a hidden photograph came out of the vault; typing one into
+   * /v1/search would put it in the URL, in the browser's history, and in the
+   * list of recent searches this app keeps — three places outside the vault,
+   * for a name the vault is holding. Nothing else in the panel is affected,
+   * because nothing else in it exists: the ML passes all refuse a sealed asset
+   * and the analysis comes back empty.
+   */
+  sealed?: boolean;
 }
 
-export function Viewer({ at, total, index, onClose, onNavigate }: Props) {
+export function Viewer({ at, total, index, onClose, onNavigate, sealed }: Props) {
+  const router = useRouter();
   const item = at(index);
   const [detail, setDetail] = useState<AssetDetail | null>(null);
+  const [analysis, setAnalysis] = useState<AssetAnalysis | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
   const [loaded, setLoaded] = useState(false);
   // Kept across navigation rather than reset per photo: Snapchat memories
@@ -97,6 +117,28 @@ export function Viewer({ at, total, index, onClose, onNavigate }: Props) {
       });
     return () => controller.abort();
   }, [item?.id]);
+
+  // What the models said, fetched only while the panel is open and asked again
+  // for each photograph stepped to with it open.
+  //
+  // Separate from the detail above rather than folded into it, because the two
+  // are wanted at different moments: the detail is on every arrow-key press and
+  // this is on a toggle, and a photograph of a terminal carries kilobytes of
+  // recognised text that nobody with the panel shut has asked to download.
+  useEffect(() => {
+    if (!item || !panelOpen) return;
+    setAnalysis(null);
+    const controller = new AbortController();
+    fetchAnalysis(item.id, controller.signal)
+      .then(setAnalysis)
+      .catch(() => {
+        // The rest of the panel still draws, and this half goes on saying it is
+        // reading — the same thing the panel already does when the detail fetch
+        // fails, and for the same reason: a photograph is not the place to
+        // report that the server is unreachable, and the status page is.
+      });
+    return () => controller.abort();
+  }, [item?.id, panelOpen]);
 
   // Preloading the neighbours is what makes arrow-keying feel instant. The
   // preview is rendered per request, so this also gets the conversion started
@@ -297,7 +339,20 @@ export function Viewer({ at, total, index, onClose, onNavigate }: Props) {
         ) : null}
       </div>
 
-      {panelOpen ? <MetadataPanel detail={detail} /> : null}
+      {panelOpen ? (
+        <MetadataPanel
+          detail={detail}
+          analysis={analysis}
+          onSearch={
+            sealed
+              ? undefined
+              : (text) => {
+                  onClose();
+                  router.push(`/search?${askFor(text)}`);
+                }
+          }
+        />
+      ) : null}
     </div>
   );
 }
@@ -576,7 +631,20 @@ function VideoStage({ item, plain }: { item: TimelineItem; plain: boolean }) {
   );
 }
 
-function MetadataPanel({ detail }: { detail: AssetDetail | null }) {
+function MetadataPanel({
+  detail,
+  analysis,
+  onSearch,
+}: {
+  detail: AssetDetail | null;
+  /** Null while it is still being fetched, and after a fetch that failed. */
+  analysis: AssetAnalysis | null;
+  /**
+   * Ask the archive for everything else that was called this, or undefined
+   * where nothing may be looked up — see Props.sealed.
+   */
+  onSearch?: (text: string) => void;
+}) {
   if (!detail) {
     return (
       <aside className={PANEL}>
@@ -605,6 +673,13 @@ function MetadataPanel({ detail }: { detail: AssetDetail | null }) {
       <h3 className="mb-4 text-sm font-semibold [overflow-wrap:anywhere]">
         {detail.filename}
       </h3>
+
+      <Analysis
+        analysis={analysis}
+        people={detail.people}
+        description={detail.description}
+        onSearch={onSearch}
+      />
 
       <dl className="flex flex-col gap-3.5">
         <Row label="Taken">
@@ -664,6 +739,303 @@ function MetadataPanel({ detail }: { detail: AssetDetail | null }) {
       </dl>
     </aside>
   );
+}
+
+/**
+ * The four passes, in the order a photograph goes through them, and what to
+ * call each one to somebody who is not holding ML_IMAGES.md.
+ *
+ * `mlprep` is in here even though it is not ML at all, because it is the one
+ * whose failure explains all three of the others: no rendition means nothing
+ * ever looked at the photograph, and three separate "not captioned yet" lines
+ * would be three symptoms of one cause.
+ */
+const PASSES = ["mlprep", "vision", "ocr", "describe"] as const;
+
+const PASS_LABEL: Record<string, string> = {
+  mlprep: "the rendition",
+  vision: "the encoder",
+  ocr: "the text recogniser",
+  describe: "the captioner",
+};
+
+/**
+ * What the models have said about this photograph — and, where they have said
+ * nothing, which of the two reasons that is.
+ *
+ * This is a search read backwards. /v1/search takes a sentence and ranks
+ * photographs out of these four tables; this takes a photograph and shows the
+ * words the ranking was built from. Which is the question somebody has the
+ * moment a search returns something surprising, and it is also the only way to
+ * see what the model actually called things — the thing ML_IMAGES.md §9's tag
+ * cleanup has to be read through.
+ *
+ * Nothing here is drawn as blank. A photograph with no caption is one the
+ * captioner has not reached, or one it failed on, or one nothing has queued —
+ * and a panel that drew all three the same way would be §11's silent exclusion
+ * with a nicer font. See `notes`.
+ */
+function Analysis({
+  analysis,
+  people,
+  description,
+  onSearch,
+}: {
+  analysis: AssetAnalysis | null;
+  /** Names an import carried, which are not the model's and never become tags. */
+  people?: string[];
+  /** What a person typed under the photograph, before this archive existed. */
+  description?: string;
+  onSearch?: (text: string) => void;
+}) {
+  const tags = analysis?.tags ?? [];
+  const said = Boolean(analysis?.caption || tags.length || analysis?.text);
+  const pending = notes(analysis);
+
+  // A Live Photo's video half, a Snapchat overlay layer, anything in the vault:
+  // the ML pass is 23% smaller than the library and skips these by construction
+  // rather than by a queue that has not got to them. There is no story to tell
+  // about a photograph nothing was ever going to look at.
+  if (analysis && !said && !description && !people?.length && pending.length === 0) {
+    return null;
+  }
+
+  return (
+    <section className="mb-5 flex flex-col gap-3.5 border-b pb-5">
+      {/* Only where there is a sentence to head, or one still coming. A heading
+          over nothing is the blank this component exists not to draw — the note
+          at the foot says why there is no caption, and says it in words. */}
+      {analysis == null || analysis.caption ? (
+        <div>
+          <h4 className="mb-[3px] text-[11px] tracking-[0.06em] text-faint uppercase">
+            Analysis
+          </h4>
+          {analysis == null ? (
+            <p className="text-[13px] text-faint">Reading what the models said…</p>
+          ) : (
+            <p className="text-[13px] leading-[1.45]">{analysis.caption}</p>
+          )}
+          {analysis?.caption_model ? (
+            <span className={PANEL_HINT}>{analysis.caption_model}</span>
+          ) : null}
+        </div>
+      ) : null}
+
+      {tags.length ? (
+        <div>
+          <h4 className="mb-1.5 text-[11px] tracking-[0.06em] text-faint uppercase">
+            Tags
+          </h4>
+          <span className="flex flex-wrap gap-1.5">
+            {tags.map((tag) => (
+              <TagChip key={tag.name + tag.raw} tag={tag} onSearch={onSearch} />
+            ))}
+          </span>
+        </div>
+      ) : null}
+
+      {people?.length ? (
+        <div>
+          <h4 className="mb-1.5 text-[11px] tracking-[0.06em] text-faint uppercase">
+            People
+          </h4>
+          <span className="flex flex-wrap gap-1.5">
+            {people.map((name) =>
+              onSearch ? (
+                <Badge
+                  key={name}
+                  variant="outline"
+                  className="cursor-pointer hover:bg-muted"
+                  render={<button type="button" />}
+                  onClick={() => onSearch(name)}
+                  title={`Search for ${name}`}
+                >
+                  {name}
+                </Badge>
+              ) : (
+                <Badge key={name} variant="outline">
+                  {name}
+                </Badge>
+              ),
+            )}
+          </span>
+          {/* The seam ML_IMAGES.md §11 asks to keep visible: a name somebody
+              confirmed is a different kind of claim from a word a model wrote,
+              and the panel should not be the place the two quietly become one
+              list of things "in" the photograph. */}
+          <span className={PANEL_HINT}>named when this was imported</span>
+        </div>
+      ) : null}
+
+      {description ? (
+        <div>
+          <h4 className="mb-[3px] text-[11px] tracking-[0.06em] text-faint uppercase">
+            Description
+          </h4>
+          <p className="text-[13px] leading-[1.45] [overflow-wrap:anywhere]">
+            {description}
+          </p>
+          <span className={PANEL_HINT}>written by a person, not a model</span>
+        </div>
+      ) : null}
+
+      {analysis?.text ? (
+        <div>
+          <h4 className="mb-1.5 text-[11px] tracking-[0.06em] text-faint uppercase">
+            Recognised text
+          </h4>
+          {/* The whole of it, scrolled rather than truncated. A search shows the
+              matching line; somebody who opened this panel on a receipt wants
+              the receipt. Rendered as text and never as markup — a photograph of
+              a screen is exactly where a <script> would come from. */}
+          <p className="max-h-40 overflow-y-auto rounded-md bg-muted/40 px-2.5 py-2 font-mono text-[11px] leading-[1.5] whitespace-pre-wrap text-muted-foreground">
+            {analysis.text}
+          </p>
+          {analysis.text_model ? (
+            <span className={PANEL_HINT}>{analysis.text_model}</span>
+          ) : null}
+        </div>
+      ) : null}
+
+      {pending.length ? (
+        <ul className="flex flex-col gap-1 text-[11px] leading-[1.4] text-faint">
+          {pending.map((note) => (
+            <li key={note}>{note}</li>
+          ))}
+        </ul>
+      ) : null}
+
+      {analysis?.frames ? (
+        <span className="text-[11px] text-faint">
+          Findable by what it looks like ·{" "}
+          {analysis.frames === 1 ? "one frame" : `${analysis.frames} frames`}
+          {analysis.vision_model ? ` · ${analysis.vision_model}` : ""}
+        </span>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * One word, and the way back to everything else that was called it.
+ *
+ * Clicking searches rather than filtering the current view, because a tag is a
+ * question about the whole archive: "what else did it call a beach" is not a
+ * narrowing of the album somebody happens to have open.
+ */
+function TagChip({
+  tag,
+  onSearch,
+}: {
+  tag: AnalysisTag;
+  onSearch?: (text: string) => void;
+}) {
+  const confidence =
+    tag.confidence != null && tag.confidence > 0
+      ? `${Math.round(tag.confidence * 100)}% sure`
+      : "";
+  // Only ever set when a merge has folded one word into another, which is the
+  // one case where what the model wrote and what a search resolves to are two
+  // different facts worth seeing side by side.
+  const merged = tag.raw ? `written as “${tag.raw}”` : "";
+
+  const label = (
+    <>
+      {tag.name}
+      {merged ? <span className="text-faint">*</span> : null}
+    </>
+  );
+  const title = [merged, confidence].filter(Boolean).join(" · ");
+
+  if (!onSearch) {
+    return (
+      <Badge variant="secondary" title={title}>
+        {label}
+      </Badge>
+    );
+  }
+  return (
+    <Badge
+      variant="secondary"
+      className="cursor-pointer hover:bg-secondary/80"
+      render={<button type="button" />}
+      onClick={() => onSearch(tag.name)}
+      title={[`Search for ${tag.name}`, title].filter(Boolean).join(" · ")}
+    >
+      {label}
+    </Badge>
+  );
+}
+
+/**
+ * Why a pass has said nothing, for each pass that has said nothing.
+ *
+ * Empty on a photograph that has been all the way through, which is the
+ * majority and should cost no lines in the panel. Everything else here is the
+ * difference between "there is nothing in this photograph" and "nothing has
+ * looked at this photograph", which are the two readings of an empty panel and
+ * are not remotely the same news.
+ */
+function notes(analysis: AssetAnalysis | null): string[] {
+  if (!analysis) return [];
+  const jobs = analysis.jobs ?? {};
+
+  // A missing rendition is the cause of everything downstream, so it is said
+  // once and the three symptoms are left unsaid.
+  if (jobs.mlprep === "failed") {
+    return ["No ML rendition could be made, so nothing has looked at this."];
+  }
+
+  const out: string[] = [];
+  for (const pass of PASSES) {
+    if (pass === "mlprep") continue;
+    const produced =
+      pass === "vision"
+        ? Boolean(analysis.frames)
+        : pass === "ocr"
+          ? analysis.text != null
+          : analysis.caption != null;
+    const state = jobs[pass];
+
+    if (state === "done") {
+      // Ran, and found nothing. Worth saying for the recogniser — a photograph
+      // with no text in it is the ordinary case and looks identical to one
+      // nobody has read — and worth saying for the captioner, where it means
+      // the model returned an empty sentence.
+      if (!produced) {
+        out.push(
+          pass === "ocr"
+            ? "No text was found in this photograph."
+            : `Nothing came back from ${PASS_LABEL[pass]}.`,
+        );
+      }
+      continue;
+    }
+    if (produced) continue;
+
+    switch (state) {
+      case "failed":
+        out.push(`${sentence(PASS_LABEL[pass])} failed on this photograph.`);
+        break;
+      case "running":
+        out.push(`${sentence(PASS_LABEL[pass])} is looking at this now.`);
+        break;
+      case "pending":
+        out.push(`Queued for ${PASS_LABEL[pass]}.`);
+        break;
+      default:
+        // No row at all. The ordinary state of a library the captioning
+        // backfill has not been run over — it is a typed command rather than
+        // something a restart begins, so this is a fact about the archive
+        // rather than a fault in it.
+        out.push(`${sentence(PASS_LABEL[pass])} has not been run over this.`);
+    }
+  }
+  return out;
+}
+
+function sentence(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {

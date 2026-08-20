@@ -28,14 +28,23 @@ gone, and telling those apart is the one thing photod needs from this process.
 ## Endpoints
 
 ```
-GET  /health          which models are resident, and on what device
+GET  /health          which models are loaded, and on what device
 POST /embed           images[] or texts[] → unit vectors[], 1152-d
+POST /describe        images[] → [{caption, tags[]}]
+POST /ocr             images[] → [{text, lines[]}]
+POST /parse           query → filter JSON, as a suggestion
 ```
 
-`/describe`, `/ocr` and `/parse` are ML_IMAGES.md step 6 and 7. They are not
-here yet, and the shape of `app.py` assumes they will be: each borrows a model
-through the same `Residency`, so adding the captioner is a `register()` call and
-a route rather than a second way of managing the card.
+All five of ML_IMAGES.md §6. Every one of them borrows its model through the
+same `Residency`, so what separates the encoder that is always loaded from the
+captioner that is not is one argument at registration — and no handler knows
+which it got.
+
+Each route answers **per image, in order, with no merging**. This service holds
+no state and knows nothing about assets: it is handed some pictures and says
+what is in each of them, so deciding that three of them are one video is a
+decision for the process that knows what a video is. See
+`worker.foldDescriptions`.
 
 ### Proving it works, with curl alone
 
@@ -91,6 +100,55 @@ phrase should score higher:
 photo-ml/check-space.sh /path/to/some.ml.webp "a dog" "a spreadsheet"
 ```
 
+A caption and some words for it:
+
+```sh
+curl -s localhost:8789/describe \
+  -H 'content-type: application/json' \
+  -d "{\"images\":[\"$img\"]}" | python3 -m json.tool
+```
+
+```json
+{
+  "model": "qwen3-vl-4b-instruct",
+  "results": [
+    {
+      "caption": "Group of people sitting on a grassy hillside overlooking a forested mountain range under a clear blue sky.",
+      "tags": [
+        {"name": "mountain", "confidence": 1.0},
+        {"name": "group", "confidence": 0.95},
+        {"name": "hillside", "confidence": 0.9}
+      ]
+    }
+  ]
+}
+```
+
+The confidences are the model's own ordering turned into a number, not a
+probability — it reports none. They exist so that the twelve-tag cap in
+`db.normalizeTags` keeps the words the model led with rather than whichever
+twelve hashed first.
+
+Whatever is written on it:
+
+```sh
+curl -s localhost:8789/ocr -H 'content-type: application/json' \
+  -d "{\"images\":[\"$img\"]}" | python3 -m json.tool
+```
+
+And what it thinks a search query was asking for — remembering that the Go
+grammar has already answered by the time photod asks this, and that everything
+below will be checked against the archive before any of it is believed:
+
+```sh
+curl -s localhost:8789/parse -H 'content-type: application/json' \
+  -d '{"query":"addy and me in mexico","today":"2026-08-20","people":["Dominic","Addy"]}'
+```
+
+```json
+{"people":["addy"],"place":"mexico","after":"","before":"","visual":""}
+```
+
 ## Settings
 
 All optional; every one falls back to its default rather than refusing to start.
@@ -101,10 +159,34 @@ All optional; every one falls back to its default rather than refusing to start.
 | `PHOTO_ML_PORT` | `8789`, beside photod's 8787 and 8788 |
 | `PHOTO_ML_DEVICE` | `auto` — CUDA when it is there, the CPU when it is not. The fallback is about fifty times slower and completely correct. |
 | `PHOTO_ML_IDLE_SECONDS` | `300` — how long an on-demand model may sit unused before its VRAM goes back |
-| `PHOTO_ML_MAX_BATCH` | `32`. The worker sends 1 for a photograph and 6 for a video, so this bounds mistakes rather than tuning anything. |
+| `PHOTO_ML_MAX_BATCH` | `32`. The worker sends 1 image for a photograph and 3 or 6 for a video, so this bounds mistakes rather than tuning anything. |
+| `PHOTO_ML_MODELS` | which models this instance loads; every one by default. `PHOTO_ML_MODELS=caption` is how a second instance shares the card with the first — see below. |
+| `PHOTO_ML_DESCRIBE_BATCH` | `8` — how many images the captioner may put through one forward pass. Bounded by VRAM, not by throughput. See [Batching](#batching-the-captioner). |
+| `PHOTO_ML_BATCH_WINDOW_MS` | `30` — how long the collector waits for company before running a batch |
+| `PHOTO_ML_PARSER_MODEL` | `Qwen/Qwen3-0.6B`. Swappable; see [The query parser](#the-query-parser). |
 | `PHOTO_ML_CACHE_DIR` | where transformers keeps weights. Set explicitly by the unit, which gives the service one writable directory and no home. |
 
-## The model
+## The models
+
+| key | checkpoint | stored as | VRAM | residency |
+|---|---|---|---|---|
+| `vision` | `google/siglip2-so400m-patch14-384` | `siglip2-so400m-patch14-384` | 2.3GB | resident |
+| `parse` | `Qwen/Qwen3-0.6B` | — | 1.2GB | resident |
+| `caption` | `Qwen/Qwen3-VL-4B-Instruct` | `qwen3-vl-4b-instruct` | 9.1–10.1GB | on demand |
+| `ocr` | rapidocr (PP-OCR, ONNX) | `rapidocr` | none — CPU | on demand |
+
+Checkpoint and stored name are deliberately two strings. The row records what
+produced a caption or a vector and will outlive whatever the weights were called
+on whichever mirror they came from, so the identity is ours: `db.VisionModel`,
+`db.CaptionModel` and `db.OCRModel` hold the same constants on the Go side, and
+migration `0017_vision.sql` names the encoder in the HNSW index's predicate.
+
+That table is also a VRAM budget. 2.3 + 1.2 resident, 10.1 more while the
+captioner is loaded, 1.4 for the desktop session — about 15 of 16.3GB at the
+peak of a backfill, which is why the captioner is on demand, why the parser is
+0.6B, and why `PHOTO_ML_DESCRIBE_BATCH` stops at 8 rather than 16.
+
+### The encoder
 
 `google/siglip2-so400m-patch14-384`, recorded in the database as
 `siglip2-so400m-patch14-384`.
@@ -135,17 +217,124 @@ torch wheels on PyPI are built for nothing newer than Hopper. Without the
 cleanly, and then reports *no kernel image is available for execution on the
 device* on the first forward pass.
 
+**torchvision has to come from that index too**, and that one is easy to lose an
+hour to: PyPI's build is against CUDA 13, so mixing it with a cu128 torch gives
+*PyTorch and torchvision were compiled with different CUDA major versions* on a
+package nothing here calls directly. It is present only because transformers'
+Qwen3-VL processor imports a video processor that requires it, whether or not a
+video is ever sent.
+
+### The captioner
+
+`Qwen/Qwen3-VL-4B-Instruct` in bf16, which is a deliberate step away from §6's
+sketch of a 7–8B model at 4-bit. The AWQ and GPTQ kernels are the part of that
+ecosystem most likely to be missing an architecture on a card this new, and the
+failure mode is a service that installs, starts, and then reports *no kernel
+image* on the first forward pass — exactly the 1am debugging session this whole
+design is arranged to avoid. 4B in bf16 costs about the same VRAM as 8B in
+4-bit, needs no extra dependency, and runs the code path everything else here
+already runs on.
+
+Its prompt is deliberately narrow: no names, no places, no guessing. Names come
+from `asset_people`, where a person confirmed them, and places from the offline
+geocoder. ML_IMAGES.md §11's seam between *a name somebody approved* and *a word
+a model produced* runs right through `captioner.py`, and a captioner inventing
+"Phoenix" or "Chicago" would be the first thing to cross it.
+
+It returns JSON, and a malformed answer becomes a caption with no tags rather
+than a failed job — the sentence is the more useful half, and a 4xx here would
+burn an attempt against a photograph that is not the problem.
+
+### The text recogniser
+
+rapidocr on ONNX Runtime, on the **CPU**. Which means the OCR pass costs the card
+nothing and finishes while the captioner is still on its first thousand
+photographs, and it is why the two are separate job kinds on the Go side.
+
+A dedicated recogniser rather than asking the VLM to read the words: a model
+asked what a blurry sign says will tell you something plausible, and this one
+returns a confidence that can be thresholded. Lines under 0.5 confidence or two
+characters are dropped in `ocr.py`, because everything that gets through lands
+in a tsvector where a wrong word is a wrong search result.
+
+It is pointed at the same frames the captioner gets, videos included, and that
+is deliberate: a Snapchat memory carries its caption burned into the picture,
+and `mlprep` burns the overlay in on purpose.
+
+### The query parser
+
+`Qwen/Qwen3-0.6B`, resident, and worth being honest about. Measured against this
+archive's own queries, the gates in `searchquery.Merge` reject nearly everything
+it produces: it answers "today" to questions with no date in them, offers
+"beach" as a place, and handed the archive's people as a spelling hint returns
+the whole list on every query. What survives the gates is correct and
+occasionally useful — *addy and me in mexico* comes back with both — and what
+does not survive costs nothing.
+
+That is the arrangement §11 asks for, not a disappointment: **the Go grammar is
+the parser** and this is a suggestion box with a bouncer. It stays small because
+it stays resident, and the card has to fit a 9.6GB captioner beside it.
+`PHOTO_ML_PARSER_MODEL` swaps it — Qwen3-1.7B is meaningfully better at this and
+costs 3.4GB, which fits fine on a machine that is not captioning and does not fit
+on one that is.
+
+## Batching the captioner
+
+The captioner is memory-bandwidth bound: 8.8GB of weights are read for every
+token it generates, whether that token is for one image or twelve. Measured on
+the RTX 5060 Ti over this archive's own renditions:
+
+| batch | per image | over the library | peak VRAM |
+|---|---|---|---|
+| 1 | 1.47 s | 7.3 h | 9.1GB |
+| 4 | 0.78 s | 3.9 h | 9.6GB |
+| 8 | 0.48 s | 2.4 h | 10.1GB |
+| 16 | 0.38 s | 1.9 h | 11.2GB |
+
+Threads do not help — four concurrent single-image calls take exactly four times
+as long as one, because they serialise on the same kernels. Only a real batch
+does.
+
+So the requests have to meet somewhere, and the only place they can is inside
+this service. photod's vision pool is several workers each holding one asset's
+job, and it must stay that way: a job is a claim on one photograph, and batching
+at the queue level would mean a lease, a heartbeat and a failure shared between
+eight unrelated files. `batching.py` is one thread and a queue — a caller
+enqueues and waits, the collector takes the first thing it sees, waits 30ms for
+company, and runs whatever turned up as one call.
+
+Which means `VISION_CONCURRENCY` on the photod side is now a throughput knob
+rather than a no-op. It defaults to 4; raising it to 8 during an overnight run
+fills the batch and roughly halves the wall clock again.
+
+## Running two instances
+
+`PHOTO_ML_MODELS` names which models an instance loads. Nine gigabytes of
+captioner and two of encoder do not both fit twice, so a bench — the shape of
+every comparison §9 describes — means splitting them:
+
+```sh
+PHOTO_ML_PORT=8789 PHOTO_ML_MODELS=vision,parse,ocr photo-ml   # search
+PHOTO_ML_PORT=8799 PHOTO_ML_MODELS=caption          photo-ml   # captioning
+```
+
+A route whose model is not loaded answers **404**, not 503, and the difference
+matters to the caller: 503 means come back later and costs a job no attempt,
+while this is a permanent property of how the service was started. photod turns
+a 4xx into an ordinary failure, which is right — the fix is an env file, not
+time.
+
 ## Model residency
 
 The card is 16.3GB and the desktop session already holds about 1.4 of it. A
 model declares a role rather than being loaded wherever somebody first needs it:
 
 - **resident** — loaded at startup, never given back. The vision encoder, at
-  1.8GB, because interactive search embeds a phrase per query and a query that
-  waits twenty seconds for a checkpoint is not a search box.
+  2.3GB, and the query parser at 1.2GB, because interactive search embeds a
+  phrase and parses a sentence per query, and a query that waits twenty seconds
+  for a checkpoint is not a search box.
 - **on demand** — loaded when asked, unloaded once nothing has asked for
-  `PHOTO_ML_IDLE_SECONDS`. The 6GB captioner and the text recogniser that arrive
-  in step 6.
+  `PHOTO_ML_IDLE_SECONDS`. The 9.6GB captioner and the text recogniser.
 
 The mechanism is `residency.py`, and two details in it are the reason it is a
 module rather than a dict.

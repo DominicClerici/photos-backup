@@ -23,6 +23,14 @@ import {
   saveCachedStats,
   type CachedStats,
 } from './src/stats/cache';
+import { readSamples, surveySharedAlbums, type SampleRead } from './src/sharedalbums/survey';
+import {
+  formatDuration,
+  STILL_LONG_EDGE_CAP,
+  throughputMbPerSecond,
+  VIDEO_SECONDS_CAP,
+  type SharedSurvey,
+} from './src/sharedalbums/summary';
 import { formatAge, formatBytes, formatCount, formatLastBackup } from './src/stats/format';
 import { DEFAULT_GATE, NO_GATE, readConditions } from './src/sync/conditions';
 import { DEFAULT_ENGINE_CONFIG, SyncEngine } from './src/sync/engine';
@@ -68,6 +76,11 @@ export default function App() {
   const [pairError, setPairError] = useState<string | null>(null);
   const [galleryCheck, setGalleryCheck] = useState<CheckResult | null>(null);
   const [checkingGallery, setCheckingGallery] = useState(false);
+  const [survey, setSurvey] = useState<SharedSurvey | null>(null);
+  const [surveying, setSurveying] = useState(false);
+  const [surveyError, setSurveyError] = useState<string | null>(null);
+  const [samples, setSamples] = useState<SampleRead[] | null>(null);
+  const [fetchingSamples, setFetchingSamples] = useState(false);
   /** Seeded from the cache so the card has numbers before the first fetch lands. */
   const [stats, setStats] = useState<CachedStats | null>(loadCachedStats);
   /** True when the last refresh failed and what is on screen is the cache. */
@@ -245,6 +258,39 @@ export default function App() {
       setCheckingGallery(false);
     }
   }, []);
+
+  /**
+   * Looks at the iCloud Shared Albums on this phone without touching one.
+   *
+   * Nothing here feeds the backup — see src/shared/survey.ts for why it exists
+   * at all. It is here rather than behind a developer flag because the thing it
+   * measures is on this phone and nowhere else, and the answer decides whether
+   * shared albums are worth teaching the queue about.
+   */
+  const runSurvey = useCallback(async () => {
+    setSurveying(true);
+    setSurveyError(null);
+    // The old readings describe a library that has just been re-read. Leaving
+    // them beside fresh counts would invite reading one against the other.
+    setSamples(null);
+    try {
+      setSurvey(await surveySharedAlbums());
+    } catch (e) {
+      setSurveyError(errorText(e));
+    } finally {
+      setSurveying(false);
+    }
+  }, []);
+
+  const runSamples = useCallback(async () => {
+    if (!survey || survey.sample.length === 0) return;
+    setFetchingSamples(true);
+    try {
+      setSamples(await readSamples(survey.sample));
+    } finally {
+      setFetchingSamples(false);
+    }
+  }, [survey]);
 
   const start = useCallback(
     async (override = false) => {
@@ -486,6 +532,39 @@ export default function App() {
           )}
         </Section>
 
+        <Section title="Shared albums">
+          <Text style={styles.muted}>
+            iCloud Shared Albums are not in the library the backup enumerates — they live in
+            collections of their own, and nothing has ever archived them. This looks at what is
+            there before anything is built to send it.
+          </Text>
+          <Pressable
+            style={[styles.button, (!granted || surveying) && styles.buttonDisabled]}
+            onPress={() => void runSurvey()}
+            disabled={!granted || surveying}
+          >
+            <Text style={styles.buttonText}>
+              {surveying ? 'Surveying…' : 'Survey shared albums'}
+            </Text>
+          </Pressable>
+          {surveyError && <Text style={styles.warning}>{surveyError}</Text>}
+          {limitedAccess && (
+            <Text style={styles.warning}>
+              Limited access hides shared albums entirely, so a survey run now will find none
+              whether or not there are any.
+            </Text>
+          )}
+
+          {survey && (
+            <SharedSurveyReport
+              survey={survey}
+              samples={samples}
+              fetching={fetchingSamples}
+              onFetch={() => void runSamples()}
+            />
+          )}
+        </Section>
+
         {!granted && (
           <Text style={styles.warning}>
             Photo library access is required. Grant it in Settings to back anything up.
@@ -607,6 +686,171 @@ function Section({ title, children }: { title: string; children: React.ReactNode
       {children}
     </View>
   );
+}
+
+/**
+ * The shared-album survey, read out.
+ *
+ * Written to answer one question rather than to display a structure: is Apple's
+ * copy of a shared photo worth archiving? Everything on screen is arranged
+ * around that, and the two findings that would change the answer — a still above
+ * the documented cap, a full-size resource sitting beside the render — are
+ * called out in words rather than left to be spotted in a table.
+ *
+ * The counts are deliberately flat and unformatted where they are small. This is
+ * a diagnostic that will be read a handful of times by the person who wrote it
+ * and then deleted or promoted; dressing it up would cost more than it is worth.
+ */
+function SharedSurveyReport({
+  survey,
+  samples,
+  fetching,
+  onFetch,
+}: {
+  survey: SharedSurvey;
+  samples: SampleRead[] | null;
+  fetching: boolean;
+  onFetch: () => void;
+}) {
+  if (!survey.supported) {
+    return (
+      <Text style={styles.warning}>
+        This dev client has no shared-album enumerator in it. Rebuild it with{' '}
+        <Text style={styles.code}>pnpm ios</Text> and run the survey again.
+      </Text>
+    );
+  }
+
+  if (survey.albums.length === 0) {
+    return (
+      <Text style={styles.muted}>
+        No shared albums on this phone — so there is nothing missing from the backup, and
+        nothing here to decide about. Shared Albums can also be switched off entirely under
+        Settings › Photos, which looks exactly like this.
+      </Text>
+    );
+  }
+
+  const fullSize = (survey.resourceTypes.fullSizePhoto ?? 0) + (survey.resourceTypes.fullSizeVideo ?? 0);
+  const original = survey.still.overCap > 0 || fullSize > 0;
+
+  return (
+    <>
+      <View style={styles.counts}>
+        <Count label="albums" value={formatCount(survey.albums.length)} />
+        <Count label="assets" value={formatCount(survey.assets)} tone="good" />
+        <Count label="videos" value={formatCount(survey.videos)} />
+      </View>
+      <Text style={styles.muted}>
+        {formatCount(survey.stills)} stills · {formatCount(survey.videos)} videos ·{' '}
+        {formatCount(survey.live)} Live Photos
+        {survey.inMultipleAlbums > 0 &&
+          ` · ${formatCount(survey.inMultipleAlbums)} in more than one album`}
+      </Text>
+      {survey.oldest !== null && survey.newest !== null && (
+        <Text style={styles.muted}>
+          taken between {new Date(survey.oldest).toISOString().slice(0, 10)} and{' '}
+          {new Date(survey.newest).toISOString().slice(0, 10)}
+        </Text>
+      )}
+
+      <Text style={styles.subheading}>what sharing cost</Text>
+      <Text style={styles.muted}>
+        stills — longest edge {survey.still.maxLongEdge ?? '—'} px, {survey.still.atMax} of{' '}
+        {survey.stills} sitting exactly there
+      </Text>
+      <Text style={styles.muted}>
+        videos — longest edge {survey.video.maxLongEdge ?? '—'} px, longest clip{' '}
+        {formatDuration(survey.longestVideoSeconds)}
+      </Text>
+      {original ? (
+        <Text style={styles.good}>
+          {survey.still.overCap > 0
+            ? `${formatCount(survey.still.overCap)} stills are above the ${STILL_LONG_EDGE_CAP}px cap`
+            : `${formatCount(fullSize)} assets carry a full-size resource`}{' '}
+          — Apple is not downscaling everything here, so what a backup fetched may be the
+          original after all. Worth looking at one by hand before deciding.
+        </Text>
+      ) : (
+        <Text style={styles.muted}>
+          Nothing exceeds Apple&apos;s documented caps ({STILL_LONG_EDGE_CAP}px on a photo,{' '}
+          {formatDuration(VIDEO_SECONDS_CAP)} on a video) and no full-size resource exists, so
+          every one of these is Apple&apos;s re-encode. Backing them up archives the
+          downscale, which is the only copy that exists for anything you did not share
+          yourself.
+        </Text>
+      )}
+      <Text style={styles.muted}>
+        resources — {inventory(survey.resourceTypes)}
+      </Text>
+      <Text style={styles.muted}>sources — {inventory(survey.sourceTypes)}</Text>
+
+      <Text style={styles.subheading}>albums</Text>
+      {survey.albums.map((album, index) => (
+        <View key={`${album.title ?? 'untitled'}-${index}`} style={styles.failedRow}>
+          <Text style={styles.checkLabel}>{album.title ?? 'untitled album'}</Text>
+          <Text style={styles.muted}>
+            {formatCount(album.assets)} assets · {formatCount(album.stills)} stills ·{' '}
+            {formatCount(album.videos)} videos
+            {album.live > 0 && ` · ${formatCount(album.live)} live`}
+          </Text>
+        </View>
+      ))}
+
+      <Text style={styles.subheading}>fetching one</Text>
+      <Text style={styles.muted}>
+        A shared asset has no original on the disk, so reading one means asking iCloud for it.
+        This fetches {survey.sample.length} of them over the network, one at a time, and keeps
+        none of the bytes — it reports the size, how long it took, and how it fails.
+      </Text>
+      <Pressable
+        style={[styles.button, fetching && styles.buttonDisabled]}
+        onPress={onFetch}
+        disabled={fetching}
+      >
+        <Text style={styles.buttonText}>
+          {fetching ? 'Fetching…' : `Fetch ${survey.sample.length} sample(s) from iCloud`}
+        </Text>
+      </Pressable>
+
+      {samples?.map((sample) => (
+        <SampleRow key={sample.asset.localId} sample={sample} />
+      ))}
+    </>
+  );
+}
+
+function SampleRow({ sample }: { sample: SampleRead }) {
+  const { asset, read, error } = sample;
+  const rate = read ? throughputMbPerSecond(read.bytes, read.elapsedMs) : null;
+
+  return (
+    <View style={styles.failedRow}>
+      <Text style={styles.checkLabel}>
+        {error ? '✗' : '✓'} {asset.filename ?? asset.localId}
+      </Text>
+      {read ? (
+        <Text style={styles.logLine}>
+          {read.resourceType} · {asset.pixelWidth}×{asset.pixelHeight}
+          {asset.kind === 'video' && ` · ${formatDuration(asset.durationSeconds)}`} ·{' '}
+          {formatBytes(read.bytes)} · {(read.elapsedMs / 1000).toFixed(1)}s
+          {rate !== null && ` · ${rate.toFixed(1)} MB/s`}
+        </Text>
+      ) : (
+        <Text style={styles.bad}>{error}</Text>
+      )}
+      {read?.originalFilename && read.originalFilename !== asset.filename && (
+        <Text style={styles.muted}>the camera called it {read.originalFilename}</Text>
+      )}
+    </View>
+  );
+}
+
+/** "photo ×812, adjustmentData ×4", commonest first. */
+function inventory(counts: Record<string, number>): string {
+  const entries = Object.entries(counts).sort(([, a], [, b]) => b - a);
+  if (entries.length === 0) return 'none reported';
+  return entries.map(([name, count]) => `${name} ×${formatCount(count)}`).join(', ');
 }
 
 /**

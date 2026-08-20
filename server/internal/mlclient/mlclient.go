@@ -27,6 +27,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/dominicclerici/photos-backup/server/internal/searchquery"
 )
 
 // ErrUnavailable means the service could not be reached or could not answer:
@@ -47,6 +49,15 @@ const DefaultTimeout = 2 * time.Minute
 // pool's shared probe can hold its lock: a hung service should leave the pool
 // idle, not leave its workers blocked on each other for two minutes.
 const HealthTimeout = 5 * time.Second
+
+// ParseTimeout bounds the one call on this client that a person is waiting for.
+//
+// Everything else here is background work where two minutes is a reasonable
+// wait for a cold model. /parse is in front of a search box, and a search box
+// that hangs is worse than one that does not understand "last summer" — the
+// grammar has already produced an answer by the time this is asked, so giving
+// up costs a refinement rather than the search.
+const ParseTimeout = 8 * time.Second
 
 // errorBodyLimit bounds how much of a failure response is read into an error
 // message. Enough for FastAPI's JSON detail, not enough for a stack trace to
@@ -150,6 +161,155 @@ func (c *Client) EmbedTexts(ctx context.Context, texts []string) (Embeddings, er
 type embedRequest struct {
 	Images []string `json:"images,omitempty"`
 	Texts  []string `json:"texts,omitempty"`
+}
+
+// Description is what a captioner made of one frame: a sentence and a handful
+// of words.
+//
+// One per image, and the joining is this side's job. photo-ml holds no state
+// and knows nothing about assets — it is handed some pictures and says what is
+// in each of them — so deciding that three frames of a clip are one video is a
+// decision for the process that knows what a video is. See worker.runDescribe.
+type Description struct {
+	Caption string `json:"caption"`
+	Tags    []Tag  `json:"tags"`
+}
+
+// Tag is one word and how sure the model was. Free-form: ML_IMAGES.md §2 chose
+// an open vocabulary over one guessed in advance, and the cleanup is
+// tags.canonical_id.
+type Tag struct {
+	Name       string  `json:"name"`
+	Confidence float32 `json:"confidence"`
+}
+
+// Descriptions is a batch of them, and the model that wrote them.
+//
+// Model is echoed back rather than assumed, exactly as /embed echoes it, and
+// for the same reason: asset_descriptions.model records what actually produced
+// a caption, so a service quietly running a different checkpoint shows up as a
+// second model in the table rather than as silently different prose under the
+// first one's name.
+type Descriptions struct {
+	Model   string        `json:"model"`
+	Results []Description `json:"results"`
+	TookMS  float64       `json:"took_ms"`
+}
+
+// Recognition is the text found in one frame.
+//
+// Text is already assembled and already filtered by confidence, on the far side
+// of the socket, because the thresholds belong with the recogniser that
+// produced the numbers. Lines carry the boxes for anything that wants to draw
+// them; nothing does yet, and asset_ocr stores only the text.
+type Recognition struct {
+	Text  string    `json:"text"`
+	Lines []OCRLine `json:"lines"`
+}
+
+type OCRLine struct {
+	Text       string     `json:"text"`
+	Confidence float32    `json:"confidence"`
+	Box        [4]float32 `json:"box"`
+}
+
+type Recognitions struct {
+	Model   string        `json:"model"`
+	Results []Recognition `json:"results"`
+	TookMS  float64       `json:"took_ms"`
+}
+
+// Describe asks what a set of frames is of, in the order given.
+func (c *Client) Describe(ctx context.Context, images [][]byte) (Descriptions, error) {
+	var out Descriptions
+	body := map[string]any{"images": encode(images)}
+	if err := c.post(ctx, "/describe", body, &out); err != nil {
+		return out, err
+	}
+	if len(out.Results) != len(images) {
+		return out, fmt.Errorf("photo-ml described %d of %d images", len(out.Results), len(images))
+	}
+	return out, nil
+}
+
+// Recognize asks what a set of frames says.
+func (c *Client) Recognize(ctx context.Context, images [][]byte) (Recognitions, error) {
+	var out Recognitions
+	body := map[string]any{"images": encode(images)}
+	if err := c.post(ctx, "/ocr", body, &out); err != nil {
+		return out, err
+	}
+	if len(out.Results) != len(images) {
+		return out, fmt.Errorf("photo-ml read %d of %d images", len(out.Results), len(images))
+	}
+	return out, nil
+}
+
+// Parse asks the small instruct model what a typed sentence was asking for.
+//
+// The answer is a claim, not a parse. internal/searchquery owns the grammar
+// that actually decides, and Merge is where everything below is checked against
+// what this archive contains before any of it is believed — a person who is not
+// in asset_people, a date that does not read, a phrase nobody typed. See §11 for
+// why that asymmetry is the whole design.
+//
+// today is passed rather than assumed because the model has no clock, and
+// "last summer" is unanswerable without one. people is passed because it is
+// eleven names and it is the one thing the model can do that the grammar
+// cannot: notice that "the ski trip with Chris" mentions somebody, when the
+// grammar only ever finds a name spelled the way the archive spells it.
+func (c *Client) Parse(ctx context.Context, query string, today time.Time, people []string) (searchquery.ModelQuery, error) {
+	var out searchquery.ModelQuery
+	body := map[string]any{
+		"query":  query,
+		"today":  today.UTC().Format(time.DateOnly),
+		"people": people,
+	}
+	ctx, cancel := context.WithTimeout(ctx, ParseTimeout)
+	defer cancel()
+
+	err := c.post(ctx, "/parse", body, &out)
+	return out, err
+}
+
+func encode(images [][]byte) []string {
+	encoded := make([]string, len(images))
+	for i, img := range images {
+		encoded[i] = base64.StdEncoding.EncodeToString(img)
+	}
+	return encoded
+}
+
+// post is embed's transport, generalised: the same 5xx-versus-4xx rule, which
+// is the whole of what this package exists to get right.
+func (c *Client) post(ctx context.Context, path string, body, out any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("encode %s request: %w", path, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+path, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client().Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		detail := readDetail(resp.Body)
+		if resp.StatusCode >= 500 {
+			return fmt.Errorf("%w: %s answered %s: %s", ErrUnavailable, path, resp.Status, detail)
+		}
+		return fmt.Errorf("photo-ml refused the request (%s): %s", resp.Status, detail)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("%w: unreadable %s response: %w", ErrUnavailable, path, err)
+	}
+	return nil
 }
 
 func (c *Client) embed(ctx context.Context, body embedRequest) (Embeddings, error) {

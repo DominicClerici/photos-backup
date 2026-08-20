@@ -91,6 +91,20 @@ export interface SelectionActions {
    * other photographs anywhere else.
    */
   view?: View;
+  /**
+   * A target this grid's own actions would accept, from one addressed by
+   * position. Undefined where the two are the same thing, which is everywhere
+   * but the search results.
+   *
+   * The actions below already do this to whatever they are handed, so nothing
+   * that calls one needs it. It is here for the one surface that builds a
+   * request of its own — the create-album dialog, which sends a target to an
+   * endpoint none of these actions owns — and it is the same reason `filter`
+   * and `view` are here: a range without the whole description of the grid it
+   * was counted in names other photographs. A ranking has no such description,
+   * so its ranges are spelled out into ids instead. See useSearchActions.
+   */
+  resolve?: (target: Target) => Promise<Target>;
   /** Library only: to Recently Deleted, undoably. */
   remove: (target: Target, noun?: Noun) => Promise<void>;
   /**

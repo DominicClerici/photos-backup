@@ -85,10 +85,22 @@ type Config struct {
 	// for it — but unlike the signature pass each item is one ImageMagick
 	// rather than twenty sampled frames, so a second worker is worth having.
 	PrepConcurrency int
-	// VisionConcurrency sizes the pool that hands those renditions to photo-ml.
-	// One by default and rarely worth more: it is a queue in front of a single
-	// GPU, and a second worker does not make the card faster — it makes two
-	// requests wait on it.
+	// VisionConcurrency sizes the pool that hands those renditions to photo-ml
+	// — embeddings, recognised text and captions, in that order of priority.
+	//
+	// Four by default, and it used to be one. The old reasoning was sound and
+	// is now obsolete: a queue in front of a single GPU gains nothing from a
+	// second worker, because two requests just wait on the same card. What
+	// changed is that photo-ml learned to batch. The captioner is
+	// memory-bandwidth bound — 8.8GB of weights read per generated token,
+	// whether that token is for one image or twelve — so a batch of four costs
+	// barely more than one and halves the wall clock of an overnight pass. That
+	// batch can only form if several requests are in flight, and this is what
+	// puts them there. See photo-ml/src/photo_ml/batching.py.
+	//
+	// Raising it to 8 during a backfill fills the batch and roughly halves the
+	// wall clock again, bounded by PHOTO_ML_DESCRIBE_BATCH and by VRAM rather
+	// than by anything on this side.
 	VisionConcurrency int
 	// PreviewConcurrency caps simultaneous on-demand preview conversions, so a
 	// fast scroll cannot fork an ImageMagick per request.
@@ -176,7 +188,7 @@ func FromEnv() Config {
 		SignatureConcurrency: positive(os.Getenv("SIGNATURE_CONCURRENCY"), 1),
 		TranscodeConcurrency: positive(os.Getenv("TRANSCODE_CONCURRENCY"), 1),
 		PrepConcurrency:      positive(os.Getenv("PREP_CONCURRENCY"), 2),
-		VisionConcurrency:    positive(os.Getenv("VISION_CONCURRENCY"), 1),
+		VisionConcurrency:    positive(os.Getenv("VISION_CONCURRENCY"), 4),
 		PreviewConcurrency:   positive(os.Getenv("PREVIEW_CONCURRENCY"), 4),
 		WorkerDisabled:       truthy(os.Getenv("WORKER_DISABLED")),
 

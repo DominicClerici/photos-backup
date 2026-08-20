@@ -17,6 +17,9 @@ dependencies = [
     "numpy>=2",
     # The Gemma tokenizer the text tower is built on.
     "sentencepiece>=0.2",
+    "rapidocr>=3",
+    "onnxruntime>=1.20",
+    "torchvision>=0.26.0",
 ]
 
 [project.scripts]
@@ -39,5 +42,18 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+# torchvision as well as torch, and for a reason that is easy to lose an hour
+# to: PyPI's torchvision is built against CUDA 13 and torch here is CUDA 12.8,
+# so mixing them gives "PyTorch and torchvision were compiled with different
+# CUDA major versions" on the first import — from a package nothing in this
+# service calls directly. It is here because transformers' Qwen3-VL processor
+# imports a video processor that requires it, whether or not any video is ever
+# sent.
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

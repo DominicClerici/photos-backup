@@ -106,18 +106,26 @@ sudo useradd --system --home-dir /var/lib/photo-ml --shell /usr/sbin/nologin pho
 sudo install -d -o photo-ml -g photo-ml /var/lib/photo-ml \
         /var/lib/photo-ml/cache /var/lib/photo-ml/triton
 
-# The source, and a venv built beside it. ~5GB: torch and CUDA are most of it.
+# The source, and a venv built beside it. ~6GB: torch and CUDA are most of it.
 sudo rsync -a --delete --exclude .venv --exclude .cache photo-ml/ /opt/photo-ml/
 sudo chown -R photo-ml:photo-ml /opt/photo-ml
 sudo -u photo-ml env HOME=/var/lib/photo-ml \
         sh -c 'cd /opt/photo-ml && uv sync --frozen'
 
 # Pull the weights now, as the service user, so the first start is a start
-# rather than a 1.8GB download with systemd watching.
+# rather than a 14GB download with systemd watching. Four models: the encoder,
+# the captioner, the query parser, and the OCR pipeline — which fetches its own
+# ONNX files on first use rather than through the hub.
 sudo -u photo-ml env HOME=/var/lib/photo-ml HF_HOME=/var/lib/photo-ml/cache \
-        /opt/photo-ml/.venv/bin/python -c \
-        "from photo_ml.encoder import HF_ID; from transformers import AutoModel, AutoProcessor; \
-         AutoModel.from_pretrained(HF_ID); AutoProcessor.from_pretrained(HF_ID)"
+        PHOTO_ML_CACHE_DIR=/var/lib/photo-ml/cache \
+        /opt/photo-ml/.venv/bin/python -c "
+from huggingface_hub import snapshot_download
+from photo_ml import encoder, captioner, parser
+for hf_id in (encoder.HF_ID, captioner.HF_ID, parser.HF_ID):
+    print(hf_id, snapshot_download(hf_id, cache_dir='/var/lib/photo-ml/cache'))
+from photo_ml.ocr import Recognizer
+Recognizer()
+"
 
 sudo cp deploy/photo-ml.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now photo-ml
@@ -131,10 +139,29 @@ sudoedit /etc/photod/photod.env       # ML_URL=http://127.0.0.1:8789
 sudo systemctl restart photod
 ```
 
-That restart is the backfill. photod's `ReconcileVision` finds every asset whose
-ML renditions exist and that this model has said nothing about, queues one
-`vision` job each, and the pool drains them at roughly a thousand an hour per
-GPU-second — about fifteen minutes for a library this size.
+That restart is the *embedding* backfill. photod's `ReconcileVision` finds every
+asset whose ML renditions exist and that this model has said nothing about,
+queues one `vision` job each, and the pool drains them in about fifteen minutes
+for a library this size.
+
+The captions and the recognised text are not queued by a restart, deliberately:
+hours of GPU work begun by `systemctl restart photod` is a restart with a
+surprise in it. They are a command, and because it is a command it can be
+bounded:
+
+```sh
+photobackup ml status                                # how far anything has got
+photobackup ml backfill --stills 1000 --videos 20    # a sample first, newest
+photobackup ml backfill                              # then the whole library
+```
+
+The pool drains text recognition before captions — twenty minutes before four
+hours — so the screenshots become searchable while the captioner is still
+starting. Watch either with `photobackup ml status`.
+
+Raising `VISION_CONCURRENCY` to 8 for an overnight run is worth it and is the
+only knob that matters: photo-ml batches, and the batch can only form if several
+requests are in flight. See photo-ml/README.md § Batching the captioner.
 
 ### Checking it
 
@@ -180,10 +207,53 @@ sudo -u photo-ml env HOME=/var/lib/photo-ml sh -c 'cd /opt/photo-ml && uv sync -
 sudo systemctl restart photo-ml
 ```
 
+An update that adds a model adds a download, and systemd will not wait patiently
+for one — `uv sync` installs the code, and the weights come down on the first
+request that needs them. Pre-fetch as the service user, the same way the install
+above does, before restarting:
+
+```sh
+sudo -u photo-ml env HOME=/var/lib/photo-ml HF_HOME=/var/lib/photo-ml/cache \
+        /opt/photo-ml/.venv/bin/python -c "
+from huggingface_hub import snapshot_download
+from photo_ml import captioner, parser
+for hf_id in (captioner.HF_ID, parser.HF_ID):
+    print(hf_id, snapshot_download(hf_id, cache_dir='/var/lib/photo-ml/cache'))
+from photo_ml.ocr import Recognizer
+Recognizer()
+"
+```
+
+`curl -s localhost:8789/health` afterwards lists what is registered and, for
+anything that failed to load, why.
+
 Restarting it under a running backfill costs nothing. The vision pool asks
 whether the service is there before it claims anything, and the one job in
 flight is put back with its attempt returned rather than spent — see
 `jobs.Defer`. The queue pauses and resumes; it does not fail.
+
+### VRAM, and what to watch
+
+Four models, and the budget is tight enough to be worth writing down:
+
+| | |
+|---|---|
+| encoder, resident | 2.3GB |
+| query parser, resident | 1.2GB |
+| captioner, on demand | 9.1–10.1GB |
+| text recogniser | none — it runs on the CPU |
+| desktop session | ~1.4GB |
+
+About 15 of 16.3GB at the peak of a captioning pass. That is why the captioner
+is on demand and why unloading calls `torch.cuda.empty_cache()` rather than just
+dropping a reference — dropping it returns the blocks to torch's allocator,
+which keeps them reserved against the driver, and `nvidia-smi` goes on showing
+10GB held.
+
+ML_IMAGES.md §11 names the number to watch: **whether NVENC transcodes ever fail
+to allocate during a backfill.** If they do, the answer is a lower
+`PHOTO_ML_DESCRIBE_BATCH` (8 → 4 gives back half a gigabyte) or pausing the
+vision pool, not a bigger card.
 
 ### Changing the model
 
@@ -193,7 +263,18 @@ The whole point of `model` being part of `asset_embeddings`' primary key:
 delete from asset_embeddings where model = 'siglip2-so400m-patch14-384';
 ```
 
-Restart photod and the reconcile queues the library again. Two encoders can also
+Restart photod and the reconcile queues the library again. The captioner and the
+recogniser are the same operation against their own tables, followed by
+`photobackup ml backfill` rather than a restart:
+
+```sql
+delete from asset_descriptions where model = 'qwen3-vl-4b-instruct';
+delete from asset_ocr          where model = 'rapidocr';
+```
+
+Each is independent of the other two, which is the whole reason they are three
+job kinds: an encoder bench is fifteen minutes and must not drag four hours of
+captioning behind it. Two encoders can also
 sit in the table together while they are compared — nothing above requires the
 old rows to go first. What does need writing by hand is the HNSW index for the
 new name, since its predicate names one model literally; migration

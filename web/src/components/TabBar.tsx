@@ -5,15 +5,32 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Activity, Ellipsis, Images, Library, Search } from "lucide-react";
 
+import { openPalette, usePaletteOpen } from "@/hooks/usePalette";
 import { cn } from "@/lib/utils";
 import { FilterPill } from "./FilterPill";
 import { SelectionPill } from "./SelectionPill";
 
-const TABS = [
+/**
+ * A tab is a place, except for one of them.
+ *
+ * Search opens the palette instead of navigating, because a search is a
+ * question rather than a destination: there is nothing on /search until
+ * something has been asked, and sending somebody to an empty results page to
+ * type into it would be one extra screen between the thought and the answer.
+ * The route still exists and is still what the tab is highlighted for — it is
+ * where the palette hands the whole ranking over to.
+ */
+const TABS: {
+  href: string;
+  label: string;
+  Icon: typeof Images;
+  /** Opens the palette rather than following the href. */
+  palette?: boolean;
+}[] = [
   { href: "/", label: "Gallery", Icon: Images },
   { href: "/collections", label: "Collections", Icon: Library },
   { href: "/status", label: "Status", Icon: Activity },
-  { href: "/search", label: "Search", Icon: Search },
+  { href: "/search", label: "Search", Icon: Search, palette: true },
   { href: "/other", label: "Other", Icon: Ellipsis },
 ];
 
@@ -34,8 +51,9 @@ interface Pill {
  */
 export function TabBar() {
   const pathname = usePathname();
+  const palette = usePaletteOpen();
   const row = useRef<HTMLUListElement>(null);
-  const tabs = useRef<(HTMLAnchorElement | null)[]>([]);
+  const tabs = useRef<(HTMLElement | null)[]>([]);
 
   const [pill, setPill] = useState<Pill | null>(null);
   // The first placement is where the highlight *starts*, so it has to be drawn
@@ -43,9 +61,14 @@ export function TabBar() {
   // the left edge.
   const [placed, setPlaced] = useState(false);
 
-  const active = TABS.findIndex(
+  // The palette wins while it is open, wherever it was opened from: it is the
+  // thing in front of everything else, and a highlight still sitting on the
+  // gallery underneath it would be describing the page nobody is looking at.
+  const opened = TABS.findIndex((tab) => tab.palette);
+  const here = TABS.findIndex(
     (tab) => pathname === tab.href || (tab.href !== "/" && pathname.startsWith(`${tab.href}/`)),
   );
+  const active = palette && opened >= 0 ? opened : here;
 
   const measure = useCallback(() => {
     const el = tabs.current[active];
@@ -118,34 +141,56 @@ export function TabBar() {
             />
           ) : null}
 
-          {TABS.map(({ href, label, Icon }, i) => {
+          {TABS.map(({ href, label, Icon, palette: opens }, i) => {
             const current = i === active;
+            const skin = cn(
+              "relative flex h-10 items-center gap-2 rounded-full px-3.5 text-[13px] font-medium tracking-[0.01em] transition-colors duration-200 focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:outline-none sm:px-4",
+              current
+                ? "text-foreground"
+                : "text-muted-foreground hover:bg-foreground/[0.05] hover:text-foreground",
+            );
+            const inside = (
+              <>
+                <Icon
+                  className={cn(
+                    "size-[18px] shrink-0 transition-colors duration-200",
+                    current && "text-primary",
+                  )}
+                  aria-hidden="true"
+                />
+                {/* Below 640px the row is icons only. The label stays in the
+                    accessibility tree, so each tab keeps its name. */}
+                <span className="max-sm:sr-only">{label}</span>
+              </>
+            );
+
             return (
               <li key={href}>
-                <Link
-                  href={href}
-                  ref={(el) => {
-                    tabs.current[i] = el;
-                  }}
-                  aria-current={current ? "page" : undefined}
-                  className={cn(
-                    "relative flex h-10 items-center gap-2 rounded-full px-3.5 text-[13px] font-medium tracking-[0.01em] transition-colors duration-200 focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:outline-none sm:px-4",
-                    current
-                      ? "text-foreground"
-                      : "text-muted-foreground hover:bg-foreground/[0.05] hover:text-foreground",
-                  )}
-                >
-                  <Icon
-                    className={cn(
-                      "size-[18px] shrink-0 transition-colors duration-200",
-                      current && "text-primary",
-                    )}
-                    aria-hidden="true"
-                  />
-                  {/* Below 640px the row is icons only. The label stays in the
-                      accessibility tree, so each tab keeps its name. */}
-                  <span className="max-sm:sr-only">{label}</span>
-                </Link>
+                {opens ? (
+                  <button
+                    type="button"
+                    ref={(el) => {
+                      tabs.current[i] = el;
+                    }}
+                    onClick={() => openPalette()}
+                    aria-haspopup="dialog"
+                    aria-expanded={current}
+                    className={skin}
+                  >
+                    {inside}
+                  </button>
+                ) : (
+                  <Link
+                    href={href}
+                    ref={(el) => {
+                      tabs.current[i] = el;
+                    }}
+                    aria-current={current ? "page" : undefined}
+                    className={skin}
+                  >
+                    {inside}
+                  </Link>
+                )}
               </li>
             );
           })}

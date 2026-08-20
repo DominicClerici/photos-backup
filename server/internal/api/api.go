@@ -21,6 +21,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/livecache"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/merge"
+	"github.com/dominicclerici/photos-backup/server/internal/mlclient"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
 	"github.com/dominicclerici/photos-backup/server/internal/vault"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
@@ -67,6 +68,13 @@ type Server struct {
 	// groups, and only the button that looks for more answers 503, which is the
 	// right degradation for an API server running with WORKER_DISABLED.
 	Scan func(ctx context.Context) (merge.ScanResult, error)
+	// ML is the GPU service, for the one read path that wants it: a search
+	// phrase has to become a vector before it can be compared with a
+	// photograph. Optional, and nil is a supported way to run this archive
+	// forever — /v1/search still answers, ranked by captions, tags, recognised
+	// text, filenames and place names, and says in the response that it did.
+	// See internal/api/search.go.
+	ML *mlclient.Client
 	// WorkerEnabled says whether this process is draining the queue. A server
 	// with WORKER_DISABLED set still accepts uploads and still answers reads;
 	// what it does not do is ever build a thumbnail, and the status page exists
@@ -80,6 +88,9 @@ type Server struct {
 
 	pairOnce    sync.Once
 	pairLimiter *attemptLimiter
+	// vocab holds the archive's own people and place names, which the query
+	// parser is only allowed to recognise things from. See search.go.
+	vocab vocabularyCache
 	// deriv caches the walk behind the storage card. See derivativeBytes.
 	deriv storageCache
 }
@@ -282,6 +293,12 @@ func (s *Server) readRoutes(mux *http.ServeMux, allow guard) {
 	mux.HandleFunc("GET /v1/timeline/locate", allow(s.handleTimelineLocate))
 	mux.HandleFunc("POST /v1/timeline/states", allow(s.handleTimelineStates))
 
+	// A sentence, and the photographs it was about. Ranked rather than
+	// chronological, which is why it is not a TimelineFilter on /v1/timeline:
+	// relevance is the answer to the question that was asked, and chronology is
+	// not. See internal/api/search.go.
+	mux.HandleFunc("GET /v1/search", allow(s.handleSearch))
+
 	// The collections page and the heading of one album. The membership itself
 	// is not here: an album is read back through /v1/timeline?album=, so it
 	// pages, virtualizes and zooms exactly like the library does.
@@ -295,6 +312,11 @@ func (s *Server) readRoutes(mux *http.ServeMux, allow guard) {
 	// Which albums hold this one photograph, by id. What puts the ticks in the
 	// "Add to album" menu when exactly one thing is selected.
 	mux.HandleFunc("GET /v1/assets/{id}/albums", allow(s.handleAssetAlbums))
+	// What the ML passes said about this one photograph: the caption, the tags,
+	// the recognised text. Separate from the detail above because the viewer's
+	// panel is a toggle and recognised text is unbounded — see
+	// internal/api/analysis.go.
+	mux.HandleFunc("GET /v1/assets/{id}/analysis", allow(s.handleAssetAnalysis))
 	mux.HandleFunc("GET /v1/assets/{id}/original", allow(s.handleOriginal))
 	mux.HandleFunc("GET /v1/assets/{id}/thumb", allow(s.handleThumb))
 	// The other stored sizes, which the gallery picks between as it zooms. The

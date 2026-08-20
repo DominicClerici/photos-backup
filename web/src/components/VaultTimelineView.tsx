@@ -108,6 +108,7 @@ function Unlocked({
           index={index}
           onClose={close}
           onNavigate={navigate}
+          sealed
         />
       ) : null}
     </div>

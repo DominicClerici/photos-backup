@@ -123,6 +123,26 @@ func run(log *slog.Logger) error {
 		Log:              log,
 	}
 
+	// The one dependency the archive is designed to be able to lose. A missing
+	// photo-ml is reported the way a missing geocoder is — once, at startup,
+	// saying what is lost — and everything else runs unchanged. See PROJECT.md
+	// §4.
+	//
+	// Built here rather than beside the worker pools because both halves want
+	// it: the pools describe photographs with it, and the search endpoint turns
+	// a typed phrase into a vector with it. A server running WORKER_DISABLED
+	// still searches.
+	var ml *mlclient.Client
+	if cfg.MLURL != "" {
+		ml = mlclient.New(cfg.MLURL)
+		log.Info("photo-ml configured; photographs will be searchable by what they show",
+			"url", cfg.MLURL, "encoder", db.VisionModel, "captioner", db.CaptionModel,
+			"recogniser", db.OCRModel, "vision_workers", cfg.VisionConcurrency)
+	} else {
+		log.Info("no ML_URL; photographs keep their dates, places and filenames and will not be searchable by what they show",
+			"hint", "photo-ml/README.md, then set ML_URL=http://127.0.0.1:8789")
+	}
+
 	srv := &api.Server{
 		Store:        store,
 		Blobs:        blobs,
@@ -135,6 +155,7 @@ func run(log *slog.Logger) error {
 		Uploads:      staging,
 		Devices:      paired,
 		Vault:        vaults,
+		ML:           ml,
 		// What the status page needs to tell a degraded server from a busy one.
 		WorkerEnabled: !cfg.WorkerDisabled,
 		Tools:         mediaTools(cfg),
@@ -200,20 +221,6 @@ func run(log *slog.Logger) error {
 	if !cfg.WorkerDisabled {
 		exif := exifdata.New()
 		exif.Binary = cfg.ExiftoolBin
-
-		// The one dependency the archive is designed to be able to lose. A
-		// missing photo-ml is reported the way a missing geocoder is — once, at
-		// startup, saying what is lost — and everything else runs unchanged.
-		// See PROJECT.md §4.
-		var ml *mlclient.Client
-		if cfg.MLURL != "" {
-			ml = mlclient.New(cfg.MLURL)
-			log.Info("photo-ml configured; photographs will be searchable by what they show",
-				"url", cfg.MLURL, "model", db.VisionModel, "vision_workers", cfg.VisionConcurrency)
-		} else {
-			log.Info("no ML_URL; photographs keep their dates, places and filenames and will not be searchable by what they show",
-				"hint", "photo-ml/README.md, then set ML_URL=http://127.0.0.1:8789")
-		}
 
 		workers := worker.New(worker.Deps{
 			Store:       store,

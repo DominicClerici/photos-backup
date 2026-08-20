@@ -85,7 +85,7 @@ export function useViewer(timeline: TimelineState): ViewerState {
 
   const open = useCallback((id: string) => {
     setOpenID(id);
-    window.history.pushState(null, "", `?asset=${id}`);
+    window.history.pushState(null, "", showing(id));
     pushed.current = true;
   }, []);
 
@@ -96,7 +96,7 @@ export function useViewer(timeline: TimelineState): ViewerState {
       window.history.back();
       return;
     }
-    window.history.replaceState(null, "", window.location.pathname);
+    window.history.replaceState(null, "", showing(null));
     setOpenID(null);
   }, []);
 
@@ -107,10 +107,26 @@ export function useViewer(timeline: TimelineState): ViewerState {
       const target = at(next);
       if (!target) return;
       setOpenID(target.id);
-      window.history.replaceState(null, "", `?asset=${target.id}`);
+      window.history.replaceState(null, "", showing(target.id));
     },
     [at],
   );
 
   return { index, open, close, navigate };
+}
+
+/**
+ * The current URL with one photograph opened over it, or closed again.
+ *
+ * Everything else in the query string is kept, because on one page it is the
+ * question: the library and a collection say what is being browsed in the path,
+ * but a search says it in `?q=`, and a viewer that wrote `?asset=` over the top
+ * of that would close onto a page that had forgotten what it was of.
+ */
+function showing(id: string | null): string {
+  const params = new URLSearchParams(window.location.search);
+  if (id) params.set("asset", id);
+  else params.delete("asset");
+  const query = params.toString();
+  return query ? `${window.location.pathname}?${query}` : window.location.pathname;
 }

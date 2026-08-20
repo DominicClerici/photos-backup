@@ -200,6 +200,26 @@ type Place struct {
 // place, and the row records that somebody looked.
 func (p Place) Empty() bool { return p.City == "" && p.Admin1 == "" && p.Country == "" }
 
+// column names which of the three the filter should compare, most specific
+// first.
+//
+// A place used as a filter carries exactly one level, and which one is the whole
+// of the question: "Breckenridge" is a city, "Colorado" is a state, and
+// comparing either against the wrong column returns nothing while looking
+// entirely healthy. When a Place carries several — as one read off an asset row
+// does — the narrowest wins, because that is the one somebody typed.
+func (p Place) column() (column, value string) {
+	switch {
+	case p.City != "":
+		return "place_city", p.City
+	case p.Admin1 != "":
+		return "place_admin1", p.Admin1
+	case p.Country != "":
+		return "place_country", p.Country
+	}
+	return "", ""
+}
+
 // Derivative states, shared by DerivedState and PlaybackState.
 const (
 	DerivedPending = "pending"
