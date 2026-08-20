@@ -1,6 +1,7 @@
 "use client";
 
 import { useTimeline } from "@/hooks/useTimeline";
+import { useView } from "@/hooks/useView";
 import { useTrashActions } from "@/hooks/useTrash";
 import { useViewer } from "@/hooks/useViewer";
 import { Timeline } from "./Timeline";
@@ -8,12 +9,16 @@ import { Viewer } from "./Viewer";
 import { JobStatus } from "./JobStatus";
 
 export function Gallery() {
-  const timeline = useTimeline();
+  // The order and the filters somebody chose in the floating pill, which is
+  // mounted by the root layout and cannot reach this timeline itself. Changing
+  // one reloads the day table, exactly as opening a different collection does.
+  const { view } = useView();
+  const timeline = useTimeline(undefined, view);
   const { index, open, close, navigate } = useViewer(timeline);
   // No filter: a selection here is positions in the whole archive. `retry` is
   // what a delete reloads with — it refetches the day table, and every index
   // after a deleted photograph has moved.
-  const actions = useTrashActions(undefined, timeline.retry);
+  const actions = useTrashActions(undefined, timeline.retry, undefined, view);
 
   return (
     <div className="flex h-dvh flex-col">

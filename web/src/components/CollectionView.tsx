@@ -6,6 +6,7 @@ import { ArrowLeft } from "lucide-react";
 
 import { fetchAlbum, type Album, type CollectionFilter } from "@/lib/api";
 import { useTimeline } from "@/hooks/useTimeline";
+import { useView } from "@/hooks/useView";
 import { useTrashActions } from "@/hooks/useTrash";
 import { useViewer } from "@/hooks/useViewer";
 import { categoryLabel } from "./CategoryList";
@@ -21,7 +22,8 @@ import { Viewer } from "./Viewer";
  * step with the first.
  */
 export function CollectionView({ filter }: { filter: CollectionFilter }) {
-  const timeline = useTimeline(filter);
+  const { view } = useView();
+  const timeline = useTimeline(filter, view);
   const { index, open, close, navigate } = useViewer(timeline);
   const heading = useHeading(filter);
   // The filter goes with the actions because a position is a position *in this
@@ -29,7 +31,7 @@ export function CollectionView({ filter }: { filter: CollectionFilter }) {
   //
   // The name goes with them too, and only because of the toast: "removed from
   // Iceland 2025" needs a word the filter does not carry.
-  const actions = useTrashActions(filter, timeline.retry, heading.album);
+  const actions = useTrashActions(filter, timeline.retry, heading.album, view);
 
   return (
     <div className="flex h-dvh flex-col">

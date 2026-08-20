@@ -19,8 +19,8 @@ the job, or when asked to.
 
 Currently installed: accordion, alert-dialog, aspect-ratio, badge, button, calendar,
 card, carousel, checkbox, combobox, command, context-menu, dialog, drawer,
-dropdown-menu, field, input, input-group, kbd, label, pagination, progress,
-scroll-area, select, separator, slider, switch, textarea, toast.
+dropdown-menu, field, input, input-group, kbd, label, pagination, popover, progress,
+scroll-area, select, separator, slider, switch, textarea, toast, toggle, toggle-group.
 
 Add more with `pnpm dlx shadcn@latest add <name>` — do not write them by hand. Files
 under `src/components/ui/` are generated; they are meant to be edited in place once

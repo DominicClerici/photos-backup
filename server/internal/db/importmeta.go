@@ -492,3 +492,25 @@ func dedupe(values []string) []string {
 	}
 	return out
 }
+
+// ImportSidecar reads back the document an importer stored about an asset,
+// verbatim, or nil when nothing described it.
+//
+// It exists for the one caller that has to build a new sidecar out of an old
+// one: the merge that joins a Snapchat recording back together writes a
+// document for the joined file, and Snapchat's own row about the first piece —
+// which is where the recording's capture instant and its coordinates come from
+// — has to be carried into it untouched. Everything else in the archive reads
+// the columns this was normalized into.
+func (s *Store) ImportSidecar(ctx context.Context, assetID string) (json.RawMessage, error) {
+	var raw []byte
+	err := s.pool.QueryRow(ctx,
+		`select import_metadata from assets where id = $1::uuid`, assetID).Scan(&raw)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, ErrNotFound
+	case err != nil:
+		return nil, fmt.Errorf("read the sidecar for %s: %w", assetID, err)
+	}
+	return raw, nil
+}

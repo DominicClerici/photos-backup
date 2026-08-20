@@ -101,18 +101,38 @@ func Build(priv *ecdh.PrivateKey, bucket string, rows []db.VaultedRow, albums []
 	return index, nil
 }
 
-// Filter narrows a vault to one of its collections. The same three kinds the
-// library's TimelineFilter has, over the same meanings.
+// Filter narrows a vault and says what order to read it in. The same fields
+// db.TimelineFilter has, over the same meanings — one collection at a time, any
+// combination of facets, one order — because the pill that sets them is the
+// same pill, drawn over the same grid.
+//
+// What differs is entirely in the cost. Every one of these is a scan and a sort
+// of a slice that is already in memory, so the "this one is not optimised"
+// caveats the library carries about duration and album membership simply do not
+// arise here: there is no index to miss.
 type Filter struct {
 	AlbumID  string
 	Person   string
 	Category string
+
+	Sort      db.SortOrder
+	Kind      string
+	Favorites bool
+	Unalbumed bool
 }
 
-// Empty reports the whole-bucket filter, which is what the vault's own timeline
-// asks for.
+// Empty reports the whole-bucket timeline in its natural order, which is what
+// the index is already sorted into and what most requests ask for.
 func (f Filter) Empty() bool {
-	return f.AlbumID == "" && f.Person == "" && f.Category == ""
+	return f.AlbumID == "" && f.Person == "" && f.Category == "" &&
+		f.Sort == db.SortNewest && f.Kind == "" && !f.Favorites && !f.Unalbumed
+}
+
+// narrowed reports whether anything has to be filtered out, as opposed to
+// merely reordered.
+func (f Filter) narrowed() bool {
+	return f.AlbumID != "" || f.Person != "" || f.Category != "" ||
+		f.Kind != "" || f.Favorites || f.Unalbumed
 }
 
 // matches is the Go half of db.categoryPred and of TimelineFilter.where. The
@@ -144,8 +164,22 @@ func (f Filter) matches(it *Item) bool {
 			return false
 		}
 	}
-	if f.Category != "" {
-		return categoryMatch(f.Category, it)
+	if f.Category != "" && !categoryMatch(f.Category, it) {
+		return false
+	}
+	if f.Kind != "" && it.row.MediaKind != f.Kind {
+		return false
+	}
+	if f.Favorites && !it.row.Favorite {
+		return false
+	}
+	// A hidden photograph's albums are a list inside its own sealed document
+	// rather than rows in a table, so "in no album" is the length of that list.
+	// Which also makes it exact in a way the library's version has to work at:
+	// a hidden album cannot be deleted out from under this the way a library
+	// one can, because taking it apart means opening it.
+	if f.Unalbumed && len(it.Doc.Albums) > 0 {
+		return false
 	}
 	return true
 }
@@ -174,18 +208,78 @@ func categoryMatch(key string, it *Item) bool {
 	return false
 }
 
-// Select is every item a filter names, in timeline order.
+// Select is every item a filter names, in the order it asked for.
+//
+// The unfiltered newest-first answer is the index itself rather than a copy of
+// it — that is the request the vault's own page makes and the one worth not
+// allocating for. Everything else is a fresh slice, which is what makes the
+// reordering below safe: it is never sorting the index other callers hold.
 func (ix *Index) Select(f Filter) []*Item {
 	if f.Empty() {
 		return ix.Items
 	}
-	out := make([]*Item, 0, len(ix.Items))
-	for _, it := range ix.Items {
-		if f.matches(it) {
-			out = append(out, it)
+
+	out := ix.Items
+	if f.narrowed() {
+		out = make([]*Item, 0, len(ix.Items))
+		for _, it := range ix.Items {
+			if f.matches(it) {
+				out = append(out, it)
+			}
 		}
 	}
+	return f.ordered(out)
+}
+
+// ordered puts a selection into the order asked for, given a slice that is
+// already newest first.
+//
+// Oldest is a reversal rather than a sort, because the input is already
+// totally ordered by exactly the key being reversed — and because reversing is
+// the only way to be certain the two directions agree on where the ties go.
+func (f Filter) ordered(items []*Item) []*Item {
+	switch f.Sort {
+	case db.SortNewest:
+		return items
+	case db.SortOldest:
+		out := make([]*Item, len(items))
+		for i, it := range items {
+			out[len(items)-1-i] = it
+		}
+		return out
+	}
+
+	// A copy, so that sorting an unnarrowed selection cannot reorder the index
+	// every other caller reads.
+	out := make([]*Item, len(items))
+	copy(out, items)
+	longest := f.Sort == db.SortLongest
+	sort.SliceStable(out, func(a, b int) bool {
+		x, y := duration(out[a]), duration(out[b])
+		if x == y {
+			return false
+		}
+		// A photograph has no duration and sorts last either way, for the
+		// reason the library's `nulls last` is there: these two orders are
+		// offered beside a videos-only filter, but a filter is a request rather
+		// than a guarantee, and "longest first" should not open with stills.
+		if x < 0 || y < 0 {
+			return y < 0
+		}
+		if longest {
+			return x > y
+		}
+		return x < y
+	})
 	return out
+}
+
+// duration is an item's length in seconds, or -1 for anything that has none.
+func duration(it *Item) float64 {
+	if it.row.DurationSeconds == nil {
+		return -1
+	}
+	return *it.row.DurationSeconds
 }
 
 // Page renders one page of the vault's timeline in the gallery's own shape.
@@ -201,7 +295,11 @@ func (ix *Index) Page(f Filter, after *db.Cursor, skip, limit int) db.TimelinePa
 	items := ix.Select(f)
 
 	start := skip
-	if after != nil {
+	// The search below is a binary one, so it holds only while the slice is
+	// ordered by the key it compares. In any other order the offset is the
+	// answer — and it is the one the client will have sent, because a page in
+	// such an order hands no cursor back. See db.TimelineFilter.keyset.
+	if after != nil && f.Sort == db.SortNewest {
 		start = sort.Search(len(items), func(i int) bool {
 			t := items[i].row.SortTime
 			if !t.Equal(after.SortTime) {
@@ -222,7 +320,7 @@ func (ix *Index) Page(f Filter, after *db.Cursor, skip, limit int) db.TimelinePa
 	for _, it := range items[start:end] {
 		page.Items = append(page.Items, it.Timeline())
 	}
-	if end < len(items) {
+	if end < len(items) && f.Sort == db.SortNewest {
 		last := items[end-1]
 		page.NextCursor = db.Cursor{SortTime: last.row.SortTime, ID: last.row.ID}.Encode()
 	}
@@ -270,6 +368,18 @@ func (ix *Index) Locate(f Filter, id string) int {
 func (ix *Index) Days(f Filter, zone string) db.DayTable {
 	loc, name := location(zone)
 	table := db.DayTable{Zone: name, Days: []db.DayRun{}}
+
+	// An order that is not a walk through time has no days to count into, and
+	// the grid gets its own size instead: one headless run, and a flat wall of
+	// tiles rather than a heading above each. Exactly what the library answers,
+	// for the reason it answers it. See db.DayRun.Day.
+	if f.Sort == db.SortLongest || f.Sort == db.SortShortest {
+		table.Total = len(ix.Select(f))
+		if table.Total > 0 {
+			table.Days = []db.DayRun{{Count: table.Total}}
+		}
+		return table
+	}
 
 	for _, it := range ix.Select(f) {
 		day := dayOf(it, loc)

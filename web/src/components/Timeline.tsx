@@ -19,7 +19,9 @@ import {
   dayIndexOf,
   frameAt,
   headerY,
+  headless,
   itemAtPoint,
+  itemTop,
   layoutLevel,
   metricsFor,
   thumbSizeFor,
@@ -32,6 +34,8 @@ import {
   type Frame,
   type ItemRange,
 } from "@/lib/layout";
+import { useView, useViewScope } from "@/hooks/useView";
+import { isFiltered, viewKey } from "@/lib/view";
 import { Zoom, savedZoom } from "@/lib/zoom";
 import {
   useSelection,
@@ -177,7 +181,7 @@ interface Props {
 }
 
 export function Timeline({ timeline, actions, onOpen }: Props) {
-  const { days, total, ready, error, retry, at: itemAt, request, patch } = timeline;
+  const { days, total, ready, loading, error, retry, at: itemAt, request, patch } = timeline;
   const scroller = useRef<HTMLDivElement>(null);
   const board = useRef<HTMLDivElement>(null);
   const pill = useRef<HTMLDivElement>(null);
@@ -192,9 +196,17 @@ export function Timeline({ timeline, actions, onOpen }: Props) {
   useEffect(() => () => zoom.dispose(), [zoom]);
   useEffect(() => setMounted(true), []);
 
+  // A timeline with no days reserves no room for the headings it will not
+  // draw, which turns the grid into the flat wall of tiles an order by length
+  // actually is. Everything below is unchanged by it: one day, one heading of
+  // no height, every tile hanging under it.
+  const flat = headless(days);
   const levels = useMemo(
-    () => ZOOM_LEVELS.map((cap) => layoutLevel(days, metricsFor(size.width, cap))),
-    [days, size.width],
+    () =>
+      ZOOM_LEVELS.map((cap) =>
+        layoutLevel(days, metricsFor(size.width, cap, flat ? { headerHeight: 0 } : {})),
+      ),
+    [days, size.width, flat],
   );
 
   // Everything the per-frame loop reads, refreshed from each render by the
@@ -250,8 +262,9 @@ export function Timeline({ timeline, actions, onOpen }: Props) {
       const on = at ?? frameAt(e.levels, zoom.value);
       const day = dayAt(e.days, on, e.scrollTop);
       // Show the floating date only once its own heading has scrolled away, so
-      // it never sits directly above a heading saying the same thing.
-      const show = day != null && e.scrollTop > day.top + on.headerHeight;
+      // it never sits directly above a heading saying the same thing. A day
+      // with no label is a timeline with no days, and there is no date to float.
+      const show = day != null && day.label !== "" && e.scrollTop > day.top + on.headerHeight;
       label.style.opacity = show ? "1" : "0";
       if (day) label.textContent = day.label;
     },
@@ -403,6 +416,63 @@ export function Timeline({ timeline, actions, onOpen }: Props) {
     endDrag,
   } = useSelection();
   useSelectionScope(actions);
+
+  /**
+   * Puts a position at the top of the viewport, which is what jumping to a date
+   * is once the day table has turned that date into a number.
+   *
+   * The heading comes with it when the position is the first of its day —
+   * landing on the first tile of March with "March" scrolled off the top would
+   * be arriving somewhere without being told where. Read out of the geometry
+   * rather than from an element, because the tile being jumped to is almost
+   * never mounted: it is thirty thousand squares away.
+   */
+  const jump = useCallback(
+    (index: number) => {
+      const el = scroller.current;
+      const e = env.current;
+      if (!el || e.count === 0) return;
+
+      const at = frameAt(e.levels, zoom.value);
+      const day = dayIndexOf(e.days, clamp(index, 0, e.count - 1));
+      const top =
+        index === e.days[day].start
+          ? headerY(at, day)
+          : itemTop(e.days, at, index) - at.headerHeight;
+
+      el.scrollTop = clamp(top, 0, Math.max(0, at.totalHeight - e.height));
+      e.scrollTop = el.scrollTop;
+      e.applied = el.scrollTop;
+      invalidate();
+    },
+    [zoom],
+  );
+
+  // What the sort-and-filter pill needs to act on this grid: what it is a grid
+  // of, the shape it has, and the one thing only the scroller can do.
+  const published = useMemo(
+    () => ({ filter: actions.filter, days, loading, jump }),
+    [actions.filter, days, loading, jump],
+  );
+  useViewScope(published);
+
+  // A reorder or a refilter makes every position mean a different photograph,
+  // so the two things addressed by position have to let go of it: the scroll
+  // offset, which would leave somebody halfway down a timeline they have not
+  // seen the top of, and the selection, which would name forty photographs
+  // nobody picked.
+  const { view, setView } = useView();
+  const looking = viewKey(view);
+  const looked = useRef(looking);
+  useEffect(() => {
+    if (looked.current === looking) return;
+    looked.current = looking;
+    const el = scroller.current;
+    if (el) el.scrollTop = 0;
+    env.current.scrollTop = 0;
+    env.current.anchor = null;
+    exit();
+  }, [looking, exit]);
 
   const press = useRef<Press | null>(null);
   const chase = useRef(0);
@@ -872,10 +942,10 @@ export function Timeline({ timeline, actions, onOpen }: Props) {
       setCreating({
         name,
         bucket: actions.bucket,
-        target: { ...menuTarget, filter: actions.filter },
+        target: { ...menuTarget, filter: actions.filter, view: actions.view },
       });
     },
-    [actions.bucket, actions.filter, menuTarget],
+    [actions.bucket, actions.filter, actions.view, menuTarget],
   );
 
   const created = useCallback(
@@ -1023,10 +1093,28 @@ export function Timeline({ timeline, actions, onOpen }: Props) {
 
             {/* No "loading" notice any more: the grid is already the right size
                 and full of the squares the photos are going to land in, which says
-                it better than a line of text at the bottom could. */}
+                it better than a line of text at the bottom could.
+
+                An empty grid with a filter on it is a different statement from an
+                empty archive, and saying the wrong one sends somebody looking for
+                photographs that are exactly where they left them. */}
             {ready && total === 0 && !error ? (
               <div className={NOTICE}>
-                <span>Nothing here yet. Run a backup from the phone.</span>
+                {isFiltered(view) ? (
+                  <>
+                    <span>Nothing here matches these filters.</span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setView({ sort: view.sort })}
+                    >
+                      Clear filters
+                    </Button>
+                  </>
+                ) : (
+                  <span>Nothing here yet. Run a backup from the phone.</span>
+                )}
               </div>
             ) : null}
           </div>

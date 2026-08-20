@@ -16,10 +16,6 @@ pnpm dev                               # http://localhost:3000
 | `PHOTOD_URL` | `http://localhost:8788` | where `/api/*` is proxied |
 | `NEXT_PUBLIC_MEDIA_BASE` | unset — use the proxy | origin for thumbnails, previews, and video |
 
-Neither should be set on a build that photod will serve: `/api` is then photod's
-own origin, and pointing media anywhere else is pointing it somewhere the session
-cookie does not go.
-
 Since Phase 5, photod serves `:8787` over **HTTPS** with a certificate it signs
 itself, and puts the gallery's read endpoints on a second plaintext listener at
 `127.0.0.1:8788`, which is what `PHOTOD_URL` now defaults to. Anything pointed at
@@ -29,19 +25,10 @@ taught to trust the CA. The plaintext listener exists precisely so the gallery
 does not have to be: it serves the read path and `/health` and nothing else, and
 photod refuses every credential-carrying endpoint on it.
 
-Reaching the gallery from another machine on the LAN is a deployment rather than
-a setting: photod serves this app itself, on 8787, behind a shared password. Next
-runs bound to loopback and photod reverse-proxies it, so the browser gets the
-bundle, the JSON and the thumbnails from one origin — which is the whole trick,
-because a browser sends a same-origin cookie on an `<img>` and will not send a
-bearer token on one. `deploy/README.md` has the two units; `GALLERY_PASSWORD` and
-`WEB_URL` in `photod.env` are what turn it on.
-
-Under that arrangement `/api/*` is served by photod directly — it strips the
-prefix and answers from the same routing table `/v1/*` uses — so the rewrite
-below never runs, and one build of this app works in both worlds. Widening
-`PLAINTEXT_ADDR` is still what it always was: the whole archive, on the network,
-asking for nothing.
+Reaching the gallery from another machine on the LAN is not supported. This app
+is a browser on the archive host talking to the loopback listener, and there is
+no authentication in front of it — widening `PLAINTEXT_ADDR` is what it always
+was: the whole archive, on the network, asking for nothing.
 
 Both are read at **build** time, not at start time. `rewrites()` is evaluated by
 `next build` and frozen into `.next/routes-manifest.json`, so setting
@@ -148,6 +135,50 @@ land — a flash of empty grid at the end of every zoom otherwise. A size photod
 has not rendered yet 404s, and the tile falls back to the 256px rendition every
 asset has, so a library still waiting on `photobackup verify --fix` draws at the
 wrong size rather than not at all.
+
+## Sorting, filtering and jumping to a date
+
+The floating pill left of the selection one, and the four sorts, five filters
+and one calendar behind it. Drawn on every grid — the library, a collection,
+Recently Deleted, either vault bucket — and nowhere else.
+
+`src/lib/view.ts` holds the rules and no UI: what turns what off, which filters
+a collection has left to offer, what the pill says. Pure functions, `View` in
+and `View` out, so the awkward parts are statable and tested rather than
+scattered through click handlers.
+
+**The view is not the filter.** `TimelineFilter` is the place — this album, the
+trash, the Hidden bucket — and changes when the route does. `View` is the order
+and the narrowing chosen while standing there, and changes without navigating.
+`useTimeline` reads the first through a ref and the second through a key, so a
+reorder reloads the day table without remounting the grid.
+
+**The pill and the grid are mounted by different things.** The bar is the root
+layout's and the grid is a page's, so `useView` is where they meet — the same
+arrangement `useSelection` has, one layer in. The grid publishes what it is, the
+day table it drew from, whether that table is being replaced, and the one thing
+only the scroller can do: `jump(index)`. Leaving the grid resets the view, for
+the reason it drops the selection: a filter carried silently into the next album
+is one somebody has to go and find before their photographs come back.
+
+**Ordering by length is a question about videos.** Choosing Longest turns the
+media filter to Videos; taking Videos away puts the order back to Newest. And
+that timeline has no days in it — the server sends one dateless run, `headless()`
+sees it, and the grid draws a flat wall of tiles with no headings and no room
+reserved for them.
+
+**Jump to date costs no request.** Every heading the collection will draw is
+already in hand, with the position it starts at, so a date is a lookup and a
+scroll offset — 2014 is as instant as one screen down. Dates outside the span
+are disabled; a date inside it with nothing on it lands on the nearest day that
+does. The calendar waits while a reordered day table is in flight, because a
+date resolved against the old one would scroll to the right number in the wrong
+list.
+
+**A position travels with the description of the grid it was counted in.** The
+view goes onto every `Target` beside the filter. Index 2 of a grid sorted
+oldest-first is a different photograph, and the server numbers its rows off the
+same fields.
 
 ## What the client polls, and what it does not
 

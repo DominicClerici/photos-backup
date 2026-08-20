@@ -25,6 +25,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
+	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
 )
 
@@ -39,7 +40,14 @@ type Deps struct {
 	Images      *derive.Converter
 	Video       *video.Tool
 	Exif        *exifdata.Reader
-	Log         *slog.Logger
+	// Manifest is the append-only recovery log, and this worker writes to it
+	// for exactly one reason: joining a Snapchat recording back together
+	// produces an original, and an original with no manifest line is a blob a
+	// rebuild would not know what to do with. Optional — without it the merge
+	// job refuses rather than archiving something unrecoverable, and every
+	// other kind of work is unaffected.
+	Manifest *manifest.Log
+	Log      *slog.Logger
 }
 
 type Runner struct {
@@ -52,6 +60,17 @@ type Runner struct {
 	// several cores per clip, so a second worker mostly just competes with the
 	// first.
 	TranscodeWorkers int
+	// SignatureWorkers reduce originals to the numbers the duplicate scan
+	// compares.
+	//
+	// A third pool for the reason there is a second: this work decodes every
+	// original in the archive and samples twenty frames out of every video, it
+	// takes an hour over a library this size, and nobody is waiting for any of
+	// it. Sharing the metadata pool would put the gallery's thumbnails behind
+	// it; sharing the transcode pool would put the viewer's playback renditions
+	// behind it. One by default, so a backfill is something the machine does in
+	// the background rather than something it does instead of everything else.
+	SignatureWorkers int
 
 	// PollInterval is the floor on how often an idle worker looks for work.
 	// Uploads nudge the pools directly, so this only matters for work that
@@ -72,6 +91,7 @@ func New(deps Deps) *Runner {
 		Deps:              deps,
 		MetadataWorkers:   4,
 		TranscodeWorkers:  1,
+		SignatureWorkers:  1,
 		PollInterval:      5 * time.Second,
 		SweepInterval:     time.Minute,
 		HeartbeatInterval: jobs.DefaultLease / 3,
@@ -86,12 +106,21 @@ func (r *Runner) Start(ctx context.Context) {
 	} else if n > 0 {
 		r.log().Info("queued derivative work for assets that had none", "assets", n)
 	}
+	if err := r.reconcileSignatures(ctx); err != nil {
+		r.log().Error("reconcile signature jobs", "error", err)
+	}
 
 	for i := range r.metadataWorkers() {
 		r.spawn(ctx, fmt.Sprintf("metadata-%d", i), []jobs.Kind{jobs.KindMetadata})
 	}
+	// The transcode pool takes the merges as well. Both are ffmpeg over a whole
+	// video, both are minutes rather than milliseconds, and a merge that had its
+	// own pool would be a fourth set of goroutines competing for the same cores.
 	for i := range r.transcodeWorkers() {
-		r.spawn(ctx, fmt.Sprintf("transcode-%d", i), []jobs.Kind{jobs.KindPlayback})
+		r.spawn(ctx, fmt.Sprintf("transcode-%d", i), []jobs.Kind{jobs.KindPlayback, jobs.KindMerge})
+	}
+	for i := range r.signatureWorkers() {
+		r.spawn(ctx, fmt.Sprintf("signature-%d", i), []jobs.Kind{jobs.KindSignature})
 	}
 
 	r.wg.Add(1)
@@ -234,6 +263,13 @@ func (r *Runner) run(ctx context.Context, job jobs.Job) (err error) {
 		return r.runMetadata(ctx, job.AssetID)
 	case jobs.KindPlayback:
 		return r.runPlayback(ctx, job.AssetID)
+	case jobs.KindSignature:
+		return r.runSignature(ctx, job.AssetID)
+	case jobs.KindMerge:
+		if r.Manifest == nil {
+			return errors.New("no manifest log configured; refusing to archive a joined recording that a rebuild could not recover")
+		}
+		return r.runMerge(ctx, job.AssetID)
 	default:
 		return fmt.Errorf("unknown job kind %q", job.Kind)
 	}
@@ -311,6 +347,17 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 	}
 	if thumbErr != nil {
 		return thumbErr
+	}
+
+	// The signature, queued here rather than beside this job, because a video
+	// cannot be sampled without knowing how long it is and that number was
+	// written a few lines above. Not for the components — a paired video and a
+	// caption layer are parts of another asset's picture, and the duplicate
+	// scan never looks at either.
+	if !asset.IsLivePair() && !asset.IsOverlay {
+		if err := jobs.Enqueue(ctx, r.Store.Pool(), jobs.KindSignature, assetID); err != nil {
+			return err
+		}
 	}
 
 	if asset.IsLivePair() {
@@ -761,6 +808,13 @@ func (r *Runner) transcodeWorkers() int {
 		return 1
 	}
 	return r.TranscodeWorkers
+}
+
+func (r *Runner) signatureWorkers() int {
+	if r.SignatureWorkers <= 0 {
+		return 1
+	}
+	return r.SignatureWorkers
 }
 
 func (r *Runner) pollInterval() time.Duration {

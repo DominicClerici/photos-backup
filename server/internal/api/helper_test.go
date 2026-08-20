@@ -404,5 +404,5 @@ func truncateAssets(t *testing.T, ctx context.Context, url string) {
 	// purged_content are named too because they are the two tables that do not
 	// hang off assets: membership and tombstones would otherwise survive into
 	// the next test and be counted by it.
-	_, _ = conn.Exec(ctx, "truncate table assets, device_assets, jobs, pairing_codes, devices, albums, purged_content, vault_people, vault_secret cascade")
+	_, _ = conn.Exec(ctx, "truncate table assets, device_assets, jobs, pairing_codes, devices, albums, merge_groups, purged_content, vault_people, vault_secret cascade")
 }

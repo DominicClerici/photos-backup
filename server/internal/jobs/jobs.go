@@ -30,6 +30,18 @@ const (
 	// KindPlayback is the H.264 MP4 rendition of a video. Slow, and only the
 	// viewer needs it.
 	KindPlayback Kind = "playback"
+	// KindSignature is what the asset looks like, in the handful of integers
+	// the duplicate scan compares. See internal/imagehash.
+	//
+	// Its own kind, and its own pool in the worker, because it is a full decode
+	// of every original in the archive and nobody is waiting for it. Behind the
+	// same queue as the thumbnails it would stall the gallery for an hour to
+	// answer a question that has not been asked yet.
+	KindSignature Kind = "signature"
+	// KindMerge concatenates a set of Snapchat segments into one archived
+	// recording. ffmpeg, so it runs in the transcode pool; the asset it names is
+	// the first piece, which is as close as this table gets to naming a group.
+	KindMerge Kind = "merge"
 )
 
 type State string
@@ -199,6 +211,35 @@ func ReconcileMetadata(ctx context.Context, q Execer) (int64, error) {
 	tag, err := q.Exec(ctx, insert)
 	if err != nil {
 		return 0, fmt.Errorf("reconcile metadata jobs: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// ReconcileSignatures queues signature work for any asset whose signature is
+// missing or was computed by an older version of the algorithm.
+//
+// Unlike the metadata reconcile above, this one is expected to find things. It
+// is how a changed hash reaches an archive that has already been indexed:
+// bump merge.SignatureVersion, restart, and every original is read again by the
+// pool that is allowed to take an hour over it.
+//
+// The vault is excluded, and not as an optimisation. A signature describes what
+// a photograph looks like; computing one for something in the vault would be
+// this server writing down the thing the vault exists to stop it knowing.
+func ReconcileSignatures(ctx context.Context, q Execer, version int) (int64, error) {
+	const upsert = `
+		insert into jobs (kind, asset_id)
+		select 'signature', a.id
+		from assets a
+		left join asset_signatures sig on sig.asset_id = a.id
+		where a.vault = '' and a.deleted_at is null
+		  and (sig.asset_id is null or sig.version <> $1)
+		on conflict (asset_id, kind) do update
+		    set state = 'pending', run_after = now(), attempts = 0, last_error = null
+		    where jobs.state = 'failed' or jobs.state = 'done'`
+	tag, err := q.Exec(ctx, upsert, version)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile signature jobs: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }

@@ -11,7 +11,7 @@ import {
 } from "react";
 
 import { apply, between, count, has, NONE, type Ranges, type SelectMode } from "@/lib/ranges";
-import type { Bucket, Target, TimelineFilter } from "@/lib/api";
+import type { Bucket, Target, TimelineFilter, View } from "@/lib/api";
 import type { Noun } from "@/lib/format";
 
 /**
@@ -85,6 +85,12 @@ export interface SelectionActions {
    * was counted in names a different set of photographs.
    */
   filter?: TimelineFilter;
+  /**
+   * How that timeline is being sorted and filtered, for the same surfaces and
+   * the same reason. A range counted in a grid showing only the videos names
+   * other photographs anywhere else.
+   */
+  view?: View;
   /** Library only: to Recently Deleted, undoably. */
   remove: (target: Target, noun?: Noun) => Promise<void>;
   /**
@@ -271,7 +277,7 @@ export function SelectionProvider({ children }: { children: ReactNode }) {
       // dismissing the album menu is not a reason to lose forty photographs.
       if (
         document.querySelector(
-          "[role=alertdialog],[data-slot=dialog-content],[data-slot=context-menu-content],[data-slot=dropdown-menu-content]",
+          "[role=alertdialog],[data-slot=dialog-content],[data-slot=context-menu-content],[data-slot=dropdown-menu-content],[data-slot=popover-content]",
         )
       ) {
         return;

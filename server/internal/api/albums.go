@@ -47,17 +47,35 @@ type albumRequest struct {
 	Album    string     `json:"album,omitempty"`
 	Person   string     `json:"person,omitempty"`
 	Category string     `json:"category,omitempty"`
+
+	// The rest of the description of the grid those positions were counted in.
+	// See selectionRequest, which carries them for the same reason.
+	Sort      string `json:"sort,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	Favorites bool   `json:"favorites,omitempty"`
+	Unalbumed bool   `json:"unalbumed,omitempty"`
 }
 
 // selection is the "what to put in it" half, or false when there is none.
+//
+// A sort it cannot read is the default one rather than a refusal: an album
+// being created out of a selection of exact ids has no use for the ordering at
+// all, and the ranges that do use it come from a gallery that spells it right.
 func (req albumRequest) selection() (db.Selection, bool) {
 	if len(req.IDs) == 0 && len(req.Ranges) == 0 {
 		return db.Selection{}, false
 	}
+	sort, err := db.ParseSort(req.Sort)
+	if err != nil {
+		sort = db.SortNewest
+	}
 	return db.Selection{
 		IDs:    req.IDs,
 		Ranges: req.Ranges,
-		Filter: db.TimelineFilter{AlbumID: req.Album, Person: req.Person, Category: req.Category},
+		Filter: db.TimelineFilter{
+			AlbumID: req.Album, Person: req.Person, Category: req.Category,
+			Sort: sort, Kind: req.Kind, Favorites: req.Favorites, Unalbumed: req.Unalbumed,
+		},
 	}, true
 }
 

@@ -5,11 +5,8 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -35,7 +32,6 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
 	"github.com/dominicclerici/photos-backup/server/internal/vault"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
-	"github.com/dominicclerici/photos-backup/server/internal/websession"
 	"github.com/dominicclerici/photos-backup/server/internal/worker"
 )
 
@@ -117,24 +113,6 @@ func run(log *slog.Logger) error {
 		Log:              log,
 	}
 
-	// The browser's way into the archive, and the whole of what it costs this
-	// file. Both are inert unless configured: no GALLERY_PASSWORD means no
-	// browser can sign in, and no WEB_URL means photod serves the API alone and
-	// the gallery is somebody else's process to serve. See
-	// internal/api/websession.go, which is written to be removed whole.
-	sessions := websession.New(cfg.GalleryPassword, cfg.GallerySessionTTL)
-	webApp, err := galleryProxy(cfg, log)
-	if err != nil {
-		return err
-	}
-	switch {
-	case webApp == nil:
-	case cfg.TLSDisabled:
-		log.Warn("serving the gallery from photod with TLS disabled: the gallery password and every session cookie will cross the network in the clear — development only", "web", cfg.WebURL)
-	default:
-		log.Info("serving the gallery from the API listener", "web", cfg.WebURL, "session_idle", cfg.GallerySessionTTL)
-	}
-
 	srv := &api.Server{
 		Store:        store,
 		Blobs:        blobs,
@@ -147,8 +125,6 @@ func run(log *slog.Logger) error {
 		Uploads:      staging,
 		Devices:      paired,
 		Vault:        vaults,
-		Sessions:     sessions,
-		WebApp:       webApp,
 		Log:          log,
 	}
 
@@ -216,10 +192,12 @@ func run(log *slog.Logger) error {
 			Images:      converter,
 			Video:       videoTool,
 			Exif:        exif,
+			Manifest:    srv.Manifest,
 			Log:         log,
 		})
 		workers.MetadataWorkers = cfg.WorkerConcurrency
 		workers.TranscodeWorkers = cfg.TranscodeConcurrency
+		workers.SignatureWorkers = cfg.SignatureConcurrency
 
 		workers.Start(ctx)
 		defer workers.Wait()
@@ -228,9 +206,21 @@ func run(log *slog.Logger) error {
 		// of a fresh backup appears in about the time it takes to make one.
 		srv.Nudge = workers.Nudge
 
+		// The review page and the overview card are read off tables this fills,
+		// so the server comes up having already looked. It is also what puts a
+		// freshly imported Snapchat export back together without anybody asking
+		// — see worker.Scan for why this is on startup rather than on a timer.
+		srv.Scan = workers.Scan
+		go func() {
+			if _, err := workers.Scan(ctx); err != nil && ctx.Err() == nil {
+				log.Error("scan for duplicates and split recordings", "error", err)
+			}
+		}()
+
 		log.Info("derivative workers running",
 			"metadata", workers.MetadataWorkers,
 			"transcode", workers.TranscodeWorkers,
+			"signature", workers.SignatureWorkers,
 			"derivatives_root", derivRoot)
 	} else {
 		log.Warn("derivative workers disabled; uploads will queue work that nothing drains")
@@ -309,42 +299,6 @@ func run(log *slog.Logger) error {
 		}
 		return shutdownErr
 	}
-}
-
-// galleryProxy builds the reverse proxy that puts the Next app and the archive
-// on one origin. Nil, and no error, when WEB_URL is unset.
-//
-// It refuses to start without a gallery password, which is the one hard failure
-// this feature has. Serving the gallery from the listener that answers to the
-// whole LAN, with nothing in front of it, would hand the archive to anyone on
-// the Wi-Fi — and a misconfiguration that opens the library has to be a startup
-// error rather than a log line nobody reads.
-func galleryProxy(cfg config.Config, log *slog.Logger) (http.Handler, error) {
-	if cfg.WebURL == "" {
-		return nil, nil
-	}
-	if cfg.GalleryPassword == "" {
-		return nil, errors.New("WEB_URL is set but GALLERY_PASSWORD is empty: photod will not serve the gallery unauthenticated")
-	}
-
-	target, err := url.Parse(cfg.WebURL)
-	if err != nil {
-		return nil, fmt.Errorf("WEB_URL is not a URL: %w", err)
-	}
-	if target.Scheme != "http" && target.Scheme != "https" || target.Host == "" {
-		return nil, fmt.Errorf("WEB_URL must be an http(s) URL with a host, got %q", cfg.WebURL)
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	// The gallery being down is not the archive being down. Without this the
-	// browser gets Go's default 502 with no body and no log line, which reads
-	// as "photod is broken" when what happened is that a second unit is not
-	// running yet.
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Error("could not reach the gallery", "error", err, "web", cfg.WebURL, "path", r.URL.Path)
-		http.Error(w, "the gallery is not responding; the API is unaffected", http.StatusBadGateway)
-	}
-	return proxy, nil
 }
 
 func serveErr(errs chan<- error, err error) {

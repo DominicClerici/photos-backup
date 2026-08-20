@@ -142,14 +142,60 @@ func DecodeCursor(token string) (Cursor, error) {
 	return Cursor{SortTime: t, ID: id}, nil
 }
 
-// TimelineFilter narrows the timeline to one collection. At most one field is
-// meant to be set; setting two asks for their intersection, which is a
-// coherent answer to a question nothing currently poses.
+// SortOrder is the order a timeline is read in.
 //
-// The zero value is the whole library, which is what the gallery itself asks
-// for — so the filtered timeline is the same query, the same cursor, and the
-// same page shape as the unfiltered one rather than a second endpoint that
-// would have to be kept in step with it.
+// Two of the four are the same walk through time read in opposite directions,
+// and the index serves both — a b-tree scanned backwards is still an index
+// scan. The other two order by a column with no index at all, which is a
+// deliberate trade: see order and keyset.
+type SortOrder string
+
+const (
+	// SortNewest is the zero value, so a filter that says nothing about order
+	// asks for the timeline every other comment in this file describes.
+	SortNewest   SortOrder = ""
+	SortOldest   SortOrder = "oldest"
+	SortLongest  SortOrder = "longest"
+	SortShortest SortOrder = "shortest"
+)
+
+// ErrUnknownSort names an order that is not one of the four.
+var ErrUnknownSort = errors.New("db: unknown sort order")
+
+// ParseSort reads the wire spelling of an order.
+//
+// "newest" is accepted as well as absent: a client that names the default
+// explicitly is not making a mistake, and refusing it would make the one order
+// everything defaults to the only one that cannot be asked for by name.
+func ParseSort(name string) (SortOrder, error) {
+	switch SortOrder(name) {
+	case SortNewest, SortOldest, SortLongest, SortShortest:
+		return SortOrder(name), nil
+	}
+	if name == "newest" {
+		return SortNewest, nil
+	}
+	return "", fmt.Errorf("%w: %q", ErrUnknownSort, name)
+}
+
+// byDuration reports the two orders that are not a walk through time.
+func (s SortOrder) byDuration() bool {
+	return s == SortLongest || s == SortShortest
+}
+
+// TimelineFilter narrows the timeline and says what order to read it in.
+//
+// The zero value is the whole library, newest first, which is what the gallery
+// itself asks for — so a narrowed timeline is the same query, the same cursor,
+// and the same page shape as the unnarrowed one rather than a second endpoint
+// that would have to be kept in step with it.
+//
+// The fields fall into two groups that behave differently. A collection —
+// album, person, category — is a *place*, and at most one may be named: setting
+// two asks for their intersection, which is a coherent answer to a question
+// nothing poses. The facets below them are not places but adjectives, and they
+// combine freely with a collection and with each other, because "the videos in
+// this album that are not favourites" is a question somebody does pose.
 type TimelineFilter struct {
 	// AlbumID is an album's uuid. Membership rather than the album's own row,
 	// so an id that names no album is an empty timeline, not an error.
@@ -169,6 +215,79 @@ type TimelineFilter struct {
 	// what the library is. Keeping it a separate field is what makes it
 	// impossible to write a filter that returns the two mixed together.
 	Trash bool
+
+	// Sort is the order, and the zero value is the one everything is indexed
+	// for. See SortOrder.
+	Sort SortOrder
+
+	// Kind narrows to photographs or to videos: MediaImage or MediaVideo, and
+	// empty for both. It is the one facet the timeline index can help with, and
+	// the one the gallery spends most of its time under.
+	Kind string
+	// Favorites keeps what somebody starred, in whatever app exported it.
+	Favorites bool
+	// Unalbumed keeps what is in no album — the pile left over after the
+	// organising, which is the whole reason to ask for it.
+	Unalbumed bool
+}
+
+// ErrUnknownKind names a media kind that is neither of the two.
+var ErrUnknownKind = errors.New("db: unknown media kind")
+
+// order renders the ordering as a SQL fragment against a given alias.
+//
+// The alias is a parameter because the same order is written twice per page:
+// once inside the subquery that cuts it, and once outside to restore it after
+// the lateral join. Both have to say the same thing or a page comes back
+// shuffled.
+//
+// The duration orders carry `nulls last`, which is not the default for `desc`.
+// A null duration is a photograph, and the gallery only offers these two orders
+// alongside a videos-only filter — but a filter is a request, not a guarantee,
+// and "longest first" should not open with every still in the archive.
+func (f TimelineFilter) order(alias string) string {
+	switch f.Sort {
+	case SortOldest:
+		return alias + ".sort_time asc, " + alias + ".id asc"
+	case SortLongest:
+		return alias + ".duration_seconds desc nulls last, " + alias + ".id desc"
+	case SortShortest:
+		return alias + ".duration_seconds asc nulls last, " + alias + ".id asc"
+	default:
+		return alias + ".sort_time desc, " + alias + ".id desc"
+	}
+}
+
+// keyset reports whether a page in this order can say where the next one
+// begins, which is what decides between a cursor and a row offset.
+//
+// Only the two orders over `sort_time` can. A cursor is the sort key of the
+// last row plus its id, and it is worth having because the timeline's index
+// holds exactly that pair — so continuing from one is a seek rather than a
+// count. Duration has no such index and would need a nullable key in the
+// cursor to boot, so those two orders page by offset instead: every page pays
+// for a sort of the whole filtered set, which is the cost of an order somebody
+// reaches for once and scrolls a few screens of. See TimelineAt.
+func (f TimelineFilter) keyset() bool {
+	return !f.Sort.byDuration()
+}
+
+// beyond is the comparison a cursor makes: rows that sort after the one the
+// last page ended on, in whichever direction this order runs.
+func (f TimelineFilter) beyond() string {
+	if f.Sort == SortOldest {
+		return ">"
+	}
+	return "<"
+}
+
+// ahead is the same comparison read the other way: rows this one has already
+// passed, which counted is a position. See TimelinePosition.
+func (f TimelineFilter) ahead() string {
+	if f.Sort == SortOldest {
+		return "<"
+	}
+	return ">"
 }
 
 // scope is the rule that says which assets this filter can see at all, before
@@ -211,6 +330,29 @@ func (f TimelineFilter) where(next int) (string, []any, error) {
 		// No argument: the predicate is one of ours, from a closed list, and
 		// never carries anything the request supplied.
 		clauses = append(clauses, pred)
+	}
+
+	if f.Kind != "" {
+		if f.Kind != MediaImage && f.Kind != MediaVideo {
+			return "", nil, fmt.Errorf("%w: %q", ErrUnknownKind, f.Kind)
+		}
+		clauses = append(clauses, fmt.Sprintf(`a.media_kind = $%d`, next))
+		args = append(args, f.Kind)
+		next++
+	}
+	if f.Favorites {
+		clauses = append(clauses, `a.favorite`)
+	}
+	if f.Unalbumed {
+		// A deleted album is not an album any more, and neither is a hidden
+		// one. Their membership rows survive both — that is what makes the
+		// undo work — so joining is what keeps a photograph whose only album
+		// went to the trash from being invisible in the one filter that exists
+		// to find it.
+		clauses = append(clauses, `not exists (
+			select 1 from album_assets m
+			join albums al on al.id = m.album_id
+			where m.asset_id = a.id and al.deleted_at is null and al.vault = '')`)
 	}
 
 	if len(clauses) == 0 {
@@ -267,7 +409,11 @@ func (s *Store) timeline(ctx context.Context, filter TimelineFilter, after *Curs
 		cursorTime any
 		cursorID   any
 	)
-	if after != nil {
+	// A cursor is a position in an ordering that has one; an order this page
+	// cannot hand a cursor out for is one it must not accept a stale cursor
+	// into either. Ignored rather than refused, because the offset the request
+	// also carries is a perfectly good answer to where the page starts.
+	if after != nil && filter.keyset() {
 		cursorTime = after.SortTime
 		cursorID = after.ID
 	}
@@ -295,11 +441,11 @@ func (s *Store) timeline(ctx context.Context, filter TimelineFilter, after *Curs
 			from assets a
 			where `+filter.scope()+`
 			  and ($1::timestamptz is null
-			       or (a.sort_time, a.id) < ($1::timestamptz, $2::uuid))`+narrow+`
-			order by a.sort_time desc, a.id desc
+			       or (a.sort_time, a.id) `+filter.beyond()+` ($1::timestamptz, $2::uuid))`+narrow+`
+			order by `+filter.order("a")+`
 			offset $3 limit $4
 		) p`+liveJoin("p")+`
-		order by p.sort_time desc, p.id desc`, args...)
+		order by `+filter.order("p"), args...)
 	if err != nil {
 		return TimelinePage{}, fmt.Errorf("query timeline: %w", err)
 	}
@@ -326,7 +472,13 @@ func (s *Store) timeline(ctx context.Context, filter TimelineFilter, after *Curs
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
 		last = Cursor{SortTime: page.Items[limit-1].TakenAt, ID: page.Items[limit-1].ID}
-		page.NextCursor = last.Encode()
+		// Silence is what tells a client to keep using offsets. An order with
+		// no keyset has no position to hand over, and a cursor built from a
+		// sort key this ordering does not use would send the next page to a
+		// different part of the archive entirely.
+		if filter.keyset() {
+			page.NextCursor = last.Encode()
+		}
 	}
 	return page, nil
 }
@@ -351,6 +503,13 @@ func (s *Store) timeline(ctx context.Context, filter TimelineFilter, after *Curs
 // page handed a link to a photo outside that album is the ordinary case, and it
 // is not an error.
 func (s *Store) TimelinePosition(ctx context.Context, filter TimelineFilter, id string) (int, error) {
+	// An order with no keyset has no "sorts ahead of" to count either — the
+	// comparison below is over the sort key, and duration's is nullable. Those
+	// two are ranked instead. See rank.
+	if !filter.keyset() {
+		return s.rank(ctx, filter, id)
+	}
+
 	// $1 is the asset; the filter's own arguments start after it. The fragment
 	// is pasted twice and both copies alias the table `a`, so they share their
 	// placeholders rather than needing a second set.
@@ -369,7 +528,7 @@ func (s *Store) TimelinePosition(ctx context.Context, filter TimelineFilter, id 
 			select count(*)::int
 			from assets a
 			where `+filter.scope()+`
-			  and (a.sort_time, a.id) > (t.sort_time, t.id)`+narrow+`
+			  and (a.sort_time, a.id) `+filter.ahead()+` (t.sort_time, t.id)`+narrow+`
 		)
 		from (
 			select a.sort_time, a.id
@@ -387,6 +546,42 @@ func (s *Store) TimelinePosition(ctx context.Context, filter TimelineFilter, id 
 	return index, nil
 }
 
+// rank is TimelinePosition for the orders that cannot count what sorts ahead.
+//
+// It numbers the whole filtered timeline and reads off the row it was asked
+// about, which is a sort of everything to answer a question about one thing.
+// That is the same bargain the duration orders make everywhere else — no index,
+// so every page pays for the sort — and it is worth making twice rather than
+// keeping a nullable duration in the cursor and a second comparison beside the
+// one above.
+func (s *Store) rank(ctx context.Context, filter TimelineFilter, id string) (int, error) {
+	// $1 is the asset; the filter's own arguments start after it.
+	narrow, args, err := filter.where(2)
+	if err != nil {
+		return 0, err
+	}
+	args = append([]any{id}, args...)
+
+	// Numbered from zero, because that is what the day table's run lengths sum
+	// to and what TimelineAt skips in.
+	row := s.pool.QueryRow(ctx, `
+		select o.rn from (
+			select a.id, row_number() over (order by `+filter.order("a")+`) - 1 as rn
+			from assets a
+			where `+filter.scope()+narrow+`
+		) o
+		where o.id = $1::uuid`, args...)
+
+	var index int
+	if err := row.Scan(&index); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, fmt.Errorf("rank asset in timeline: %w", err)
+	}
+	return index, nil
+}
+
 // DayRun is one heading in the timeline and the number of tiles that hang under
 // it: everything the grid needs to know a day's size without holding a single
 // one of its photos.
@@ -399,6 +594,12 @@ func (s *Store) TimelinePosition(ctx context.Context, filter TimelineFilter, id 
 type DayRun struct {
 	// Day is the local calendar day, YYYY-MM-DD. Rendered by the client, which
 	// is the only party that knows what language to render it in.
+	//
+	// Empty means this run has no date and draws no heading, which is what a
+	// timeline ordered by something other than time is: the days are still
+	// there, scattered through it in an order that has nothing to do with the
+	// calendar, and a heading per tile is not a description of that shape but a
+	// ruin of it. See TimelineDays.
 	Day   string `json:"day"`
 	Count int    `json:"count"`
 }
@@ -464,6 +665,13 @@ func normalizeZone(name string) string {
 func (s *Store) TimelineDays(ctx context.Context, filter TimelineFilter, zone string) (DayTable, error) {
 	table := DayTable{Zone: normalizeZone(zone), Days: []DayRun{}}
 
+	// An order that is not a walk through time has no days to count into. What
+	// the grid needs from this is its own size, so that is all it gets: one
+	// headless run, and a flat wall of tiles rather than a heading above each.
+	if filter.Sort.byDuration() {
+		return s.timelineSize(ctx, filter, table)
+	}
+
 	// $1 is the timezone; the filter's own arguments start after it.
 	narrow, args, err := filter.where(2)
 	if err != nil {
@@ -482,7 +690,7 @@ func (s *Store) TimelineDays(ctx context.Context, filter TimelineFilter, zone st
 				           else (a.sort_time at time zone 'UTC')
 				                + make_interval(mins => a.exif_offset_minutes)
 				       end) as day,
-				       row_number() over (order by a.sort_time desc, a.id desc) as rn
+				       row_number() over (order by `+filter.order("a")+`) as rn
 				from assets a
 				where `+filter.scope()+narrow+`
 			) dated
@@ -504,6 +712,30 @@ func (s *Store) TimelineDays(ctx context.Context, filter TimelineFilter, zone st
 	}
 	if err := rows.Err(); err != nil {
 		return DayTable{}, fmt.Errorf("read timeline days: %w", err)
+	}
+	return table, nil
+}
+
+// timelineSize is the day table for a timeline that has no days: how many
+// items, said in the one shape the grid knows how to be laid out from.
+//
+// One run rather than none, because a client that received an empty table would
+// read it as an empty collection. The run carries no date, which is what tells
+// the grid to draw no headings — see DayRun.Day.
+func (s *Store) timelineSize(ctx context.Context, filter TimelineFilter, table DayTable) (DayTable, error) {
+	narrow, args, err := filter.where(1)
+	if err != nil {
+		return DayTable{}, err
+	}
+
+	row := s.pool.QueryRow(ctx, `
+		select count(*)::int from assets a
+		where `+filter.scope()+narrow, args...)
+	if err := row.Scan(&table.Total); err != nil {
+		return DayTable{}, fmt.Errorf("count timeline: %w", err)
+	}
+	if table.Total > 0 {
+		table.Days = []DayRun{{Count: table.Total}}
 	}
 	return table, nil
 }

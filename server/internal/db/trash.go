@@ -92,11 +92,15 @@ func (sel Selection) pick(from int) (string, []any, error) {
 		}
 		// The row number is the position, counted in exactly the ordering
 		// TimelineAt offsets into — the two have to agree or a selection made
-		// in the grid would delete something else. Numbered from zero, because
-		// that is what the day table's run lengths sum to.
+		// in the grid would delete something else. Which is also why the order
+		// comes off the filter rather than being written out here: a grid
+		// sorted oldest-first numbers its tiles the other way round, and a
+		// selection made in it means the photographs at those positions in
+		// *that* ordering. Numbered from zero, because that is what the day
+		// table's run lengths sum to.
 		parts = append(parts, fmt.Sprintf(`
 			select o.id from (
-				select a.id, row_number() over (order by a.sort_time desc, a.id desc) - 1 as rn
+				select a.id, row_number() over (order by `+sel.Filter.order("a")+`) - 1 as rn
 				from assets a
 				where %s%s
 			) o

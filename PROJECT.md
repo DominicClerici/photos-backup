@@ -853,64 +853,31 @@ library, and nothing about it is encrypted or was decided here. It keeps the
 past tense it was imported with and stays where it was, above the two new rows;
 the new one takes the plain noun. They have nothing in common but a word.
 
-### Phase 12 — The gallery on the network
+### Phase 12 — The gallery on the network (built, then removed)
 
-A browser anywhere in the house can now open the archive, behind one shared
-password, over the same TLS listener the phone has used since Phase 5.
+A browser anywhere in the house could open the archive, behind one shared
+password, over the same TLS listener the phone has used since Phase 5. photod
+reverse-proxied the Next app so that the bundle, the JSON and the thumbnails all
+arrived from one origin, and a single session cookie authenticated all three —
+which was the point, because a browser attaches a same-origin cookie to an
+`<img>` and will not attach a bearer header to one.
 
-**The cookie was the whole obstacle, and it turned out to be a door rather than
-a wall.** Phase 5 wrote the problem down as a choice between two bad options:
-give up pointing `<img>` straight at photod, or mint HMAC-signed media URLs into
-the timeline JSON. Phase 6 closed the phone's half by putting the token on every
-request React Native makes, and said the browser's half was untouched. It was —
-but the answer was never a signed URL. A browser attaches a **same-origin
-cookie** to a subresource without being asked, which is exactly the thing it
-refuses to do with a bearer header. So photod serves the gallery itself: the
-Next app, the JSON and the thumbnails all arrive from one origin, and one cookie
-authenticates all three. No second credential, no expiry to manage, and still no
-URL that is itself a secret.
+**It has since been removed, whole.** One shared password with no accounts, no
+roles and no revocation was always meant as a house key rather than an identity
+system, and it is being replaced by something more robust rather than extended.
+The removal touched no data: sessions lived only in the serving process's
+memory, so there was no table, no migration and no file on disk to unwind. What
+came out was `internal/websession`, `internal/api/websession.go`, the
+`GALLERY_PASSWORD` / `GALLERY_SESSION_TTL` / `WEB_URL` settings, the `photoweb`
+unit, and the web app's `SignIn` overlay and session module. The guard on the
+read and gallery routes is the Phase 6 guard again, exactly.
 
-**One origin means photod reverse-proxies Next.** `/v1/*` is the API, `/api/*`
-is the same routing table with the prefix stripped on arrival, and everything
-else is the gallery. The alias is what keeps a single build of the web app
-working in both places: in development `next.config.ts` rewrites `/api/*` away
-to the loopback listener, and in production photod strips it instead. The client
-never learns which world it is in.
-
-**The gate is on the API, not on the app.** The bundle, the HTML and the CSS are
-served to anyone on the network who asks for them, because they are not the
-archive — every photograph and every row of every timeline is behind `/v1`, and
-therefore behind the guard. Gating the shell as well would buy a redirect to
-write and a login page to serve twice.
-
-**A house key, not an account system.** One password, no usernames, no roles, no
-reset, and sessions that exist only in this process's memory — a photod restart
-signs every browser out. There is no table, no migration and no file on disk
-that records a session, which is deliberate: the whole feature is written to be
-deleted whole if it is ever replaced by something real. `internal/websession`
-lists what deletion means, and the four lines it needs in `api.go` are each
-marked. It is a strict widening while it is there: with no `GALLERY_PASSWORD`
-set, no session can be created, and the guard is the Phase 6 guard exactly.
-
-**Two passwords, and they are not the same kind of thing.** The vault password
-is never written down anywhere a machine can use, because what it protects the
-photographs from is *this server*. The gallery password sits in the clear in
-`photod.env` beside `DATABASE_URL`, because a lock the server has to be able to
-check is a lock the server has to hold the answer to. Hashing it there would be
-theatre — the process needs the plaintext in memory to compare against either
-way. The two are separate on purpose, and the sign-in prompt says so.
-
-**A misconfiguration that opens the library is a startup error.** `WEB_URL` set
-with `GALLERY_PASSWORD` empty does not start. The failure it prevents is the
-quiet one: a gallery that works perfectly, for everybody on the Wi-Fi.
-
-What this does *not* change is worth being as clear about. `PLAINTEXT_ADDR` is
-still loopback and still unauthenticated — it is what `next dev` talks to, and
-widening it is the same mistake it always was, now with a locked front door
-beside the open back one. The vault's unlock is still server-wide, so one
-signed-in browser unlocking it unlocks it for every signed-in browser; that is
-the same property Phase 11 shipped, reaching further than it used to. And a
-laptop still has to install the CA once, exactly as the phone did.
+What the phase established and what is worth keeping when it is replaced: the
+credential a browser can actually carry onto a subresource is a cookie, not a
+header, so whatever comes next still wants the app and the media on one origin.
+Signed media URLs remain unnecessary — there is no URL that is itself a secret.
+And the constraint that made the old design safe is unchanged: `PLAINTEXT_ADDR`
+is loopback and unauthenticated, and widening it is the whole risk.
 
 ### Phase 13 — Albums you can make
 
@@ -970,6 +937,188 @@ clicking a ticked one takes it out. With several, they are not — a selection o
 forty has forty answers, and a tick that meant "some of them" is not a thing
 anybody wants to read off a menu they opened to file something.
 
+### Phase 14 — Sorting, filtering and jumping to a date
+
+The grid could show you a collection. It could not show you part of one, and it
+could only ever show it in one order — so "the videos from the trip", "the
+photographs I never filed", and "that afternoon in 2019" were all the same
+gesture: scroll until you find it. This is the floating pill beside the
+selection one, and the four sorts, five filters and one calendar behind it.
+
+**The order and the collection are different questions.** A collection is a
+*place* — this album, the trash, the Hidden bucket — and it changes when the
+route does. A view is the order and the narrowing chosen while standing in that
+place, and it changes under somebody's hands without going anywhere. They travel
+as separate things (`db.TimelineFilter` gained fields rather than variants; the
+client passes `View` beside `TimelineFilter`), and the second one reloads the day
+table without remounting anything.
+
+**A facet is an adjective, not a place.** At most one album, person or category
+can be named, because their intersection is a question nothing poses. Photos,
+Videos, Favorites and Not-in-an-album combine freely with each other and with
+whatever collection they are asked inside, because "the videos in this album that
+are in no other album" is a question somebody does pose. All photos is not a
+filter at all; it is the absence of the rest, which is why pressing it turns them
+off and turning the last one off lights it.
+
+**Two of the four orders are the index read backwards.** Newest and oldest are
+the same b-tree walked in opposite directions, so both keep the keyset cursor,
+the constant-time page and the day table. Longest and shortest order by a column
+with no index at all: they cost a sort of the filtered set per page and hand out
+no cursor, so the client pages them by offset. That is deliberate. They are what
+somebody reaches for once to find the twenty-minute video, not what they scroll a
+hundred thousand photographs in — and the price of an index on `duration_seconds`
+is paid by every upload forever.
+
+**Ordering by length is a question about videos, so asking it says so.** Choosing
+Longest turns the media filter to Videos, and taking Videos away puts the order
+back to Newest. A photograph has no duration, and a grid of stills sorted by one
+is a control that has stopped meaning anything while still looking like it works.
+
+**A timeline in that order has no days, and says so.** The day table comes back
+as a single run with no date on it, and the grid draws a flat wall of tiles with
+no headings and no room reserved for them. The dates are still in there — every
+photograph has one — but they fall in an order that has nothing to do with the
+calendar, and a heading above every tile would be a ruin of that shape rather
+than a description of it.
+
+**Jump to date costs no request.** The client is already holding every heading
+the collection will draw and the position each one starts at; a date is a lookup
+in that table and a scroll offset. Which is what makes 2014 as instant as one
+screen down. Dates outside the archive's span are disabled, dates inside it with
+nothing on them land on the nearest day that has something, and the control sets
+the order to Newest on the way in — a date is a position in a timeline read in
+date order, and there is no such position in one read by length.
+
+**A position means nothing without the whole description of the grid.** A
+selection is runs of positions, so the sort and the facets travel with every
+range on every write, exactly as the collection already did. Index 2 of a grid
+sorted oldest-first is a different photograph, and the row number a delete
+resolves against comes off the same filter the grid was drawn from. Getting this
+wrong would not have been a cosmetic bug.
+
+**The vault gets all of it and shares none of the code.** Its timeline is
+computed in Go over decrypted rows, so filtering is a walk over a slice and
+sorting is `sort.SliceStable` — and the "this one is not optimised" caveats above
+simply do not arise, because there was never an index to miss.
+
+**A collection does not offer the filter it already is.** Inside the Videos
+category there is no Photos/Videos toggle; inside an album there is no
+Not-in-an-album; inside Favorites there is no Favorites. One question asked of
+the filter the page was built from, rather than a special case per page.
+
+**Leaving the grid is leaving the view.** Same rule the selection has always
+had, for the same reason: a filter silently carried into the next album is one
+somebody has to go and find before their photographs come back.
+
+### Phase 15 — Duplicates, and recordings that arrived in pieces
+
+Two problems the archive had and could not see, which turn out to be the same
+problem: several rows that ought to be one item.
+
+Content addressing already caught every case where the *bytes* agreed —
+`assets.sha256` is unique, and across 23,000 items there is not one `md5` pair
+left to find. What it cannot catch is the same photograph recompressed by an
+export, or a recording Snapchat cut into ten-second files. Both end with the
+library holding a thing several times over; only the evidence differs.
+
+**One pair of tables, two kinds of evidence, and only one of them asks.** A
+`duplicate` group is found by comparing pixels and is a judgement about which
+of four nearly identical photographs is worth keeping — nothing here is entitled
+to make it. A `video-segments` group is found by comparing timestamps in a
+document Snapchat wrote, and the worker resolves it without anybody being asked,
+because "these six files are one minute of video" is not a matter of taste.
+Everything after the finding is shared: elect a keeper, carry what the others
+knew onto it, move them to the trash with a batch, and remember the batch as the
+undo.
+
+**The split-video signature is a ten-second grid, and it is exact.** Consecutive
+pieces of one recording are written into `memories_history.json` exactly ten
+seconds apart, to the second — 287 links at 10.00s in this archive against
+single digits at every other spacing. The EXIF time on the same files is when
+the piece was *written out*, and it drifts by up to eighty seconds across one
+recording, which is why the scan reads `captured_at` and ordering by `sort_time`
+puts a minute of video in the wrong order.
+
+**The obvious corroboration does not work, and that is a measurement.** The last
+frame of one piece and the first frame of the next are three hundredths of a
+second apart, so they ought to be nearly identical. Measured across the 271
+candidate links against a control set of memories twenty to a hundred and twenty
+seconds apart: median difference-hash distance 21 bits across a real boundary
+and 30 across the control, overlapping from 5 to 43. Handheld video of one scene
+stays similar to itself for a whole minute — a second apart *inside* one piece
+measured further apart than a real boundary did. A gate on that would have
+refused a large fraction of genuine merges to exclude a couple of false ones.
+What is relied on instead is the timestamps, and the fact that the merge is
+undoable.
+
+**A joined recording is an original, not a derivative.** It goes into `blobs/`
+under its own digest, gets an asset line and a metadata line in
+`manifest.jsonl`, and `verify` covers it like anything else — and the pieces it
+was made from go to the trash rather than away, so for a year both exist and
+either can be got back. It is the one file in the archive that no camera
+produced, which is why its sidecar records the parts by digest and whether the
+join copied or re-encoded.
+
+**It copies. It does not re-encode.** Two consecutive pieces came out of the same
+encoder on the same phone a tenth of a second apart, so joining them moves
+packets rather than pixels: the output holds the camera's own frames and comes
+out at exactly the sum of the inputs' durations. The re-encode path exists for
+the handful of groups where a resolution changed mid-recording, a piece has no
+audio, or a caption layer has to go into the pixels — and it says in the sidecar
+which of those it was.
+
+**Two hashes, because they fail differently.** A difference hash is a gradient:
+it survives compression and resizing, and it finds two photographs of nothing in
+particular to be the same nothing. A perceptual hash is the low frequencies of a
+DCT: it describes structure, and it is what notices two flat frames are flat
+differently. Requiring both is what keeps a wall and a different wall out of one
+group. The archive's own fixtures make the point — `photo.jpg` is a vertical
+gradient and `bare.jpg` is flat grey, and their difference hashes are both
+exactly zero.
+
+**The threshold barely matters, which is the useful finding.** Swept from 3 to 12
+bits over six thousand real photographs: 513 groups at 3, 484 at 9, 494 at 12,
+and around 380 pairs and 60 triples at every setting. Copies of one photograph
+land within a handful of bits and unrelated photographs land past thirty, with
+very little in between for a threshold to arbitrate. Nine, in the middle of the
+plateau, because the failure modes are not symmetric — a false positive costs one
+click on a page somebody is looking at anyway.
+
+**What the threshold does change is how far transitivity runs.** A burst of
+ninety-eight frames chains into one group at every setting tried. Those groups
+are correct, and they are why the review page folds a group after twelve
+thumbnails: a burst really is a hundred near-identical photographs, and what to
+do about it is exactly the judgement this refuses to make on anybody's behalf.
+
+**A video is a sequence, not a frame.** Twenty frames at even fractions of the
+running time, hashed by the same code that hashes a still, compared position for
+position against another clip of the same length. Sampled by *time* rather than
+frame number, which is what survives a re-encode: a clip at 15fps and the same
+clip at 30fps share nothing at frame seven and the same picture 35% of the way
+through. The duration filter in front of it does less work than it looks like —
+Snapchat caps a clip at ten seconds, so this archive holds 229,000 pairs of
+unrelated videos agreeing on length to within two percent — so the sequence is
+doing all of the discriminating.
+
+**Signatures get their own worker pool.** A third pool for the reason there is a
+second: this decodes every original in the archive and samples twenty frames out
+of every video, it takes an hour over a library this size, and nobody is waiting
+for it. Behind the metadata pool it would stall the gallery; behind the transcode
+pool it would stall the viewer.
+
+**The vault is excluded, and not as an optimisation.** A signature is a
+description of what a photograph looks like. Computing one for something in the
+vault would be this server writing down the thing the vault exists to stop it
+knowing.
+
+**A dismissal sticks by pair, not by group.** Refusing {a, b} and then finding
+{a, b, c} is a different fingerprint and the same rejected question with a
+stranger in it. So every pair inside a dismissed group becomes a pair the scan
+will never link again — and an undone join lands in `dismissed` rather than back
+in `pending`, because a pending set of segments would be re-joined by the worker
+within the minute and the undo would appear not to have worked.
+
 ### v2
 
 - **ML service.** Python, CLIP semantic search, then face detection and clustering.
@@ -1007,20 +1156,19 @@ Cheap to verify now, annoying to discover in Phase 3.
 **6. Battery and heat.** Pushing 100GB will heat the phone significantly. Bulk
 backfill should be gated on charging + Wi-Fi by default, with a manual override.
 
-**7. Unauthenticated gallery.** Closed on both listeners' terms since Phase 12.
-The TLS listener takes a device token or a browser session, so nothing on the LAN
-reads the archive without either having been paired or knowing the gallery
-password. What remains is the plaintext listener, which stays open by design and
-bound to loopback — it is still the only unauthenticated way in, and widening
-`PLAINTEXT_ADDR` is still the whole risk. A device token cannot cross it, and
-neither can the gallery password: pairing and both sign-in routes are absent from
-its routing table, so widening it exposes photographs but never a credential.
-What is genuinely new is that one shared password now stands in front of the
-archive for anyone on the Wi-Fi, which is a weaker thing than a 256-bit token —
-rate-limited per address, and the reason the sessions it issues are memory-only
-and idle-expiring. Putting the gallery on the internet, which §4 keeps as an
-option, is a different question again: this is a house key, and the internet is
-not a house.
+**7. Unauthenticated gallery.** Open again, deliberately, since the Phase 12
+browser gate was removed. The TLS listener is token-only, so nothing on the LAN
+reads the archive without having been paired — but a browser cannot carry a
+token, which means there is no supported way for a laptop or an iPad in the
+house to open the gallery at all. The plaintext listener is what the development
+gallery talks to, it asks for nothing, and it is bound to loopback; widening
+`PLAINTEXT_ADDR` is still the whole risk. A device token cannot cross it —
+pairing and every authenticated route are absent from its routing table — so
+widening it exposes photographs but never a credential. Closing this properly is
+the open design question the gate's removal reopened, and whatever answers it
+still has to put the app and the media on one origin: a cookie is the only
+credential a browser will attach to an `<img>`. Putting the gallery on the
+internet, which §4 keeps as an option, is a different question again.
 
 **8. Losing `ca.key`.** It is the one file whose loss means physically re-pairing
 every device, and the one whose disclosure lets somebody impersonate the archive

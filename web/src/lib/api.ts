@@ -6,9 +6,6 @@
 // Nothing is imported back the other way at runtime — layout.ts takes only a
 // type from here — so this is a dependency rather than a cycle.
 import { BASE_THUMB_SIZE, type ThumbSize } from "./layout";
-// browser gate: the one line of this feature that reaches into the API client.
-// See ./session.
-import { signedOut } from "./session";
 
 export type MediaKind = "image" | "video";
 export type DerivedState = "pending" | "ready" | "failed";
@@ -90,11 +87,6 @@ class ApiError extends Error {
   ) {
     super(message);
     this.name = "ApiError";
-    // browser gate: every refusal in this file is constructed here, so this is
-    // the one place that catches a session lapsing mid-scroll without a check
-    // at each of the dozen call sites. Deleting the feature is deleting these
-    // two lines and the import above.
-    if (status === 401) signedOut();
   }
 }
 
@@ -141,6 +133,55 @@ export type TimelineFilter = CollectionFilter | { kind: "trash" } | VaultFilter;
 
 /** Which of the two buckets. Two destinations, one mechanism, one password. */
 export type Bucket = "archive" | "hidden";
+
+/**
+ * The order a timeline is read in.
+ *
+ * Two of them are the same walk through time in opposite directions, which the
+ * server answers from the index either way. The other two order by length, have
+ * no index behind them, and are deliberately allowed to be slower: they are
+ * what somebody reaches for once to find the twenty-minute video, not what they
+ * scroll a hundred thousand photographs in.
+ */
+export type SortKey = "newest" | "oldest" | "longest" | "shortest";
+
+/**
+ * How a grid is being looked at, as opposed to what it is a grid *of*.
+ *
+ * Kept apart from TimelineFilter because the two answer different questions and
+ * change on different schedules. The filter is the place — this album, the
+ * trash, the Hidden bucket — and it changes when the route does. The view is
+ * the order and the narrowing somebody has chosen while standing in that place,
+ * and it changes under their hands without going anywhere.
+ *
+ * Every field but the order is an adjective, and they combine: "the videos in
+ * this album that are in no other album" is one request. Which is what makes
+ * this a record rather than a second union.
+ */
+export interface View {
+  sort: SortKey;
+  /** One medium, or both when absent. */
+  media?: MediaKind;
+  favorites?: boolean;
+  /** In no album — the pile left over after the organising. */
+  unalbumed?: boolean;
+}
+
+/**
+ * Writes a view into a query string.
+ *
+ * The default order is written as nothing rather than as "newest", which keeps
+ * the URL of an ordinary timeline exactly what it was before any of this
+ * existed — and keeps that request's cache entry from splitting in two.
+ */
+function withView(params: URLSearchParams, view?: View): URLSearchParams {
+  if (!view) return params;
+  if (view.sort !== "newest") params.set("sort", view.sort);
+  if (view.media) params.set("kind", view.media);
+  if (view.favorites) params.set("favorites", "1");
+  if (view.unalbumed) params.set("unalbumed", "1");
+  return params;
+}
 
 /**
  * A timeline inside the vault, optionally narrowed to one of its collections.
@@ -195,18 +236,28 @@ export function fetchTimeline(
   start: PageStart,
   limit: number,
   filter?: TimelineFilter,
+  view?: View,
   signal?: AbortSignal,
 ): Promise<TimelinePage> {
   const params = new URLSearchParams({ limit: String(limit) });
   if ("cursor" in start) params.set("cursor", start.cursor);
   else if (start.skip > 0) params.set("skip", String(start.skip));
   withFilter(params, filter);
+  withView(params, view);
   return get<TimelinePage>(`${timelinePath(filter, "/v1/timeline")}?${params}`, signal);
 }
 
 /** One heading the timeline will draw, and how many tiles hang under it. */
 export interface DayRun {
-  /** The local calendar day, YYYY-MM-DD. Rendered here, not by the server. */
+  /**
+   * The local calendar day, YYYY-MM-DD. Rendered here, not by the server.
+   *
+   * Empty means this run has no date and draws no heading, which is what a
+   * timeline ordered by something other than time is: the days are still in
+   * there, scattered through an order that has nothing to do with the calendar,
+   * and a heading per tile would be a ruin of that shape rather than a
+   * description of it. See lib/layout.headless.
+   */
   day: string;
   count: number;
 }
@@ -244,9 +295,11 @@ function viewerZone(): string {
 
 export function fetchTimelineDays(
   filter?: TimelineFilter,
+  view?: View,
   signal?: AbortSignal,
 ): Promise<DayTable> {
   const params = withFilter(new URLSearchParams({ tz: viewerZone() }), filter);
+  withView(params, view);
   return get<DayTable>(`${timelinePath(filter, "/v1/timeline/days")}?${params}`, signal);
 }
 
@@ -264,9 +317,10 @@ export function fetchTimelineDays(
 export async function fetchTimelineIndex(
   id: string,
   filter?: TimelineFilter,
+  view?: View,
   signal?: AbortSignal,
 ): Promise<number> {
-  const params = withFilter(new URLSearchParams({ id }), filter);
+  const params = withView(withFilter(new URLSearchParams({ id }), filter), view);
   try {
     const found = await get<{ index: number }>(
       `${timelinePath(filter, "/v1/timeline/locate")}?${params}`,
@@ -430,6 +484,16 @@ export interface Target {
   ids?: string[];
   ranges?: readonly { start: number; end: number }[];
   filter?: TimelineFilter;
+  /**
+   * How that timeline was being looked at when the positions were counted.
+   *
+   * Travels for the same reason the filter does and is the same kind of mistake
+   * to leave behind: position 2 of a grid sorted oldest-first, or of one
+   * showing only the videos, is a different photograph from position 2 of the
+   * library. A range means nothing without the whole description of the grid it
+   * was drawn in.
+   */
+  view?: View;
 }
 
 /** The body every selection endpoint takes. The scope is the endpoint's. */
@@ -437,6 +501,14 @@ function selectionBody(target: Target): Record<string, unknown> {
   const body: Record<string, unknown> = {};
   if (target.ids?.length) body.ids = target.ids;
   if (target.ranges?.length) body.ranges = target.ranges;
+
+  const view = target.view;
+  if (view) {
+    if (view.sort !== "newest") body.sort = view.sort;
+    if (view.media) body.kind = view.media;
+    if (view.favorites) body.favorites = true;
+    if (view.unalbumed) body.unalbumed = true;
+  }
 
   // The scope — library, trash, or a bucket — is the endpoint's, so only the
   // collection a position was counted in travels in the body. Inside the vault
@@ -619,18 +691,35 @@ export interface Unvaulted {
  */
 export function unvault(
   what:
-    | { bucket: Bucket; ids?: string[]; ranges?: readonly { start: number; end: number }[]; filter?: CollectionFilter }
+    | {
+        bucket: Bucket;
+        ids?: string[];
+        ranges?: readonly { start: number; end: number }[];
+        filter?: CollectionFilter;
+        view?: View;
+      }
     | { batch: string }
     | { bucket: Bucket; album: string }
     | { bucket: Bucket; person: string },
 ): Promise<Unvaulted> {
   const body: Record<string, unknown> = { ...what };
-  // The collection a range was counted in travels under its own key, because
-  // the top level already spends `album` and `person` on "restore this whole
-  // grouping" — two different questions that would otherwise share a word.
-  if ("filter" in what && what.filter) {
-    delete body.filter;
-    body.filter = { [FILTER_PARAM[what.filter.kind]]: what.filter.value };
+  // The whole description of the grid a range was counted in travels under one
+  // key, because the top level already spends `album` and `person` on "restore
+  // this whole grouping" — two different questions that would otherwise share a
+  // word. Nothing but a range has any use for it: a restore by id names its
+  // photographs exactly, whatever order they were being looked at in.
+  delete body.filter;
+  delete body.view;
+  if ("ranges" in what && what.ranges?.length) {
+    const collection = what.filter ? { [FILTER_PARAM[what.filter.kind]]: what.filter.value } : {};
+    const view = what.view;
+    body.filter = {
+      ...collection,
+      ...(view?.sort && view.sort !== "newest" ? { sort: view.sort } : {}),
+      ...(view?.media ? { kind: view.media } : {}),
+      ...(view?.favorites ? { favorites: true } : {}),
+      ...(view?.unalbumed ? { unalbumed: true } : {}),
+    };
   }
   return send<Unvaulted>("/v1/vault/restore", body);
 }
@@ -738,4 +827,157 @@ export function fetchVaultCollections(
   signal?: AbortSignal,
 ): Promise<VaultCollections> {
   return get<VaultCollections>(`/v1/vault/${bucket}/collections`, signal);
+}
+
+// The archive's opinion about what ought to be one item and is several. Two
+// kinds, one shape, and only one of them is a question anybody is asked — see
+// internal/merge on why a split recording is put back together without being
+// approved and a set of duplicates is not.
+
+/** Which kind of group. Not interchangeable; see the review page. */
+export type MergeKind = "duplicate" | "video-segments";
+export type MergeState = "pending" | "merged" | "dismissed";
+
+/**
+ * One candidate, described in the terms the choice is actually made in.
+ *
+ * Everything here is on the wire because the comparison is made from it. A page
+ * that had to fetch each member's detail separately would issue a hundred
+ * requests to draw one burst.
+ */
+export interface MergeMember {
+  id: string;
+  position: number;
+  filename: string;
+  kind: MediaKind;
+  width?: number;
+  height?: number;
+  byte_size: number;
+  duration?: number;
+  taken_at: string;
+  import_source?: string;
+  favorite?: boolean;
+  /**
+   * What a discarded copy would take with it, if the merge did not carry them
+   * across. It does — but "this one is in three albums" is exactly the sort of
+   * thing that makes somebody pick a different keeper.
+   */
+  albums?: string[];
+  people?: string[];
+  /** "live" or "deleted", so a resolved group can still be drawn honestly. */
+  state: string;
+}
+
+export interface MergeGroup {
+  id: string;
+  kind: MergeKind;
+  state: MergeState;
+  detected_at: string;
+  /** The copy that was kept, or the recording that was built. */
+  keeper_asset_id?: string;
+  members: MergeMember[];
+}
+
+/** How much of the library the scan could see when it last ran. */
+export interface SignatureCoverage {
+  assets: number;
+  signed: number;
+}
+
+/**
+ * What the overview card says.
+ *
+ * Groups and photographs are both here because they answer different questions:
+ * the first is how many decisions are waiting, the second is how much is at
+ * stake in them.
+ */
+export interface MergeCounts {
+  pending_duplicates: number;
+  duplicate_items: number;
+  pending_segments: number;
+  merged_segments: number;
+  merged_duplicates: number;
+  coverage: SignatureCoverage;
+}
+
+export function fetchMergeCounts(signal?: AbortSignal): Promise<MergeCounts> {
+  return get<MergeCounts>("/v1/merges", signal);
+}
+
+export function fetchMergeGroups(
+  kind: MergeKind = "duplicate",
+  state: MergeState = "pending",
+  signal?: AbortSignal,
+): Promise<MergeGroup[]> {
+  const params = new URLSearchParams({ kind, state });
+  return get<{ groups: MergeGroup[] }>(`/v1/merges/groups?${params}`, signal).then(
+    (r) => r.groups ?? [],
+  );
+}
+
+/** What a resolved group did. The batch is the undo, as everywhere else here. */
+export interface Merged {
+  keeper: string;
+  batch: string;
+  trashed: number;
+}
+
+/**
+ * Keeps one copy and moves the rest to Recently Deleted, carrying their albums,
+ * people, caption and favourite onto the one that stays first.
+ *
+ * The keeper is always sent, never defaulted. The order the members arrive in is
+ * the server's opinion about which is the better copy and the page preselects
+ * it, so a request that named nothing would be ambiguous between agreeing with
+ * the suggestion and forgetting the field.
+ */
+export function mergeGroup(group: string, keeper: string): Promise<Merged> {
+  return send<Merged>(`/v1/merges/${group}/merge`, { keeper });
+}
+
+/** Records that these are different photographs, and stops them being paired again. */
+export async function dismissGroup(group: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/v1/merges/${group}/dismiss`, { method: "POST" });
+  if (!res.ok) throw new ApiError(res.status, await errorText(res));
+}
+
+/** What an undo put back, and what it took away in exchange. */
+export interface Unmerged {
+  restored: number;
+  /** The joined recording that has now gone to the trash. Absent for duplicates. */
+  keeper?: string;
+}
+
+/**
+ * Undoes a merge: the pieces come back out of the trash, and a joined recording
+ * goes into it.
+ *
+ * The undo for the half of this that happens without being asked. It leaves the
+ * group dismissed rather than pending — a pending set of segments would be
+ * re-joined by the worker within the minute, and the undo would appear not to
+ * have worked.
+ */
+export function unmergeGroup(group: string): Promise<Unmerged> {
+  return send<Unmerged>(`/v1/merges/${group}/undo`, {});
+}
+
+/** What one sweep of the library found. */
+export interface ScanResult {
+  segments: number;
+  duplicates: number;
+  queued: number;
+  signed: number;
+  assets: number;
+}
+
+/**
+ * Looks over the whole library again.
+ *
+ * Synchronous and slow — a few seconds — because the page that called it is
+ * about to redraw from what it found. It is a button rather than a timer
+ * because the things that create work here (an import, a signature backfill)
+ * both end.
+ */
+export function scanForMerges(): Promise<ScanResult> {
+  return send<ScanResult>("/v1/merges/scan", {});
 }

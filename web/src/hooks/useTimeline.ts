@@ -8,7 +8,9 @@ import {
   fetchTimelineIndex,
   type TimelineFilter,
   type TimelineItem,
+  type View,
 } from "@/lib/api";
+import { DEFAULT_VIEW, viewKey } from "@/lib/view";
 import {
   countOf,
   dayIndexOf,
@@ -54,6 +56,16 @@ export interface TimelineState {
   total: number;
   /** False until the day table lands. There is no geometry before that. */
   ready: boolean;
+  /**
+   * Whether a day table is in flight. True on the first load and again whenever
+   * the collection is reordered, refiltered or reloaded after a delete.
+   *
+   * Which is the window in which `days` describes a timeline nobody is looking
+   * at any more — the old table is deliberately kept until the new one lands,
+   * so the grid does not collapse and flicker on every reload. Anything reading
+   * a position out of it has to know that, and the calendar does.
+   */
+  loading: boolean;
   error: string | null;
   retry: () => void;
   /** The item at a position, or undefined while it is still being fetched. */
@@ -104,11 +116,19 @@ export interface TimelineState {
  * The filter is read through a ref rather than a dependency, because it is an
  * object literal at every call site. A collection only changes when the route
  * does, at which point the hook is remounted anyway.
+ *
+ * The view is read the same way and is not the same case: it changes under
+ * somebody's hands, without the route moving and without a remount. So it is
+ * the one thing here with a dependency of its own — a string rather than the
+ * object, so that an equal view spelled twice does not refetch the archive.
+ * Everything else about a reorder is a reload, which is what the day table
+ * already knows how to be.
  */
-export function useTimeline(filter?: TimelineFilter): TimelineState {
+export function useTimeline(filter?: TimelineFilter, view: View = DEFAULT_VIEW): TimelineState {
   const [days, setDays] = useState<Day[]>([]);
   const [total, setTotal] = useState(0);
   const [ready, setReady] = useState(false);
+  const [refreshing, setRefreshing] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // Bumped whenever a page lands. The item array itself lives in a ref: it is
   // one slot per photo in the archive, and copying it to announce that 200 of
@@ -117,6 +137,9 @@ export function useTimeline(filter?: TimelineFilter): TimelineState {
 
   const asked = useRef(filter);
   asked.current = filter;
+  const looking = useRef(view);
+  looking.current = view;
+  const key = viewKey(view);
 
   const items = useRef<(TimelineItem | undefined)[]>([]);
   const byID = useRef(new Map<string, number>());
@@ -245,7 +268,7 @@ export function useTimeline(filter?: TimelineFilter): TimelineState {
       const cursor = cursors.current.get(page);
       const start = cursor ? { cursor } : { skip: page * PAGE_SIZE };
 
-      fetchTimeline(start, PAGE_SIZE, asked.current, controller.signal)
+      fetchTimeline(start, PAGE_SIZE, asked.current, looking.current, controller.signal)
         .then((fetched) => {
           if (inFlight.current.get(page) !== controller) return;
           inFlight.current.delete(page);
@@ -282,8 +305,9 @@ export function useTimeline(filter?: TimelineFilter): TimelineState {
     loading.current = controller;
     clear();
     setError(null);
+    setRefreshing(true);
 
-    fetchTimelineDays(asked.current, controller.signal)
+    fetchTimelineDays(asked.current, looking.current, controller.signal)
       .then((table) => {
         if (controller.signal.aborted) return;
         const built = daysFrom(table.days);
@@ -292,6 +316,7 @@ export function useTimeline(filter?: TimelineFilter): TimelineState {
         setDays(built);
         setTotal(table.total);
         setReady(true);
+        setRefreshing(false);
         bump((n) => n + 1);
         pump();
       })
@@ -301,6 +326,7 @@ export function useTimeline(filter?: TimelineFilter): TimelineState {
         // to put placeholders in, so this is the one error worth stopping for.
         setError(err instanceof Error ? err.message : "could not load the timeline");
         setReady(true);
+        setRefreshing(false);
       });
 
     return () => controller.abort();
@@ -308,7 +334,10 @@ export function useTimeline(filter?: TimelineFilter): TimelineState {
 
   resync.current = load;
 
-  useEffect(() => load(), [load]);
+  // `key` rather than `view`: an equal view spelled as a second object literal
+  // is the same timeline, and refetching it would cost a day table and every
+  // page on screen for nothing.
+  useEffect(() => load(), [load, key]);
   useEffect(() => clear, [clear]);
 
   const request = useCallback(
@@ -336,7 +365,7 @@ export function useTimeline(filter?: TimelineFilter): TimelineState {
 
   const locate = useCallback(async (id: string, signal?: AbortSignal) => {
     const held = byID.current.get(id);
-    return held ?? fetchTimelineIndex(id, asked.current, signal);
+    return held ?? fetchTimelineIndex(id, asked.current, looking.current, signal);
   }, []);
 
   const patch = useCallback((updated: TimelineItem[]) => {
@@ -360,6 +389,7 @@ export function useTimeline(filter?: TimelineFilter): TimelineState {
       days,
       total,
       ready,
+      loading: refreshing,
       error,
       retry,
       at,
@@ -368,7 +398,7 @@ export function useTimeline(filter?: TimelineFilter): TimelineState {
       request,
       patch,
     }),
-    [days, total, ready, error, retry, at, indexOf, locate, request, patch, version],
+    [days, total, ready, refreshing, error, retry, at, indexOf, locate, request, patch, version],
   );
 }
 
@@ -393,6 +423,11 @@ function misplaced(days: Day[], start: number, fetched: TimelineItem[]): boolean
     const index = start + n;
     const day = days[dayIndexOf(days, index)];
     if (!day || index >= day.start + day.count) return true;
+    // A run with no date makes no claim about which day anything falls under —
+    // see lib/layout.headless — so the bounds check above is the whole of what
+    // can be checked, and it is still worth checking: an upload during a
+    // reorder changes the count as surely as it changes the headings.
+    if (day.key === "") continue;
     const item = fetched[n];
     if (dayKeyOf(item.taken_at, item.offset_minutes) !== day.key) return true;
   }

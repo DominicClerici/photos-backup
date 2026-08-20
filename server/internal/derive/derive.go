@@ -135,7 +135,7 @@ func (c *Converter) Thumbs(ctx context.Context, src string, over *Layer, targets
 	// rendition to be named twice.
 	args = append(args, "null:")
 
-	if err := c.run(ctx, nil, src, args...); err != nil {
+	if err := c.run(ctx, nil, "webp", src, args...); err != nil {
 		return err
 	}
 	// ImageMagick can exit 0 having written a file it could not finish — a full
@@ -177,7 +177,64 @@ func (c *Converter) Preview(ctx context.Context, src string, over *Layer, w io.W
 		"-quality", fmt.Sprint(c.previewQuality()),
 		"webp:-",
 	)
-	return c.run(ctx, w, src, ops...)
+	return c.run(ctx, w, "webp", src, ops...)
+}
+
+// Sample writes the square grey plane the duplicate scan hashes: edge x edge
+// bytes, one byte of luminance per pixel, row-major and headerless. See
+// internal/imagehash, which is the only thing that reads one.
+//
+// Squashed to a square rather than cropped to one, which is the opposite of
+// what Thumbs does and is the point. A thumbnail is cropped because it is
+// shown in a square cell and a letterboxed grid looks broken; this is never
+// shown to anyone, and cropping it would throw away the edges of the picture —
+// where, for two copies of the same photograph at different aspect ratios, the
+// only difference between them often is. Squashing distorts both copies
+// identically, which is all a comparison needs. The aspect ratio is stored
+// beside the hash rather than baked into it.
+//
+// The caption layer goes on first, for a Snapchat memory, because the
+// composite is the picture: two copies of the same memory are two copies of
+// what was sent, and the photograph underneath is a thing nobody ever saw.
+//
+// -alpha off after the composite, not before: a transparent PNG hashed as
+// though its transparent regions were black is a plane mostly describing the
+// shape of the alpha channel, and an original with an alpha channel and no
+// overlay would otherwise be compared against opaque copies of itself.
+func (c *Converter) Sample(ctx context.Context, src string, over *Layer, edge int) ([]byte, error) {
+	if edge <= 0 {
+		return nil, fmt.Errorf("sample %s: %d is not an edge length", src, edge)
+	}
+	if err := c.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer c.release()
+
+	compose, err := c.compose(ctx, src, over)
+	if err != nil {
+		return nil, err
+	}
+
+	ops := []string{"-auto-orient"}
+	ops = append(ops, compose...)
+	ops = append(ops,
+		"-background", "black", "-alpha", "remove", "-alpha", "off",
+		"-colorspace", "Gray",
+		// The ! is what makes this a squash: fill the box exactly, ignoring the
+		// aspect ratio, rather than fitting inside it.
+		"-resize", fmt.Sprintf("%dx%d!", edge, edge),
+		"-depth", "8",
+		"gray:-",
+	)
+
+	var out bytes.Buffer
+	if err := c.run(ctx, &out, "a grey plane", src, ops...); err != nil {
+		return nil, err
+	}
+	if out.Len() != edge*edge {
+		return nil, fmt.Errorf("sample %s: got %d bytes, want %d", src, out.Len(), edge*edge)
+	}
+	return out.Bytes(), nil
 }
 
 // compose renders a layer as the ImageMagick operators that draw it over the
@@ -235,7 +292,12 @@ func (c *Converter) dimensions(ctx context.Context, src string) (width, height i
 
 // run drives one ImageMagick, with ops carrying its own output specification —
 // stdout for the preview, a file per size for the thumbnails.
-func (c *Converter) run(ctx context.Context, w io.Writer, src string, ops ...string) error {
+//
+// what names the rendition being built, and is only ever read in an error. It
+// is a parameter because this package now writes something that is not an
+// image anybody will look at, and "convert x to webp" is a misleading thing to
+// find in a log when what failed was a grey plane for the duplicate scan.
+func (c *Converter) run(ctx context.Context, w io.Writer, what, src string, ops ...string) error {
 	args := append([]string{source(src)}, ops...)
 
 	cmd := exec.CommandContext(ctx, c.binary(), args...)
@@ -244,7 +306,7 @@ func (c *Converter) run(ctx context.Context, w io.Writer, src string, ops ...str
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("convert %s to webp: %w: %s", src, err, bytes.TrimSpace(stderr.Bytes()))
+		return fmt.Errorf("convert %s to %s: %w: %s", src, what, err, bytes.TrimSpace(stderr.Bytes()))
 	}
 	return nil
 }

@@ -26,7 +26,8 @@ proxies `/api/*` here; see its README to bring the browser side up.
 | `DERIVATIVES_ROOT` | `$PHOTOS_ROOT/derivatives` | thumbnails and playback files |
 | `DATABASE_URL` | local compose Postgres | Postgres connection string |
 | `WORKER_CONCURRENCY` | `4` | metadata + thumbnail workers |
-| `TRANSCODE_CONCURRENCY` | `1` | video transcode workers |
+| `TRANSCODE_CONCURRENCY` | `1` | video transcode and merge workers |
+| `SIGNATURE_CONCURRENCY` | `1` | workers hashing originals for the duplicate scan |
 | `PREVIEW_CONCURRENCY` | `4` | simultaneous on-demand preview conversions |
 | `LIVE_PREVIEW_CONCURRENCY` | `2` | simultaneous on-demand Live Photo renditions |
 | `LIVE_PREVIEW_CACHE_MB` | `64` | memory those renditions are held in between requests |
@@ -68,7 +69,7 @@ DELETE /v1/uploads/{id}          abandon
 POST /v1/assets/{id}/import-metadata   an export's sidecar for an archived asset
 
 open:
-GET  /v1/timeline                JSON page, newest first; keyset cursor or row offset
+GET  /v1/timeline                JSON page; keyset cursor or row offset
 GET  /v1/timeline/days           every heading in the collection and its size
 GET  /v1/timeline/locate         where one asset sits, for a link that names an id
 POST /v1/timeline/states         re-read derivative state for specific ids
@@ -82,6 +83,8 @@ GET  /v1/assets/{id}/preview/plain    the same still without its Snapchat overla
 GET  /v1/assets/{id}/playback/plain   the same video without it burned in
 GET  /v1/assets/{id}/live/thumb[/{px}]  a Live Photo's motion, same sizes
 GET  /v1/assets/{id}/live/preview       1080p with audio, rendered per request
+GET  /v1/merges                  how much is waiting, and how much has been analysed
+GET  /v1/merges/groups?kind=&state=   the review: sets of items that should be one
 GET  /v1/jobs                    queue depth and the failure list
 GET  /health                     also reports pending and failed job counts
 
@@ -90,10 +93,24 @@ POST /v1/trash                   move a selection to Recently Deleted
 POST /v1/trash/restore           put a batch, or a selection of the trash, back
 POST /v1/trash/purge             destroy a selection of the trash outright
 DELETE /v1/collections/albums/{id}[?photos=true]   drop an album, optionally its photos
+POST /v1/merges/scan             look for duplicates and split recordings again
+POST /v1/merges/{id}/merge       keep one copy of a group, trash the rest
+POST /v1/merges/{id}/dismiss     record that these are different photographs
+POST /v1/merges/{id}/undo        put a merge back: copies out of the trash, a join into it
 ```
 
+`/v1/timeline`, `/v1/timeline/days` and `/v1/timeline/locate` share a filter, and
+so do their vault counterparts: one of `album`/`person`/`category`, plus `sort`
+(`newest` — the default — `oldest`, `longest`, `shortest`), `kind` (`image` or
+`video`), `favorites=1` and `unalbumed=1`. The last four combine freely with each
+other and with the collection; the first three do not combine with one another.
+An unknown sort or kind is a `400`, not a silently wider timeline. See
+[Sorting and filtering](#sorting-and-filtering).
+
 The three trash endpoints take the same body: `ids`, `ranges`, or both, plus one
-of `album`/`person`/`category` naming the timeline those ranges are positions in.
+of `album`/`person`/`category` naming the timeline those ranges are positions in,
+plus `sort`, `kind`, `favorites` and `unalbumed` saying how that timeline was
+being read.
 A range is `{"start": n, "end": m}`, end exclusive, counted in exactly the units
 `GET /v1/timeline?skip=` offsets by — which is what lets the gallery act on a
 selection of forty thousand photographs it has never fetched. Which half of the
@@ -127,6 +144,44 @@ guaranteed to have; a size that has not been rendered yet is a `404`, never the
 nearest one that exists. Since these URLs are cached forever, answering
 `/thumb/512` with the 256px file would pin the wrong bytes in a browser long
 after the real rendition landed. The gallery falls back on its own.
+
+## Sorting and filtering
+
+Four orders and four facets, over the same query, the same cursor and the same
+day table.
+
+**Newest and oldest are one index read in two directions.** `assets_timeline_visible_idx`
+is `(sort_time desc, id desc)`; a backward scan of it is `(sort_time asc, id
+asc)`, so oldest keeps the keyset cursor and the constant-time page that newest
+has. The cursor comparison flips with it — `TimelineFilter.beyond` — and so does
+the `row_number()` the day table and every range-resolving write are counted in.
+
+**Longest and shortest have no index and are allowed not to.** They order by
+`duration_seconds`, which nothing indexes: every page costs a sort of the
+filtered set, and `TimelinePosition` falls back to ranking the whole timeline to
+find one row. They also hand out no `next_cursor`, because a cursor is a sort key
+and this one is nullable — clients page them by `skip` instead. The trade is
+deliberate: these are what somebody reaches for once to find the long video, and
+an index on `duration_seconds` would be paid for by every upload forever. Both
+carry `nulls last`, which is not `desc`'s default, so "longest first" cannot open
+with every still in the archive.
+
+**A timeline ordered by length has no days.** `GET /v1/timeline/days` answers
+with one run carrying the whole count and an empty `day`, which is the client's
+signal to draw no headings and reserve no room for them. Sending a heading per
+tile instead would be a description of a shape the timeline does not have.
+
+**The facets are predicates, and `kind` is the one the index helps with.**
+`favorites` is a column. `unalbumed` is a `not exists` over `album_assets` joined
+to `albums`, so an album in the trash or in the vault stops hiding what was in
+it — the membership rows survive a delete, which is what makes the undo work.
+Neither is fast, and neither has to be: the gallery spends its time under
+`kind`, and these two are answers to questions asked once.
+
+**Everything that resolves a position uses the same order.** `Selection.pick`
+numbers rows with `TimelineFilter.order`, the same fragment the page and the day
+table use, so a selection made in a grid sorted oldest-first deletes the
+photographs somebody was looking at. There is a test that says exactly that.
 
 ## Authentication
 
@@ -329,16 +384,25 @@ it has been through JavaScript; `Date.toISOString()` always emits three decimals
 
 ## Derivatives
 
-Two jobs per asset, in two separately sized pools:
+Four kinds of job, in three separately sized pools:
 
 | kind | does | pool |
 |---|---|---|
 | `metadata` | exiftool, the 256px thumbnail, a poster frame for video, a Live Photo's 256px motion | `WORKER_CONCURRENCY` |
 | `playback` | H.264/AAC MP4 capped at 1080p, `+faststart` | `TRANSCODE_CONCURRENCY` |
+| `merge` | concatenates the pieces of a split Snapchat recording into one archived original | `TRANSCODE_CONCURRENCY` |
+| `signature` | decodes an original into the hashes the duplicate scan compares | `SIGNATURE_CONCURRENCY` |
 
 The pools are split so a handful of 4K transcodes cannot claim every slot and
 starve the thumbnails behind them — during a backfill that would look like the
-gallery doing nothing at all.
+gallery doing nothing at all. `signature` gets a third pool for a related reason
+and a stronger one: it is a full decode of every original in the archive plus
+twenty sampled frames out of every video, it takes about an hour over a library
+of this size, and nothing at all is waiting for the answer.
+
+`merge` shares the transcode pool because it is the same kind of work — ffmpeg
+over a whole video, minutes rather than milliseconds. It is the only job here
+that *adds* to the archive: see Merging below.
 
 Splitting the pools bounds the slots, not the CPU, and libx264 will take every
 core it can reach whatever its pool size is. Measured on the archive machine
@@ -747,6 +811,66 @@ The two halves upload as separate devices (`snapchat memories import`,
 ids are `memories/<name>` and `chat_media/<name>` with the delivery directory
 deliberately left out: Snapchat's zip numbering is an artifact of one download,
 and a second download splits the same files differently.
+
+## Merging
+
+Two things the archive holds several times over, found by one scan and resolved
+by one mechanism. See `internal/merge`, which does the finding and nothing else:
+no SQL, no files, no ffmpeg.
+
+**Duplicates.** Every asset is reduced to two 64-bit hashes taken from a 32x32
+grey plane of the original — a difference hash (a gradient: survives
+recompression, blind to brightness) and a perceptual hash (the low frequencies
+of a DCT: describes structure). Both must agree within nine of sixty-four bits,
+and the aspect ratios must be within 5%. A video is instead reduced to twenty
+frames sampled at even fractions of its running time and compared position for
+position against another clip of the same length, which is what survives a
+change of frame rate. Matching pairs are unioned into groups, so a burst of a
+hundred frames arrives as one group rather than five thousand pairs.
+
+Nothing is merged without being asked. The review page offers the group best
+first — most pixels, then most bytes, then oldest — and whichever copy is chosen
+inherits the others' albums, people, caption and favourite before they go to the
+trash under one batch.
+
+**Split recordings.** Snapchat caps a memory at ten seconds and exports a longer
+one as several files with nothing marking them as related. What gives them away
+is `memories_history.json`: consecutive pieces are written exactly ten seconds
+apart, to the second. The scan chains on `captured_at` (the history date) rather
+than `sort_time`, because the QuickTime creation date on these files is when the
+piece was written out and drifts by up to eighty seconds across one recording.
+
+These are joined without being asked, by the `merge` job. The join prefers a
+stream copy — two pieces from the same encoder agree about everything a container
+cares about, so the output holds the camera's own frames and comes out at exactly
+the sum of the inputs' durations. It falls back to re-encoding when a resolution
+changed mid-recording, a piece has no audio, or a caption layer has to be burned
+in, and records which in the sidecar.
+
+**A joined recording is an original.** It is committed blob first, then two
+manifest lines (an asset line and a metadata line carrying the sidecar), then the
+database row — the upload path's ordering, for the upload path's reasons. Its
+pieces go to the trash rather than away, so for a year both exist and `verify`
+covers all of them. Nothing is trashed until the join is committed and indexed: a
+crash halfway leaves a duplicate-looking minute of video beside its pieces, which
+somebody can see and undo, where the other order would leave the pieces deleted
+and nothing joined.
+
+**Undo.** Both kinds hand back a delete batch, and `POST /v1/merges/{id}/undo`
+restores it — plus, for a join, sends the joined recording to the trash so the
+library does not end up holding the minute *and* the six pieces. An undone group
+lands in `dismissed` rather than `pending`, because a pending set of segments
+would be re-joined by the worker within the minute. Every pair inside a dismissed
+group is one the scan will never link again.
+
+**The scan is not on a timer.** The two things that create work here — an import
+and a signature backfill — both end, so it runs at startup and from the button on
+the review page. A sweep over an untouched library writes nothing and costs a few
+seconds of comparing every signature against every other, which is the right
+algorithm at twenty thousand assets and the wrong one at a million.
+
+**The vault is excluded** from signatures entirely. A signature describes what a
+photograph looks like, and the vault exists to stop this server knowing that.
 
 ## Commit ordering
 

@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation";
 import { Ellipsis, Images, LayoutDashboard, Library, Search } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { FilterPill } from "./FilterPill";
 import { SelectionPill } from "./SelectionPill";
 
 const TABS = [
@@ -81,11 +82,23 @@ export function TabBar() {
       className="pointer-events-none fixed inset-x-0 bottom-5 z-30 flex justify-center px-3 transition-[opacity,visibility] duration-200 ease-out"
     >
       {/* The tabs and everything moored to them. The wrapper is only here to
-          give the selection pill an edge to hang off: it is positioned against
-          the row's left edge and grows away from it, so a selection of eleven
-          thousand photographs widens the pill without nudging a single tab. */}
+          give the floating controls an edge to hang off: they are positioned
+          against the row's left edge and grow away from it, so a selection of
+          eleven thousand photographs widens its pill without nudging a tab. */}
       <div className="pointer-events-none relative flex max-w-full">
-        <SelectionPill />
+        {/* Anchored by its right edge and unconstrained on the left, so the row
+            grows leftwards as the pills in it find things to say. Both of them
+            are things done *to* a grid, and neither is drawn without one.
+
+            `w-max` is load-bearing. An absolutely positioned box with only
+            `right` set is shrink-to-fit against the space between that edge and
+            the containing block's — which at `right-full` is exactly none, so
+            every label inside would collapse to nothing while the pills kept
+            their padding and looked merely empty. */}
+        <div className="absolute right-full bottom-0 mr-2 flex w-max items-end gap-2">
+          <FilterPill />
+          <SelectionPill />
+        </div>
 
         <ul
           ref={row}

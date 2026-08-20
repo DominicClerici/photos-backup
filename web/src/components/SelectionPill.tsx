@@ -27,11 +27,11 @@ import { cn } from "@/lib/utils";
 /**
  * The selection control, standing to the left of the tab bar.
  *
- * A circle until there is a selection, then a pill with a count in it. It grows
- * leftwards, from a right edge pinned a few pixels from the tab bar, so that
- * turning selection mode on never shoves the tabs across the screen — the one
- * thing on this bar that must not move, because it is the thing people aim at
- * without looking.
+ * A circle until there is a selection, then a pill with a count in it. It sits
+ * in a row anchored by its right edge a few pixels from the tab bar and growing
+ * leftwards, so that turning selection mode on never shoves the tabs across the
+ * screen — the one thing on this bar that must not move, because it is the
+ * thing people aim at without looking. See TabBar.
  *
  * It draws nothing at all unless a grid is on screen to select from, which is
  * what keeps it off the collections and overview pages.
@@ -94,7 +94,11 @@ export function SelectionPill() {
   const startCreate = useCallback(
     (name: string) => {
       if (!actions || count === 0) return;
-      setCreating({ name, bucket: actions.bucket, target: { ranges, filter: actions.filter } });
+      setCreating({
+        name,
+        bucket: actions.bucket,
+        target: { ranges, filter: actions.filter, view: actions.view },
+      });
     },
     [actions, count, ranges],
   );
@@ -143,7 +147,7 @@ export function SelectionPill() {
   const forever = actions?.scope === "trash";
 
   return (
-    <div className="pointer-events-auto absolute right-full bottom-0 mr-2 flex flex-col items-end">
+    <div className="pointer-events-auto relative flex flex-col items-end">
       <Sheet
         open={sheet}
         count={count}
@@ -296,7 +300,10 @@ function Sheet({
   return (
     <div
       className={cn(
-        "mb-2 w-60 rounded-2xl border bg-card/80 p-3 shadow-lg backdrop-blur-xl transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none",
+        // Out of the flow, not merely hidden. Closed it is still 240px wide,
+        // and in the row of floating controls that width would sit between the
+        // pill and its neighbour as a gap nothing is drawn in.
+        "absolute right-0 bottom-full mb-2 w-60 rounded-2xl border bg-card/80 p-3 shadow-lg backdrop-blur-xl transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none",
         open ? "translate-y-0 opacity-100" : "pointer-events-none invisible translate-y-2 opacity-0",
       )}
       // Not merely invisible: a panel nobody can see should not be reachable by

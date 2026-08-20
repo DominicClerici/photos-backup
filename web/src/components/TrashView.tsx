@@ -5,6 +5,7 @@ import { ArrowLeft, Trash2 } from "lucide-react";
 
 import type { TimelineFilter } from "@/lib/api";
 import { useTimeline } from "@/hooks/useTimeline";
+import { useView } from "@/hooks/useView";
 import { useTrashActions } from "@/hooks/useTrash";
 import { useViewer } from "@/hooks/useViewer";
 import { Timeline } from "./Timeline";
@@ -31,9 +32,10 @@ const TRASH: TimelineFilter = { kind: "trash" };
  * often enough to notice it rotting.
  */
 export function TrashView() {
-  const timeline = useTimeline(TRASH);
+  const { view } = useView();
+  const timeline = useTimeline(TRASH, view);
   const { index, open, close, navigate } = useViewer(timeline);
-  const actions = useTrashActions(TRASH, timeline.retry);
+  const actions = useTrashActions(TRASH, timeline.retry, undefined, view);
 
   return (
     <div className="flex h-dvh flex-col">

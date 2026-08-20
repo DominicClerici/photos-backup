@@ -14,6 +14,7 @@ import {
   type Bucket,
   type Target,
   type TimelineFilter,
+  type View,
 } from "@/lib/api";
 import { toast } from "@/components/ui/toast";
 import { counted, formatBytes, type Noun } from "@/lib/format";
@@ -39,11 +40,16 @@ import type { AlbumRef, SelectionActions } from "./useSelection";
  * @param albumTitle What this album is called, when the timeline is one. Only
  *   the page knows — the filter carries a uuid — and the toast that says a
  *   photograph has left an album should say which.
+ * @param view How that timeline is being sorted and filtered, which is the
+ *   other half of what a position means. It travels with every range for the
+ *   same reason the filter does: position 2 of a grid showing only the videos
+ *   is a different photograph from position 2 of the album.
  */
 export function useTrashActions(
   filter: TimelineFilter | undefined,
   reload: () => void,
   albumTitle?: string,
+  view?: View,
 ): SelectionActions {
   return useMemo<SelectionActions>(() => {
     const scope =
@@ -65,10 +71,11 @@ export function useTrashActions(
       bucket,
       album: within ? { id: within, title: albumTitle } : undefined,
       filter,
+      view,
 
       async remove(target: Target, noun?: Noun) {
         try {
-          const { batch, deleted } = await deleteItems({ ...target, filter });
+          const { batch, deleted } = await deleteItems({ ...target, filter, view });
           reload();
           // `id` is referenced by a handler defined before `add` returns it.
           // That is safe because the handler cannot run until long after this
@@ -102,7 +109,7 @@ export function useTrashActions(
       // the gate rather than to a toast. See needsVault.
       async hide(bucket: Bucket, target: Target, noun?: Noun) {
         try {
-          const { batch, moved } = await vaultItems(bucket, { ...target, filter });
+          const { batch, moved } = await vaultItems(bucket, { ...target, filter, view });
           reload();
           const id: string = toast.add({
             title: `${counted(moved, noun)} ${bucket === "archive" ? "archived" : "hidden"}`,
@@ -131,8 +138,16 @@ export function useTrashActions(
         try {
           const restored =
             filter?.kind === "vault"
-              ? (await unvault({ bucket: filter.bucket, ids: target.ids, ranges: target.ranges, filter: filter.within })).restored
-              : (await restoreItems({ ...target, filter })).restored;
+              ? (
+                  await unvault({
+                    bucket: filter.bucket,
+                    ids: target.ids,
+                    ranges: target.ranges,
+                    filter: filter.within,
+                    view,
+                  })
+                ).restored
+              : (await restoreItems({ ...target, filter, view })).restored;
           reload();
           toast.add({
             type: "success",
@@ -151,7 +166,7 @@ export function useTrashActions(
       // this album's own, which is the one case checked for below.
       async file(album: AlbumRef, target: Target, noun?: Noun) {
         try {
-          const { added = 0 } = await addToAlbum(album.id, { ...target, filter }, bucket);
+          const { added = 0 } = await addToAlbum(album.id, { ...target, filter, view }, bucket);
           albumsChanged();
           if (within === album.id) reload();
           toast.add(
@@ -176,7 +191,7 @@ export function useTrashActions(
       // removal named by position has already moved every position after it.
       async unfile(album: AlbumRef, target: Target, noun?: Noun) {
         try {
-          const { removed = 0 } = await removeFromAlbum(album.id, { ...target, filter }, bucket);
+          const { removed = 0 } = await removeFromAlbum(album.id, { ...target, filter, view }, bucket);
           albumsChanged();
           reload();
 
@@ -210,7 +225,7 @@ export function useTrashActions(
 
       async purge(target: Target, noun?: Noun) {
         try {
-          const { purged, bytes } = await purgeItems({ ...target, filter });
+          const { purged, bytes } = await purgeItems({ ...target, filter, view });
           reload();
           toast.add({
             title: `${counted(purged, noun)} permanently deleted`,
@@ -221,7 +236,7 @@ export function useTrashActions(
         }
       },
     };
-  }, [filter, reload, albumTitle]);
+  }, [filter, reload, albumTitle, view]);
 }
 
 /** What to call an album in a sentence, whether or not its name is in hand. */

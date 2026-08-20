@@ -3,9 +3,9 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { Geist } from "next/font/google";
 import { SelectionProvider } from "@/hooks/useSelection";
+import { ViewProvider } from "@/hooks/useView";
 import { TabBar } from "@/components/TabBar";
 import { Toaster } from "@/components/ui/toast";
-import { SignIn } from "@/components/SignIn";
 import { VaultGate } from "@/components/VaultGate";
 import { cn } from "@/lib/utils";
 
@@ -38,6 +38,9 @@ export default function RootLayout({
           mounted by a page and the control that reports it by the bar, so this
           is the only place the two can meet. `children` stays a server
           component — it is passed through, not rendered by, the provider. */}
+      {/* The sort and the filters are the same arrangement for the same reason,
+          and one layer further in: a view is of a selection's timeline, and
+          changing it drops the selection made under the old one. */}
       {/* Toasts are here for a related reason and a stronger one: a delete
           reloads the timeline it happened on, so the component that started it
           may well be unmounted by the time the toast is showing. The undo it
@@ -50,13 +53,11 @@ export default function RootLayout({
       <body>
         <Toaster>
           <SelectionProvider>
-            {children}
-            <TabBar />
-            <VaultGate />
-            {/* browser gate: the gallery password, when photod is the one
-                serving this app to a network rather than to this machine. It
-                draws nothing at all otherwise. */}
-            <SignIn />
+            <ViewProvider>
+              {children}
+              <TabBar />
+              <VaultGate />
+            </ViewProvider>
           </SelectionProvider>
         </Toaster>
       </body>

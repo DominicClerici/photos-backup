@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -19,10 +20,10 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/livecache"
 	"github.com/dominicclerici/photos-backup/server/internal/manifest"
+	"github.com/dominicclerici/photos-backup/server/internal/merge"
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
 	"github.com/dominicclerici/photos-backup/server/internal/vault"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
-	"github.com/dominicclerici/photos-backup/server/internal/websession"
 )
 
 type Server struct {
@@ -53,31 +54,27 @@ type Server struct {
 	// which is the right degradation for a server whose encrypted trees are on
 	// a disk that is not mounted.
 	Vault *vault.Service
-	// Sessions authenticates a browser. Optional, and inert until
-	// GALLERY_PASSWORD is set: with no password configured no session can be
-	// created, so every guarded route falls through to the device token it
-	// already required. See internal/api/websession.go — the browser gate is
-	// the one thing here designed to be deleted whole.
-	Sessions *websession.Store
-	// WebApp is the gallery, reverse-proxied so that it and the photographs
-	// share an origin — which is what lets a cookie authenticate an <img>. Nil
-	// serves the API alone, exactly as before, and is right for any deployment
-	// where the browser reaches Next directly.
-	WebApp http.Handler
 	// Nudge wakes the derivative workers after an upload commits, so the first
 	// thumbnail appears in about the time it takes to make one rather than at
 	// the next poll. Optional: without it the pools still find the work.
 	Nudge func()
-	Log   *slog.Logger
+	// Scan re-runs the search for things that ought to be one item and are
+	// several — see internal/merge. A function rather than a worker, because
+	// this package does HTTP and the worker package does not know it exists;
+	// the result type is the pure one both of them can name.
+	//
+	// Optional. Without it the review endpoints still read and still resolve
+	// groups, and only the button that looks for more answers 503, which is the
+	// right degradation for an API server running with WORKER_DISABLED.
+	Scan func(ctx context.Context) (merge.ScanResult, error)
+	Log  *slog.Logger
 
 	pairOnce    sync.Once
 	pairLimiter *attemptLimiter
 }
 
 // Handler serves the whole API, and must only be mounted on a listener whose
-// traffic is encrypted. Everything that carries a device token is here — and,
-// since the browser gate, everything that carries the gallery password, plus the
-// gallery itself when WebApp is set.
+// traffic is encrypted. Everything that carries a device token is here.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -117,15 +114,9 @@ func (s *Server) Handler() http.Handler {
 	// Reads are authenticated here and open on the plaintext listener. Which
 	// listener a request arrived on is the whole of the difference, so it is
 	// settled once, at the routing table, rather than sampled inside handlers.
-	// browser gate: a signed-in browser is accepted here as well as a paired
-	// device. With no gallery password configured this is s.requireToken
-	// unchanged — see browserOrDevice.
-	s.readRoutes(mux, s.browserOrDevice)
-	s.galleryRoutes(mux, s.browserOrDevice)
-	// browser gate: the sign-in endpoints, and the gallery itself when this
-	// server is the one serving it.
-	s.sessionRoutes(mux)
-	return s.withWebApp(mux)
+	s.readRoutes(mux, s.requireToken)
+	s.galleryRoutes(mux, s.requireToken)
+	return mux
 }
 
 // PlaintextHandler serves only what is safe to send in the clear: the gallery's
@@ -159,15 +150,9 @@ func (s *Server) PlaintextHandler() http.Handler {
 		// Not a write, but it needs a device token to know whose stats to
 		// report, and a token is exactly what this listener will not accept.
 		"GET /v1/stats",
-		// browser gate: the gallery password is a credential like any other,
-		// so the routes that carry it are absent here too. The status endpoint
-		// below carries nothing and is served.
-		"POST /v1/session",
-		"DELETE /v1/session",
 	} {
 		mux.HandleFunc(route, refuseInsecure)
 	}
-	mux.HandleFunc("GET /v1/session", openSessionStatus)
 
 	s.readRoutes(mux, openToAnyone)
 	s.galleryRoutes(mux, openToAnyone)
@@ -201,6 +186,20 @@ func (s *Server) galleryRoutes(mux *http.ServeMux, allow guard) {
 	// what to destroy.
 	mux.HandleFunc("POST /v1/trash/purge", allow(s.handlePurge))
 	mux.HandleFunc("DELETE /v1/collections/albums/{id}", allow(s.handleDeleteAlbum))
+
+	// Resolving a duplicate group, and undoing either kind of merge. They are
+	// here rather than beside the reads above for the reason everything in this
+	// table is: they move photographs to the trash, which is the same authority
+	// the delete endpoints need and the same exposure.
+	//
+	// The scan is a write too, and the odd one out: it destroys nothing and
+	// creates nothing anybody can see, but it queues the joins that put a
+	// Snapchat recording back together without anyone approving it. That is a
+	// change to the library, so it goes where the changes go.
+	mux.HandleFunc("POST /v1/merges/scan", allow(s.handleScan))
+	mux.HandleFunc("POST /v1/merges/{id}/merge", allow(s.handleMerge))
+	mux.HandleFunc("POST /v1/merges/{id}/dismiss", allow(s.handleDismissMerge))
+	mux.HandleFunc("POST /v1/merges/{id}/undo", allow(s.handleUnmerge))
 
 	// Albums, which until now only an import could make. The membership routes
 	// are POST and DELETE on a sub-resource rather than two verbs on the album
@@ -304,6 +303,13 @@ func (s *Server) readRoutes(mux *http.ServeMux, allow guard) {
 
 	// Guarded with the rest: a failed job carries a filename and an error string,
 	// which is archive content by another name.
+	// What the archive thinks is duplicated, and what it has already put back
+	// together. Reads of archive content — a group is a list of filenames and
+	// thumbnails — so they sit with the rest of the gallery's reads rather than
+	// with the writes below.
+	mux.HandleFunc("GET /v1/merges", allow(s.handleMergeCounts))
+	mux.HandleFunc("GET /v1/merges/groups", allow(s.handleMergeGroups))
+
 	mux.HandleFunc("GET /v1/jobs", allow(s.handleJobs))
 	mux.HandleFunc("GET /health", s.handleHealth)
 }

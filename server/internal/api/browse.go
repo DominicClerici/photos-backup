@@ -155,27 +155,60 @@ func (s *Server) handleTimelineLocate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, timelinePosition{Index: index})
 }
 
-// timelineFilter reads the collection a request narrows to.
+// timelineFilter reads the collection a request narrows to, the facets it
+// narrows by, and the order it wants them in.
 //
 // One collection at a time. Accepting two would be an intersection nothing asks
 // for, and refusing it here keeps the query's shape a thing the gallery can
-// reason about.
+// reason about. The facets are the opposite and are meant to combine: they are
+// adjectives rather than places. See db.TimelineFilter.
 func timelineFilter(w http.ResponseWriter, r *http.Request) (db.TimelineFilter, bool) {
+	query := r.URL.Query()
+
+	sort, err := db.ParseSort(query.Get("sort"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "sort must be newest, oldest, longest or shortest")
+		return db.TimelineFilter{}, false
+	}
+	kind, ok := mediaKind(w, query.Get("kind"))
+	if !ok {
+		return db.TimelineFilter{}, false
+	}
+
 	filter := db.TimelineFilter{
-		AlbumID:  r.URL.Query().Get("album"),
-		Person:   r.URL.Query().Get("person"),
-		Category: r.URL.Query().Get("category"),
+		AlbumID:  query.Get("album"),
+		Person:   query.Get("person"),
+		Category: query.Get("category"),
 		// Not counted below, because it is not a collection. It replaces the
 		// rule that says what the timeline is over rather than narrowing it, so
 		// asking for the trash *and* an album is a coherent question — "what of
 		// this album have I deleted" — even though nothing asks it yet.
-		Trash: truthy(r.URL.Query().Get("trash")),
+		Trash: truthy(query.Get("trash")),
+
+		Sort:      sort,
+		Kind:      kind,
+		Favorites: truthy(query.Get("favorites")),
+		Unalbumed: truthy(query.Get("unalbumed")),
 	}
 	if named(filter) > 1 {
 		writeError(w, http.StatusBadRequest, "name at most one of album, person, category")
 		return db.TimelineFilter{}, false
 	}
 	return filter, true
+}
+
+// mediaKind reads the media-kind facet, which is empty for both kinds.
+//
+// Refused rather than ignored when it is neither, for the reason an unknown
+// category is: a filter that quietly widens to the whole library is a bug that
+// looks like it works.
+func mediaKind(w http.ResponseWriter, kind string) (string, bool) {
+	switch kind {
+	case "", db.MediaImage, db.MediaVideo:
+		return kind, true
+	}
+	writeError(w, http.StatusBadRequest, "kind must be image or video")
+	return "", false
 }
 
 // writeFilterError answers for the two queries that share a filter. Both can
@@ -185,6 +218,8 @@ func (s *Server) writeFilterError(w http.ResponseWriter, err error, what string)
 	switch {
 	case errors.Is(err, db.ErrUnknownCategory):
 		writeError(w, http.StatusBadRequest, "unknown category")
+	case errors.Is(err, db.ErrUnknownKind):
+		writeError(w, http.StatusBadRequest, "kind must be image or video")
 	case isBadUUID(err):
 		writeError(w, http.StatusBadRequest, "malformed album id")
 	default:

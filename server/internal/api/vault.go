@@ -356,10 +356,18 @@ type vaultRestoreRequest struct {
 	// resolved against the same index that drew it.
 	Ranges []db.Range `json:"ranges,omitempty"`
 	Bucket string     `json:"bucket,omitempty"`
+	// Filter is the whole description of the timeline those positions were
+	// counted in: which collection, narrowed how, in what order. All of it
+	// matters — position 2 of a grid sorted oldest-first, or of one showing
+	// only videos, is a different photograph from position 2 of the bucket.
 	Filter struct {
-		Album    string `json:"album,omitempty"`
-		Person   string `json:"person,omitempty"`
-		Category string `json:"category,omitempty"`
+		Album     string `json:"album,omitempty"`
+		Person    string `json:"person,omitempty"`
+		Category  string `json:"category,omitempty"`
+		Sort      string `json:"sort,omitempty"`
+		Kind      string `json:"kind,omitempty"`
+		Favorites bool   `json:"favorites,omitempty"`
+		Unalbumed bool   `json:"unalbumed,omitempty"`
 	} `json:"filter"`
 }
 
@@ -475,9 +483,18 @@ func (s *Server) resolveRestore(w http.ResponseWriter, r *http.Request, req vaul
 		if !ok {
 			return nil, nil, nil, false
 		}
-		items := index.Select(vault.Filter{
+		// A sort this does not recognise is the default one, exactly as
+		// vaultFilter treats it: a restore that has already been authorised
+		// should not fail on the spelling of an ordering.
+		sort, err := db.ParseSort(req.Filter.Sort)
+		if err != nil {
+			sort = db.SortNewest
+		}
+		items := index.Select(narrowing(db.TimelineFilter{
 			AlbumID: req.Filter.Album, Person: req.Filter.Person, Category: req.Filter.Category,
-		})
+			Sort: sort, Kind: req.Filter.Kind, Favorites: req.Filter.Favorites,
+			Unalbumed: req.Filter.Unalbumed,
+		}))
 		for _, run := range req.Ranges {
 			for i := max(run.Start, 0); i < run.End && i < len(items); i++ {
 				ids = append(ids, items[i].ID())
@@ -621,14 +638,54 @@ func (s *Server) handleVaultCollections(w http.ResponseWriter, r *http.Request) 
 	}{Collections: collections, Total: len(index.Items)})
 }
 
-// vaultFilter reads the collection a vault request is narrowed to, in the same
-// query parameters the library's timeline uses.
+// vaultFilter reads the collection a vault request is narrowed to, the facets
+// it narrows by and the order it wants, in the same query parameters the
+// library's timeline uses.
+//
+// An unreadable sort or kind falls back to the default rather than answering
+// 400, which is the opposite of what the library's timeline does with the same
+// parameter and is the right call here for one reason: this filter is read by
+// three handlers that have already opened a vault, and refusing the request at
+// that point would spend a password on an error message. The gallery is the
+// only client and it does not send either of these wrong.
 func vaultFilter(r *http.Request) vault.Filter {
 	q := r.URL.Query()
+	sort, err := db.ParseSort(q.Get("sort"))
+	if err != nil {
+		sort = db.SortNewest
+	}
+	kind := q.Get("kind")
+	if kind != db.MediaImage && kind != db.MediaVideo {
+		kind = ""
+	}
 	return vault.Filter{
-		AlbumID:  q.Get("album"),
-		Person:   q.Get("person"),
-		Category: q.Get("category"),
+		AlbumID:   q.Get("album"),
+		Person:    q.Get("person"),
+		Category:  q.Get("category"),
+		Sort:      sort,
+		Kind:      kind,
+		Favorites: truthy(q.Get("favorites")),
+		Unalbumed: truthy(q.Get("unalbumed")),
+	}
+}
+
+// narrowing is the library's description of a timeline, read as the vault's.
+//
+// The two structs say the same thing about the same grid and are separate only
+// because one of them is turned into SQL and the other into a walk over a slice
+// in memory. This is the one place that translates, so a facet added to the
+// timeline cannot be silently dropped on the way to a vault selection —
+// resolving a range against a differently-ordered index would restore the wrong
+// photographs.
+func narrowing(f db.TimelineFilter) vault.Filter {
+	return vault.Filter{
+		AlbumID:   f.AlbumID,
+		Person:    f.Person,
+		Category:  f.Category,
+		Sort:      f.Sort,
+		Kind:      f.Kind,
+		Favorites: f.Favorites,
+		Unalbumed: f.Unalbumed,
 	}
 }
 

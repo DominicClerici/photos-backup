@@ -71,6 +71,11 @@ const (
 	// something else. Archived because the export offered it and the thing it
 	// is a thumbnail of is usually not in the export at all.
 	SubtypeThumbnail = "snapchat:thumbnail"
+	// SubtypeJoined marks a recording this archive reassembled from the
+	// ten-second pieces Snapchat exported it as. Nothing filters on it today;
+	// it is here so that "which of my videos are not the file Snapchat gave
+	// me" is a question the library can answer.
+	SubtypeJoined = "snapchat:joined"
 	// SubtypeDiscover marks publisher content — Daily Mail, VICE, Cosmopolitan
 	// — that reached the account through Discover rather than through a person.
 	// It is nobody's photograph and it is the first thing anyone trimming this
@@ -384,6 +389,44 @@ type Sidecar struct {
 	// gallery filters on. Written into the sidecar as well as into the column
 	// so that a reindex from the manifest reaches the same conclusion.
 	Subtypes []string `json:"subtypes,omitempty"`
+
+	// Joined is set on the one kind of file in this archive that Snapchat never
+	// shipped: a recording it cut into ten-second pieces, put back together
+	// here. See internal/merge.
+	//
+	// It is in the sidecar rather than in a column because of what it is for.
+	// The pieces go to the trash when the join is archived and the trash empties
+	// after a year, so this document eventually becomes the only account of
+	// where a minute of video came from — and "which six files, and was it
+	// copied or re-encoded" is exactly what somebody will want from it.
+	Joined *Joined `json:"joined,omitempty"`
+}
+
+// Joined is the record of a recording reassembled from its pieces.
+type Joined struct {
+	// Method is "stream-copy" or "re-encode", and Reason says why when it is the
+	// second. A stream copy holds the camera's own frames; a re-encode is a
+	// generation further from them, and that is a fact about an archived
+	// original rather than a detail of how it was made.
+	Method string `json:"method"`
+	Reason string `json:"reason,omitempty"`
+
+	DurationSeconds float64   `json:"durationSeconds"`
+	JoinedAt        time.Time `json:"joinedAt"`
+
+	// Parts are the pieces, in the order they were joined. By digest as well as
+	// by name, because the digest is what finds the blob again — and because if
+	// somebody ever wants to take this apart, the parts are still exactly those
+	// bytes.
+	Parts []JoinedPart `json:"parts"`
+}
+
+// JoinedPart is one piece of a joined recording.
+type JoinedPart struct {
+	File            string    `json:"file"`
+	SHA256          string    `json:"sha256"`
+	CapturedAt      time.Time `json:"capturedAt"`
+	DurationSeconds float64   `json:"durationSeconds"`
 }
 
 // Metadata is a sidecar reduced to the facts the archive stores.

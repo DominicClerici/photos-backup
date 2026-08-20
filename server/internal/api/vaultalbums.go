@@ -155,9 +155,7 @@ func (s *Server) vaultSelection(w http.ResponseWriter, r *http.Request, bucket s
 	if !ok {
 		return nil, false
 	}
-	items := index.Select(vault.Filter{
-		AlbumID: sel.Filter.AlbumID, Person: sel.Filter.Person, Category: sel.Filter.Category,
-	})
+	items := index.Select(narrowing(sel.Filter))
 	for _, run := range sel.Ranges {
 		for i := max(run.Start, 0); i < run.End && i < len(items); i++ {
 			ids = append(ids, items[i].ID())

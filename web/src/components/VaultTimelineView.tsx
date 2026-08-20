@@ -13,6 +13,7 @@ import {
 } from "@/lib/api";
 import { askToUnlock, BUCKET_LABEL, useVault } from "@/hooks/useVault";
 import { useTimeline } from "@/hooks/useTimeline";
+import { useView } from "@/hooks/useView";
 import { useTrashActions } from "@/hooks/useTrash";
 import { useViewer } from "@/hooks/useViewer";
 import { categoryLabel } from "./CategoryList";
@@ -91,9 +92,10 @@ function Unlocked({
   heading: Heading;
   filter: TimelineFilter;
 }) {
-  const timeline = useTimeline(filter);
+  const { view } = useView();
+  const timeline = useTimeline(filter, view);
   const { index, open, close, navigate } = useViewer(timeline);
-  const actions = useTrashActions(filter, timeline.retry, heading.album);
+  const actions = useTrashActions(filter, timeline.retry, heading.album, view);
 
   return (
     <div className="flex h-dvh flex-col">

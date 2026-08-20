@@ -86,7 +86,7 @@ step the phone's mDNS scan finds the server and every connection to it times out
 which looks exactly like photod not running.
 
 ```sh
-sudo firewall-cmd --permanent --add-port=8787/tcp     # photod, HTTPS: uploads, and the gallery
+sudo firewall-cmd --permanent --add-port=8787/tcp     # photod, HTTPS: pairing and uploads
 sudo firewall-cmd --permanent --add-port=5353/udp     # mDNS, for Avahi to answer
 sudo firewall-cmd --reload
 ```
@@ -97,66 +97,11 @@ asks for nothing, so opening it would put the whole archive on the LAN
 unauthenticated, which is a decision, not a step (see "What is still open"
 below).
 
-One port, not two. The gallery is served *through* 8787 when it is served to the
-network at all — see below — so there is nothing to open for it.
-
 `photobackup ca --serve` needs one port open for as long as the transfer takes:
 
 ```sh
 sudo firewall-cmd --add-port=8789/tcp                 # no --permanent: gone on reload
 ```
-
-## Serving the gallery to the house
-
-Optional, and off until it is configured. Without this, the gallery is a browser
-on this machine talking to loopback, and every other device in the house has
-nothing.
-
-Two units. `photoweb` runs Next, bound to `127.0.0.1:3000` and reachable by
-nothing else; `photod` serves it on to the network from the port it already
-has, behind one shared password. The archive is never on an unauthenticated
-socket the network can reach, and the browser gets the app, the JSON and the
-thumbnails from a single origin — which is what lets one cookie authenticate an
-`<img>`.
-
-```sh
-sudo useradd --system --home-dir /opt/photobackup --shell /usr/sbin/nologin photoweb
-
-# Build with neither PHOTOD_URL nor NEXT_PUBLIC_MEDIA_BASE set: both are frozen
-# into the build, and both defaults are the ones this deployment wants.
-(cd web && pnpm install --prod=false && pnpm build)
-sudo install -d -o photoweb -g photoweb /opt/photobackup
-sudo rsync -a --delete --chown=photoweb:photoweb web/ /opt/photobackup/web/
-
-sudoedit /etc/photod/photod.env      # GALLERY_PASSWORD, and WEB_URL=http://127.0.0.1:3000
-sudo cp deploy/photoweb.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now photoweb
-sudo systemctl restart photod
-```
-
-Then, on the laptop or the iPad: install the CA once, exactly as the phone did
-(`photobackup ca --serve`), and open `https://<hostname>.local:8787`. The first
-thing it draws is the password prompt.
-
-photod **refuses to start** if `WEB_URL` is set and `GALLERY_PASSWORD` is empty.
-The failure that guards against is the quiet one — a gallery that works
-perfectly, for everyone on the Wi-Fi.
-
-Two things worth not getting wrong:
-
-- **`-H 127.0.0.1` in photoweb.service.** That server proxies `/api/*` straight
-  to 8788, which has no authentication at all. Binding it to `0.0.0.0` puts an
-  open door beside the locked one, and nothing about it looks broken.
-- **Leave `NEXT_PUBLIC_MEDIA_BASE` unset.** Pointing thumbnails at photod
-  directly was worth doing when the alternative was streaming them through Node;
-  under this arrangement they are already coming from photod, and setting it to
-  an address the cookie does not cover 401s every tile in the grid.
-
-The password is a house key: one for the household, rate-limited per address,
-exchanged for a cookie that photod keeps in memory and forgets when it restarts.
-It is not the vault password and cannot be — Archive and Hidden are encrypted
-against this server, and this one is a lock the server has to be able to check.
 
 ## Running the CLI
 
@@ -350,17 +295,17 @@ only for a scripted rebuild.
 ## What is still open
 
 The read endpoints are authenticated on 8787 and open on 8788. A phone reads the
-gallery with the same device token it uploads with, and a browser reads it with a
-session cookie it got by typing the gallery password; the Next app on this
-machine reads without either, over loopback, which is what keeps a development
-browser from having to trust a private CA to draw a thumbnail.
+gallery with the same device token it uploads with; the Next app on this machine
+reads without a token, over loopback, which is what keeps a development browser
+from having to trust a private CA to draw a thumbnail.
 
-So 8788 is now the only unauthenticated way into the archive, and everything that
+So 8788 is the only unauthenticated way into the archive, and everything that
 protects it is the fact that it is bound to `127.0.0.1` and left out of the
 firewall. Widening `PLAINTEXT_ADDR` puts the whole archive on the LAN for anyone
 who asks. It still cannot leak a credential — the plaintext listener serves
-neither pairing nor any authenticated route — but it is no longer a gap shared
-with the port the phone dials.
+neither pairing nor any authenticated route — but there is no browser-facing
+authentication in front of it either: reaching the gallery from another machine
+on the LAN is not something this deployment supports today.
 
 `/health` is unauthenticated on both, on purpose: the app pings a remembered
 address to see whether it still answers, which it has to be able to do before it

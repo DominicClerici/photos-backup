@@ -528,6 +528,101 @@ func (t *Tool) LivePreview(ctx context.Context, src, dst string, info Info) erro
 	return t.encode(ctx, args, src, []string{dst}, "live preview")
 }
 
+// SampleFrames walks a clip and returns count square grey planes taken at even
+// fractions of its running time — the video's answer to derive.Sample, in
+// exactly the format internal/imagehash reads, so a frame is hashed by the same
+// code that hashes a photograph.
+//
+// Sampled by *time* rather than by frame number, which is the whole reason this
+// survives a re-encode. A clip at 15fps and the same clip at 30fps have nothing
+// in common at frame index seven and the same picture 35% of the way through,
+// so the fps filter — which resamples a stream to a fixed rate by choosing the
+// frame nearest each instant — puts the two sequences side by side. Handing
+// ffmpeg `select=eq(n\,7)` instead would compare the seventh frame of one
+// recording with a moment half a second earlier in the other, and no threshold
+// makes that work.
+//
+// One ffmpeg for the whole clip rather than one seek per frame. Twenty accurate
+// seeks into a 60-second video is twenty decodes from the preceding keyframe;
+// this is one pass, and across seven thousand videos that is the difference
+// between an afternoon and a coffee.
+//
+// The caption layer is deliberately *not* burned in here, where derive.Sample
+// does burn it in for a still. The asymmetry is real and it is cheap: for a
+// still the composite already exists in the pipeline and costs one more argv
+// word, while for a video it is a filter graph and a decode of a second input.
+// What it would buy is nothing — two copies of one memory are sampled the same
+// way with or without the layer, so they match either way. What it costs is the
+// unlikely case of two different captions over the same footage, which arrives
+// at a review page for somebody to look at rather than anywhere destructive.
+func (t *Tool) SampleFrames(ctx context.Context, src string, count, edge int, info Info) ([][]byte, error) {
+	switch {
+	case count <= 0:
+		return nil, fmt.Errorf("sample %s: %d is not a number of frames", src, count)
+	case edge <= 0:
+		return nil, fmt.Errorf("sample %s: %d is not an edge length", src, edge)
+	case info.DurationSeconds <= 0:
+		// Refused rather than guessed at. Without a duration there is no way to
+		// space the samples, and a fallback that sampled the first count frames
+		// would produce a signature that looks like every other signature taken
+		// from the opening second of a video.
+		return nil, fmt.Errorf("sample %s: the clip has no duration to sample across", src)
+	}
+
+	if err := t.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer t.release()
+
+	args := []string{"-nostdin", "-v", "error"}
+	args = append(args, t.decodeArgs()...)
+	args = append(args,
+		"-i", src,
+		// Squashed to a square, matching derive.Sample: the two feed the same
+		// hash and have to distort a picture the same way.
+		"-vf", fmt.Sprintf("fps=%d/%f,scale=%d:%d:flags=lanczos,format=gray",
+			count, info.DurationSeconds, edge, edge),
+		"-frames:v", fmt.Sprint(count),
+		"-f", "rawvideo",
+		"-",
+	)
+
+	cmd := exec.CommandContext(ctx, t.ffmpeg(), args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("sample %s: %w: %s", src, err, strings.TrimSpace(stderr.String()))
+	}
+
+	// Short is allowed and long is not. ffmpeg can hand back one frame fewer
+	// than asked for when the last sampling instant lands past the final frame,
+	// and that costs nothing: the frames it did return are at the same instants
+	// they would have been at anyway, so two clips still line up index for
+	// index. Anything else means the filter chain did not do what this thinks
+	// it did, and a signature built on that is worse than none.
+	raw := stdout.Bytes()
+	plane := edge * edge
+	got := len(raw) / plane
+	switch {
+	case len(raw)%plane != 0:
+		return nil, fmt.Errorf("sample %s: %d bytes is not a whole number of %dx%d planes",
+			src, len(raw), edge, edge)
+	case got == 0:
+		return nil, fmt.Errorf("sample %s: ffmpeg wrote no frames (stderr: %s)",
+			src, orNone(strings.TrimSpace(stderr.String())))
+	case got > count:
+		return nil, fmt.Errorf("sample %s: asked for %d frames and got %d", src, count, got)
+	}
+
+	frames := make([][]byte, got)
+	for i := range frames {
+		frames[i] = raw[i*plane : (i+1)*plane]
+	}
+	return frames, nil
+}
+
 // encode runs one ffmpeg and insists that something playable came out of every
 // output it was given, for the same reason Transcode does: an ffmpeg that exits
 // 0 having encoded nothing is a failure disguised as a success, and it surfaces

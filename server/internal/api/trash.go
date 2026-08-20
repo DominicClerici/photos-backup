@@ -29,6 +29,11 @@ const maxSelectionIDs = 1000
 // The filter travels with the ranges because a position means nothing without
 // it: index 2 is a different photograph in an album than in the library, and the
 // grid that made the selection was drawn from the album's day table.
+// The sort and the facets travel for the same reason and are the same kind of
+// mistake to leave out: position 2 of a grid sorted oldest-first, or of one
+// showing only videos, is a different photograph from position 2 of the
+// library. A range is only ever meaningful together with the whole description
+// of the timeline it was counted in.
 type selectionRequest struct {
 	IDs    []string   `json:"ids,omitempty"`
 	Ranges []db.Range `json:"ranges,omitempty"`
@@ -36,6 +41,11 @@ type selectionRequest struct {
 	Album    string `json:"album,omitempty"`
 	Person   string `json:"person,omitempty"`
 	Category string `json:"category,omitempty"`
+
+	Sort      string `json:"sort,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	Favorites bool   `json:"favorites,omitempty"`
+	Unalbumed bool   `json:"unalbumed,omitempty"`
 }
 
 // readSelection reads the body, or answers the client and reports that it did.
@@ -216,6 +226,8 @@ func (s *Server) writeSelectionError(w http.ResponseWriter, err error, what stri
 		writeError(w, http.StatusBadRequest, "the selection names no items")
 	case errors.Is(err, db.ErrUnknownCategory):
 		writeError(w, http.StatusBadRequest, "unknown category")
+	case errors.Is(err, db.ErrUnknownKind):
+		writeError(w, http.StatusBadRequest, "kind must be image or video")
 	case isBadUUID(err):
 		writeError(w, http.StatusBadRequest, "malformed id")
 	default:
@@ -243,7 +255,20 @@ func decodeSelection(w http.ResponseWriter, body []byte) (db.Selection, bool) {
 		return db.Selection{}, false
 	}
 
-	filter := db.TimelineFilter{AlbumID: req.Album, Person: req.Person, Category: req.Category}
+	sort, err := db.ParseSort(req.Sort)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "sort must be newest, oldest, longest or shortest")
+		return db.Selection{}, false
+	}
+	kind, ok := mediaKind(w, req.Kind)
+	if !ok {
+		return db.Selection{}, false
+	}
+
+	filter := db.TimelineFilter{
+		AlbumID: req.Album, Person: req.Person, Category: req.Category,
+		Sort: sort, Kind: kind, Favorites: req.Favorites, Unalbumed: req.Unalbumed,
+	}
 	if named(filter) > 1 {
 		writeError(w, http.StatusBadRequest, "name at most one of album, person, category")
 		return db.Selection{}, false

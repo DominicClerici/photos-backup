@@ -220,6 +220,9 @@ export function dayLabelOf(dayKey: string, now: Date = new Date()): string {
  * filed under their own local day, so a photo taken either side of a timezone
  * hop can put a date on both sides of another one. The table describes the
  * timeline's shape rather than tidying it.
+ *
+ * A run with no date is a run with no heading, and is left unlabelled rather
+ * than given a date it does not have. See headless.
  */
 export function daysFrom(runs: DayRun[]): Day[] {
   const days: Day[] = new Array(runs.length);
@@ -228,13 +231,27 @@ export function daysFrom(runs: DayRun[]): Day[] {
     days[i] = {
       id: `${runs[i].day}#${start}`,
       key: runs[i].day,
-      label: dayLabelOf(runs[i].day),
+      label: runs[i].day ? dayLabelOf(runs[i].day) : "",
       start,
       count: runs[i].count,
     };
     start += runs[i].count;
   }
   return days;
+}
+
+/**
+ * Whether this timeline has no days in it: one run, no date, every tile under
+ * it.
+ *
+ * Which is what an order other than newest-or-oldest produces. The dates are
+ * still in there — every photograph has one — but they fall in an order that
+ * has nothing to do with the calendar, so a heading per tile would be a ruin of
+ * that shape rather than a description of it. The grid answers by drawing no
+ * headings and reserving no room for them, which is a flat wall of tiles.
+ */
+export function headless(days: Day[]): boolean {
+  return days.length > 0 && days[0].key === "";
 }
 
 /** How many items the day model accounts for. */

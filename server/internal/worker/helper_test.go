@@ -21,6 +21,7 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 	"github.com/dominicclerici/photos-backup/server/internal/exifdata"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
+	"github.com/dominicclerici/photos-backup/server/internal/manifest"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
 )
 
@@ -57,7 +58,7 @@ func newHarness(t *testing.T) *harness {
 	if err := store.Migrate(); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	if _, err := store.Pool().Exec(ctx, "truncate table assets, device_assets, jobs cascade"); err != nil {
+	if _, err := store.Pool().Exec(ctx, "truncate table assets, device_assets, jobs, merge_groups cascade"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -70,7 +71,12 @@ func newHarness(t *testing.T) *harness {
 		Images:      derive.New(),
 		Video:       video.New(),
 		Exif:        exifdata.New(),
-		Log:         slog.New(slog.DiscardHandler),
+		// The merge job archives an original, and refuses to without somewhere
+		// to record it. Every harness gets one so that "does the log get
+		// written" is answered by the test that cares rather than by its
+		// absence everywhere.
+		Manifest: manifest.New(filepath.Join(root, "photos", "manifest.jsonl")),
+		Log:      slog.New(slog.DiscardHandler),
 	})
 	// The fixtures are tiny; slow encoder settings would only make the suite drag.
 	runner.Video.CRF = 30
