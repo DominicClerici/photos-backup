@@ -149,7 +149,24 @@ func runMLStatus(ctx context.Context, args []string) (int, error) {
 
 	fmt.Printf("\n%d tag claims over a vocabulary of %d words\n", words.Tags, words.Vocabulary)
 	if words.Vocabulary > 0 {
-		fmt.Println("(the vocabulary is free-form on purpose; tags.canonical_id is the cleanup)")
+		tags, err := a.deps.Store.TagCleanupCounts(ctx)
+		if err != nil {
+			return fail(err)
+		}
+		fmt.Printf("  %-12s %6d kept, %d struck out, %d merged away\n",
+			"cleanup", tags.Kept, tags.Junk, tags.Folded)
+		switch {
+		case tags.Untriaged > 0:
+			fmt.Printf("  %-12s %6d words nothing has judged yet\n", "", tags.Untriaged)
+		case tags.Unreviewed > 0:
+			fmt.Printf("  %-12s %6d verdicts nobody has read yet\n", "", tags.Unreviewed)
+		case tags.Unembedded > 0:
+			fmt.Printf("  %-12s %6d words with no vector to cluster by\n", "", tags.Unembedded)
+		}
+		// The whole of it is a screen rather than a command, because every step
+		// is a judgement about a word and the evidence is a photograph. This is
+		// the reading; /tags is the doing.
+		fmt.Println("  (the vocabulary is free-form on purpose; the cleanup is the Tags card on the status page)")
 	}
 
 	counts, err := a.deps.Queue.Counts(ctx)

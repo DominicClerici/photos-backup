@@ -33,9 +33,10 @@ POST /embed           images[] or texts[] → unit vectors[], 1152-d
 POST /describe        images[] → [{caption, tags[]}]
 POST /ocr             images[] → [{text, lines[]}]
 POST /parse           query → filter JSON, as a suggestion
+POST /triage          words[] → [{word, junk, score}]
 ```
 
-All five of ML_IMAGES.md §6. Every one of them borrows its model through the
+The five of ML_IMAGES.md §6, and one more the tag cleanup needed. Every one of them borrows its model through the
 same `Residency`, so what separates the encoder that is always loaded from the
 captioner that is not is one argument at registration — and no handler knows
 which it got.
@@ -149,6 +150,30 @@ curl -s localhost:8789/parse -H 'content-type: application/json' \
 {"people":["addy"],"place":"mexico","after":"","before":"","visual":""}
 ```
 
+And whether the words it wrote were worth writing:
+
+```sh
+curl -s localhost:8789/triage -H 'content-type: application/json' \
+  -d '{"words":["login","dog","high quality","snow"]}' | python3 -m json.tool
+```
+
+```json
+{
+  "model": "qwen3-vl-4b-instruct",
+  "results": [
+    {"word": "login", "junk": true, "score": 1.0},
+    {"word": "dog", "junk": false, "score": 0.0},
+    {"word": "high quality", "junk": true, "score": 1.0},
+    {"word": "snow", "junk": false, "score": 0.0}
+  ]
+}
+```
+
+The scores saturate because this is a classifier rather than a generation — see
+below — and they are answered in the order the words were sent, which `photod`
+relies on: it matches the verdicts back by position, having never sent this
+service a tag id it could match them by.
+
 ## Settings
 
 All optional; every one falls back to its default rather than refusing to start.
@@ -244,6 +269,38 @@ a model produced* runs right through `captioner.py`, and a captioner inventing
 It returns JSON, and a malformed answer becomes a caption with no tags rather
 than a failed job — the sentence is the more useful half, and a 4xx here would
 burn an attempt against a photograph that is not the problem.
+
+#### And the same weights, asked about their own words
+
+`POST /triage` is ML_IMAGES.md §9's cleanup, one stage before the merge: given
+tag names, which of them are worth keeping. It borrows `CAPTION` rather than
+registering a model of its own, and that is the point — no second checkpoint, no
+second nine gigabytes competing for a card that has to leave room for NVENC, and
+the honest framing besides, since these are the captioner's own words coming
+back to it.
+
+**Nothing is generated.** The obvious implementation asks for the junk words as a
+JSON list and it does not work: measured against the archive's real vocabulary, a
+0.6B invented words that had never been in the list and repeated one of them four
+hundred times, and even a well-behaved model has to be matched back to its input
+by string comparison — for a task whose entire output is one bit per word. So
+`judge()` runs one forward pass per word and reads the answer off the logits of
+`KEEP` and `JUNK`. It cannot hallucinate a word, cannot skip one, cannot reorder
+them, and it is prefill only: about 50ms a word against 1.5s for a generated
+answer, which is the difference between a two-minute pass over a vocabulary and a
+forty-minute one.
+
+`logits_to_keep=1` is load-bearing rather than tidy. Without it the head runs over
+every position of every prompt — half a gigabyte of logits per batch of eight, on
+a card already holding nine gigabytes of these weights, all of it thrown away
+except one row. It OOMs.
+
+What comes back is P(junk) rather than a bit, and the extra is what the review
+screen sorts by: a confident wrong verdict is the one worth catching. On this
+archive the pass is right about "casual", "peaceful", "photograph", "login",
+"result" and "text", and calls "screenshot" junk — which is arguable, and is
+exactly why `photod` writes these only where nobody has answered and a person
+signs them off. See server/README.md § Cleaning up the vocabulary.
 
 ### The text recogniser
 

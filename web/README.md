@@ -439,3 +439,51 @@ enough to notice it rotting.
 What differs is only what a selection can do: Restore, and a Delete forever that
 is armed like every other destructive control and has no undo behind it. Items
 sit here for 365 days; photod purges them on its own.
+
+## Cleaning up what the captioner wrote
+
+`/tags`, reached from a card on the status page. Four lists, and they are two
+pairs rather than four things: **Words** and **Junk** are the triage, and
+**Suggestions** and **Merged** are the merge. They are in that order because the
+first changes the answer to the second — clustering three thousand words when a
+third of them are interface text off a screenshot is more work and a worse
+result. See server/README.md § Cleaning up the vocabulary for why.
+
+The two review lists are a **wall of chips**, in use order, and the one thing you
+can do to any of them is move it to the other list. Rows would fit forty on a
+screen and would suggest each word deserves a decision; three thousand words read
+at a glance is the actual job. A chip's outline is the whole of ML_IMAGES.md
+§11's seam made visible: **solid means a person decided it, dashed means it is
+the captioner's opinion and nobody has confirmed it**. Without that, the two
+lists read as facts about the archive from the moment a pass finishes, which is
+the confident-and-invisible failure that paragraph is about.
+
+Hovering a chip shows what the word is actually on. That is not a nicety —
+"casual" reads as a plausible tag until you see four unrelated photographs under
+it, and "screenshot" reads as junk until you see it is on a hundred and seventy.
+On the suggestion cards the photographs are inline instead, because that is the
+card where somebody is deciding, and three thumbnails per word are what separate
+"doggo means dog" from "doggo is what this model calls a wolf".
+
+**The passes have a progress bar because they are a loop, not a request.** The
+server judges 120 words or embeds 512 per call and says how many are left; the
+page calls again until nothing is. So there is a real number to show, and showing
+it is what makes two minutes legible rather than a frozen button. Navigating away
+stops the loop and loses nothing.
+
+A suggestion card offers **two ways of disagreeing**, and they are different. A
+member can be wrong while the group is right — "mountain, mountains, and no, not
+mountaineering" — which is an untick, not a rejection. Both are sent with the
+merge, because a disagreement nobody wrote down is proposed again on the next
+run. The head is preselected as the most-used word, for the reason the duplicate
+review preselects its keeper, and it is a radio rather than a fact: that rule is
+right most of the time and wrong in the interesting cases.
+
+The similarity slider stops at 0.85 rather than 0. SigLIP-2's text tower puts the
+median pair of unrelated tags at 0.73, so everything below that is not a looser
+setting, it is a broken one — 0.80 proposes "man ← woman". It is a live control
+at all because the vectors are stored: dragging it is one query, not a
+re-embedding.
+
+Nothing on the page destroys anything, and every button has an opposite. `junk`
+and `canonical_id` are one column each, read wherever a search resolves a word.

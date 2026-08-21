@@ -811,6 +811,135 @@ Nothing is read for an asset in the vault. The write paths all refuse a sealed
 asset so the tables are empty for those rows anyway — the guard is repeated
 because "the tables happen to be empty" is a fact about the past.
 
+### Cleaning up the vocabulary
+
+```
+GET  /v1/tags                    how much there is, and which stage it is in
+GET  /v1/tags/words?junk=        one of the two review lists
+GET  /v1/tags/proposals?similarity=   what the words cluster into
+GET  /v1/tags/merged             what has been folded, and the undo
+POST /v1/tags/triage             judge the next slice of words
+POST /v1/tags/embed              compare the next slice of words
+POST /v1/tags/judge              move words between the two lists
+POST /v1/tags/approve            sign the verdicts off, and reindex
+POST /v1/tags/merge              fold a group into one word
+POST /v1/tags/dismiss            these are not one word
+POST /v1/tags/unmerge            take a merge apart
+```
+
+ML_IMAGES.md §2 bought an open vocabulary by promising a cleanup later, and §11
+called that "a bet on cleanup happening". This is the cleanup, and it is **two
+passes** rather than the one §9 sketched.
+
+§9 describes clustering the tag names and proposing merges. Running exactly that
+against the real vocabulary showed why it has to come second. A vision model
+looking at a screenshot writes "login", "result", "true", "screen" and
+"details"; looking at people it writes "casual", "peaceful" and "friendly"; and
+looking at anything at all it sometimes writes "photograph". None of those is a
+word anybody will type, none of them merges into anything, and every one of them
+sits in the **weight-A half** of every tsvector it is attached to — the same
+weight as the caption. They also sit *between* the real synonyms in the encoder's
+space and take up their neighbour slots. Clustering three thousand words when
+two thousand of them are the question is more work and a worse answer.
+
+So: **triage**, then **merge**.
+
+```
+words → captioner judges each one → two review lists → approve
+      → what survived is embedded → clustered → merges proposed → accepted
+```
+
+**The captioner marks its own homework.** `POST /triage` on photo-ml borrows the
+same weights `/describe` does — no second checkpoint, no second entry in the
+residency table, no second nine gigabytes competing for the card. And the answer
+is not generated. Asking a model for "the junk words as a JSON list" fails in the
+way small models fail: measured against this archive's own vocabulary, a 0.6B
+invented words that were never in the list and repeated one of them four hundred
+times. So `judge()` runs one forward pass per word and reads the answer off the
+logits of the two tokens it was told to choose between. That is a classifier: it
+cannot hallucinate a word, cannot skip one, cannot reorder them, and costs
+prefill only — a couple of minutes over three thousand words instead of twenty.
+What comes back is P(junk), which is worth more than the bit it replaces: the
+review list is read in that order, because a confident wrong verdict is the one
+worth catching.
+
+**Both passes are bounded slices, and the page loops.** Neither is a job kind.
+They are typed by somebody who is about to sit and read the result, nothing in
+the archive is waiting on them, and they happen once per model generation — but
+they are also too long to hold a request open. So each call judges 120 words or
+embeds 512, answers with how many are left, and the browser calls again. The
+resume point is a column with an index on it, so closing the tab halfway costs
+the loop and nothing else. A pass that dies mid-slice keeps what it learned.
+
+**A model may fill in a blank; it may never overrule a person.** `PutTriage`
+writes only `where judged_at is null`. That is ML_IMAGES.md §11's seam — a name
+somebody confirmed against a word a model produced — as a where clause, and it
+is what makes re-running the triage safe on a vocabulary that has grown. The
+review screen draws it too: a verdict nobody has confirmed is a dashed chip.
+
+**Approving is a real claim, not a formality.** It stamps every unconfirmed
+verdict as this archive owner's own, so no later pass revisits it, and it
+rebuilds the whole search index in the same transaction.
+
+Which is the other half of what is going on here. §11 warns that "nothing
+rebuilds the tsvector by itself… a tag merge leaves every row already written out
+of date. `photobackup ml reindex` is the answer and it has to be *remembered*."
+Every write above discharges that obligation inside its own transaction:
+`db.refreshForTags` rebuilds the photographs carrying the words that changed, and
+the two bulk operations rebuild the library once at the end rather than most of
+it per chunk. Merging "mountain" into "mountains" on this archive rewrote 276
+rows and made 117 photographs findable under a word nothing had ever called
+them, with no command typed afterwards.
+
+**The clustering is a graph walk, and the threshold is a control.** Migration
+0019 stores a vector per tag name with an HNSW index over it. Measured on 3,000
+words: a brute-force self-join is 7.7 seconds and the same neighbours through the
+index are under one. That difference is the whole reason the review screen can
+offer a slider — the vectors are stored, so dragging it is one query rather than
+a re-embedding.
+
+The default is **0.93**, and it is high because it has to be. SigLIP-2's text
+tower puts the *median* pair of unrelated tags at 0.73 cosine, so a threshold
+that sounds generous is not: at 0.80 the clustering proposes "man ← woman" and
+"black ← white". At 0.93, against this archive:
+
+```
+mountains(149) ← mountain(118), mountain range(10), mountain peaks(1), mountainous(1)
+skiing(149)    ← ski(2), snowboarding(3), skier(34), skiers(62), skis(24)
+phone(102)     ← mobile(18), telephone(1), phones(2), smartphone(3)
+cityscape(63)  ← city(42), urban landscape(5), city skyline(25)
+drinks(57)     ← beverage(1), drink(8), drinking(10)
+```
+
+Grouping is **leader clustering** rather than the obvious union-find, and the
+reason is chaining: with "dog" near "puppy", "puppy" near "kitten" and "kitten"
+near "cat", single linkage produces one group containing a dog and a cat, every
+link individually defensible. Requiring every member to be near the *head* stops
+it. Words are taken most-used first and claimed the moment they are considered,
+which guarantees the direction of every merge — a word can only ever be folded
+into one used at least as much as itself, so the head is the word the archive
+actually speaks.
+
+**A disagreement has to be written down or it is not a disagreement.**
+`tag_merge_blocks` is the tag vocabulary's version of `db.BlockedPairs`: without
+it, rejecting a proposal accomplishes nothing, because the next run computes the
+same distances over the same vectors and proposes it again. It records pairs
+rather than groups, because what somebody disagrees with inside a proposal is
+usually one member — "mountain, mountains, and no, not mountaineering" — and
+blocking the group would also block the merges they had just agreed to.
+
+**A merge brings an earlier merge's children with it.** `canonical_id` is
+resolved exactly one hop everywhere it is read, so folding "puppy" into "dog"
+while leaving "doggo → puppy" alone would leave "doggo" resolving to a word that
+is no longer canonical: findable as neither. `MergeTags` repoints them, and
+refuses a head that is itself folded rather than following the chain.
+
+**Nothing here destroys a row.** `asset_tags` goes on recording exactly what the
+captioner wrote about each photograph. `junk` and `canonical_id` are one column
+each, read at every point of use — the tsvector recipe, the parser's vocabulary,
+the viewer's panel — so every button takes effect everywhere at once and every
+one of them has an opposite.
+
 ## Searching
 
 ```

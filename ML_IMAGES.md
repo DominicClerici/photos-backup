@@ -304,6 +304,7 @@ POST /embed     images[] → vectors[]           vision encoder, 1152-d   built
 POST /describe  images[] → [{caption, tags[]}] VLM, free-form tags      built
 POST /ocr       images[] → [{text, lines[]}]   dedicated text recognition  built
 POST /parse     query    → filter JSON         small instruct model     built
+POST /triage    words[]  → [{junk, score}]     the captioner, as a judge   built
 GET  /health             → which models are resident                    built
 ```
 
@@ -569,7 +570,8 @@ Each of steps 3, 5 and 6 ships something searchable on its own.
    through `parse=0`. §8 has what came out differently, and §11's paragraph
    about a parse that fails confidently is now answered by something somebody
    can click.
-9. The tag-merge UI, run once over the finished vocabulary.
+9. ~~The tag-merge UI, run once over the finished vocabulary.~~ **Done**, and
+   it is two passes rather than one. See below.
 
 ### The tag merge, step 9
 
@@ -581,6 +583,63 @@ already resident, so the merge UI embeds the **tag names**, clusters them, and
 proposes merges — "dog / puppy / doggo / a dog", accept — instead of presenting
 a scrollable list of four thousand words. Accepting writes `canonical_id`, which
 is one column and is reversible.
+
+*(Built, as migration `0019`, eleven endpoints and `/tags` — and the paragraph
+above describes the second half of it. There is a pass in front of it that this
+document did not anticipate, and it turned out to be the one that makes the
+merge worth doing.*
+
+***A third of a free-form vocabulary is not words.** Measured on 3,505 strings
+from 2,572 captioned photographs: a vision model looking at a screenshot writes
+"login", "result", "true", "screen" and "details"; looking at people it writes
+"casual", "peaceful" and "friendly"; looking at anything at all it occasionally
+writes "photograph". None of them will ever be typed into a search box, none of
+them merges into anything — and each one sits in the **weight-A half** of every
+tsvector it is attached to, the same weight as the caption. They also sit between
+the real synonyms in the encoder's space and eat their neighbour slots. So the
+first pass is a triage, the second is this one, and the order matters both ways.*
+
+***The captioner marks its own homework**, on the same weights `/describe`
+borrows — no second checkpoint and no second nine gigabytes on a card that has to
+leave room for NVENC. And nothing is generated: asking for "the junk words as a
+JSON list" fails the way small models fail, so `/triage` runs one forward pass per
+word and reads the answer off the logits of KEEP and JUNK. A classifier cannot
+invent a word that was not in the list, skip one, or reorder them, and prefill
+alone is 50ms a word against 1.5s for a generated answer. What comes back is
+P(junk), which is what the review list is sorted by, because a confident wrong
+verdict is the one worth catching.*
+
+***A model may fill in a blank and may never overrule a person.* `PutTriage`
+writes only `where judged_at is null`. §11's seam as a where clause, and it is
+what makes re-running the triage safe on a vocabulary that has grown from three
+thousand words to six.*
+
+***Two passes, no jobs.** Neither is a job kind, a pool or a reconcile: they are
+typed by somebody who is about to sit and read the result, nothing in the archive
+is waiting on them, and they happen once per model generation — but both are also
+too long for one request. So each call judges 120 words or embeds 512 and says
+how many are left, and the page loops. The resume point is an indexed column, so
+closing the tab costs the loop and nothing else.*
+
+***0.93, and the threshold is a control.* SigLIP-2's text tower puts the median
+pair of unrelated tags at 0.73 cosine, so the useful range is narrow and high:
+0.80 proposes "man ← woman" and "black ← white", 0.93 proposes "mountains ←
+mountain, mountain range, mountainous" and "skiing ← ski, skier, skiers, skis".
+It is a live slider rather than a constant because the right value moves with the
+vocabulary, and it is affordable because migration 0019 **stores** the tag
+vectors with an HNSW index over them: brute force over 3,000 words is 7.7
+seconds, and the same neighbours through the index are under one.*
+
+***Leader clustering, not union-find.* Single linkage chains — "dog" near
+"puppy", "puppy" near "kitten", "kitten" near "cat" is one group with a dog and a
+cat in it, every link defensible. Requiring every member to be near the head
+stops that, and taking heads most-used-first guarantees the direction of every
+merge: a word can only be folded into one used at least as much as itself, so the
+head is the word the archive actually speaks.*
+
+*One thing had to be built that this section does not mention, and it is the
+answer to §11's last paragraph rather than to this one: every write here rebuilds
+the tsvectors it invalidates, inside its own transaction. See below.)*
 
 ---
 
@@ -663,6 +722,15 @@ is mostly ranking a filter's leftovers. Which is visible now, and was not.)*
 clustering are what make that bet safe. If step 9 slips, search still works
 through the embeddings and FTS; the tag browser is what stays messy.
 
+*(Paid, and the bet was bigger than this paragraph knew. `canonical_id` covers
+the words that mean the same thing; it has nothing to say about the third of the
+vocabulary that does not mean anything — "true", "casual", "photograph" — which
+merges into nothing and weights every tsvector it touches as heavily as the
+caption does. `tags.junk` is the other column, added in 0019, and the two
+together are what the cleanup actually needed. Both are read at every point of
+use and neither destroys a row, so the bet is safe in the same way for the same
+reason.)*
+
 **Faces are deferred, but the seam matters now.** `asset_people` must not become
 entangled with `tags`. They are different kinds of claim: one is a name a person
 confirmed, the other is a word a model produced. When our own clustering does
@@ -687,3 +755,16 @@ changed recipe in `rebuild_asset_search` leaves every row already written out of
 date. `photobackup ml reindex` is the answer and it takes seconds, but it has to
 be *remembered*, which is the same shape of bet as the free-form tags above and
 is worth naming as one.
+
+*(No longer a bet for the half of it this paragraph was written about. Every
+write in step 9's cleanup rebuilds what it invalidates inside its own
+transaction: `db.refreshForTags` for one word or one merge, and a whole-library
+rebuild for the two bulk operations, which is once at the end rather than most of
+the library per chunk twenty-five times over. Migration 0019 changed the recipe
+and so it rebuilds the library on the way in, which is the third case named here.
+The measurement, on this archive: merging "mountain" into "mountains" rewrote 276
+rows and made 117 photographs findable under a word nothing had ever called them,
+with no command typed afterwards.*
+
+*A re-geocode is still a bet, and `photobackup ml reindex` is still the answer to
+it.)*
