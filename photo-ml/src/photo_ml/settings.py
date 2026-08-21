@@ -70,6 +70,18 @@ class Settings:
     # does not offer /describe is one whose describe jobs should stay queued.
     models: frozenset[str]
 
+    # Which captioner, by the name its rows carry. See captioner.CAPTIONERS for
+    # what the names are; an unknown one falls back to the default, loudly.
+    #
+    # The one setting here that has a counterpart on the other side of the
+    # socket: photod stores this string on every row it writes and reads
+    # captions back by it, so PHOTOD_CAPTION_MODEL has to be set to the same
+    # value in the same breath. They are deliberately two variables rather than
+    # one — the two processes are separately deployable and a bench runs a
+    # second photo-ml against the same photod — and photod compares them on
+    # every result it reads.
+    caption_model: str
+
     # Where transformers caches weights. Set explicitly so the systemd unit can
     # give the service one writable directory and no home directory at all.
     cache_dir: str | None
@@ -86,6 +98,7 @@ def from_env() -> Settings:
         describe_batch=_positive_int(os.environ.get("PHOTO_ML_DESCRIBE_BATCH"), 8),
         batch_window=_positive_float(os.environ.get("PHOTO_ML_BATCH_WINDOW_MS"), 30.0) / 1000,
         models=_models(os.environ.get("PHOTO_ML_MODELS")),
+        caption_model=os.environ.get("PHOTO_ML_CAPTION_MODEL", ""),
         cache_dir=os.environ.get("PHOTO_ML_CACHE_DIR") or None,
     )
 

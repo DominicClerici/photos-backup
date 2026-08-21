@@ -371,7 +371,7 @@ func (s *Server) servePreview(w http.ResponseWriter, r *http.Request, asset db.A
 	if over != nil {
 		variant = "preview-composite"
 	}
-	etag := etagFor(asset.SHA256, variant)
+	etag := etagFor(asset.SHA256, variant+previewRecipe)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", immutable)
 	if etagMatches(r.Header.Get("If-None-Match"), etag) {
@@ -388,7 +388,7 @@ func (s *Server) servePreview(w http.ResponseWriter, r *http.Request, asset db.A
 	// Buffered rather than streamed: a conversion that fails halfway must
 	// produce an honest status code, not a truncated image with a 200 on it.
 	var buf bytes.Buffer
-	if err := s.Converter.Preview(r.Context(), source, over, &buf); err != nil {
+	if err := s.Converter.Preview(r.Context(), source, over, longEdge(asset), &buf); err != nil {
 		if r.Context().Err() != nil {
 			return // client went away mid-conversion
 		}
@@ -399,6 +399,19 @@ func (s *Server) servePreview(w http.ResponseWriter, r *http.Request, asset db.A
 
 	w.Header().Set("Content-Type", "image/webp")
 	http.ServeContent(w, r, asset.SHA256+"."+variant+".webp", asset.UploadedAt, bytes.NewReader(buf.Bytes()))
+}
+
+// previewRecipe changes whenever Preview produces different bytes for the same
+// source. It is part of every preview ETag because previews are served
+// immutable: without it a browser that has already seen a photograph would go
+// on showing the rendition it cached, and an improvement to the renderer would
+// reach only people who had never looked.
+const previewRecipe = "-r2"
+
+// longEdge is the source's longest side, or zero for an asset the archive never
+// managed to measure. See derive.Converter.Preview for what zero means there.
+func longEdge(asset db.Asset) int {
+	return max(intOr(asset.Width), intOr(asset.Height))
 }
 
 func intOr(v *int) int {

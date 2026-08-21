@@ -23,7 +23,12 @@ import {
   saveCachedStats,
   type CachedStats,
 } from './src/stats/cache';
-import { canDownloadShared, type SharedAsset } from './modules/photo-facts';
+import {
+  canDownloadShared,
+  photoKitSharedProvenance,
+  type SharedAsset,
+  type SharedProvenance,
+} from './modules/photo-facts';
 import { fetchSharedAssets } from './src/sharedalbums/fetch';
 import type { FetchRun, SampleRead } from './src/sharedalbums/run';
 import { loadSelection, saveSelection } from './src/sharedalbums/selection';
@@ -95,6 +100,9 @@ export default function App() {
   const [sampleSize, setSampleSize] = useState(SAMPLE_SIZE);
   const [fetchRun, setFetchRun] = useState<FetchRun | null>(null);
   const [fetchingSamples, setFetchingSamples] = useState(false);
+  const [forgotten, setForgotten] = useState<number | null>(null);
+  const [provenance, setProvenance] = useState<SharedProvenance | null>(null);
+  const [provenanceError, setProvenanceError] = useState<string | null>(null);
   /** Seeded from the cache so the card has numbers before the first fetch lands. */
   const [stats, setStats] = useState<CachedStats | null>(loadCachedStats);
   /** True when the last refresh failed and what is on screen is the cache. */
@@ -323,6 +331,50 @@ export default function App() {
     () => pickSample(assetsOf(chosenAlbums), sampleSize),
     [chosenAlbums, sampleSize]
   );
+
+  /**
+   * Drops every shared row from the queue so the next run offers them again.
+   *
+   * The repair for photographs archived before the phone could name the album
+   * they came out of. `done` is the one state nothing else can leave, and the
+   * album title only ever arrives on a fresh row, so a re-run alone changes
+   * nothing. It costs no bytes: each item comes back as pending, the archive
+   * answers `have` from the mapping it already holds, and the item settles
+   * straight back to done — describing itself on the way past, which is the
+   * point.
+   */
+  const forgetShared = useCallback(async () => {
+    if (!store) return;
+    setForgotten(await store.forgetShared());
+    await refreshQueue(store);
+  }, [store, refreshQueue]);
+
+  /**
+   * Asks one photograph what this iOS will say about who shared it.
+   *
+   * Here rather than in a test because the answer is a property of the phone
+   * this is running on. The contributor is read from keys Apple does not
+   * document, and a photograph reporting none is ambiguous between having none
+   * and this build not knowing what the field is called; only the phone can
+   * settle that. See sharedProvenance() in the native module.
+   */
+  const probeProvenance = useCallback(async () => {
+    setProvenanceError(null);
+    const subject = sample[0];
+    if (!subject) {
+      setProvenanceError('Tick an album with something in it first.');
+      return;
+    }
+    try {
+      const found = await photoKitSharedProvenance(subject.localId);
+      setProvenance(found);
+      if (found === null) {
+        setProvenanceError('This dev client has no provenance diagnostic in it.');
+      }
+    } catch (error) {
+      setProvenanceError(errorText(error));
+    }
+  }, [sample]);
 
   const chooseAlbums = useCallback((ids: string[]) => {
     saveSelection(ids);
@@ -680,6 +732,14 @@ export default function App() {
                 onFetch={() => void runSamples()}
                 onStop={stopSamples}
               />
+              <SharedRepairPanel
+                onForget={() => void forgetShared()}
+                forgotten={forgotten}
+                disabled={!store}
+                onProbe={() => void probeProvenance()}
+                provenance={provenance}
+                provenanceError={provenanceError}
+              />
             </>
           )}
         </Section>
@@ -924,6 +984,11 @@ function SharedSurveyReport({ survey }: { survey: SharedSurvey }) {
         {survey.stills} sitting exactly there
       </Text>
       <Text style={styles.muted}>
+        A shared still reports one pixel more than it downloads: PhotoKit says 2049 px and
+        the resource arrives at 2048. The count above is the honest signal that a cap is
+        being enforced — not the handful of pixels either side of it.
+      </Text>
+      <Text style={styles.muted}>
         videos — longest edge {survey.video.maxLongEdge ?? '—'} px, longest clip{' '}
         {formatDuration(survey.longestVideoSeconds)}
       </Text>
@@ -939,9 +1004,9 @@ function SharedSurveyReport({ survey }: { survey: SharedSurvey }) {
         <Text style={styles.muted}>
           Nothing exceeds Apple&apos;s documented caps ({STILL_LONG_EDGE_CAP}px on a photo,{' '}
           {formatDuration(VIDEO_SECONDS_CAP)} on a video) and no full-size resource exists, so
-          every one of these is Apple&apos;s re-encode. Backing them up archives the
-          downscale, which is the only copy that exists for anything you did not share
-          yourself.
+          every one of these is Apple&apos;s re-encode — a JPEG, whatever the original was
+          shot as. Backing them up archives the downscale, which is the only copy that
+          exists for anything you did not share yourself.
         </Text>
       )}
       <Text style={styles.muted}>
@@ -961,6 +1026,87 @@ function SharedSurveyReport({ survey }: { survey: SharedSurvey }) {
  * iCloud does to a phone that asks for hundreds in a row, and that is the
  * question a backup depends on the answer to.
  */
+/**
+ * The two things to do when a shared photograph reached the archive with
+ * something missing from it.
+ *
+ * Both are about metadata rather than bytes, and neither re-fetches anything
+ * from iCloud.
+ */
+function SharedRepairPanel({
+  onForget,
+  forgotten,
+  disabled,
+  onProbe,
+  provenance,
+  provenanceError,
+}: {
+  onForget: () => void;
+  forgotten: number | null;
+  disabled: boolean;
+  onProbe: () => void;
+  provenance: SharedProvenance | null;
+  provenanceError: string | null;
+}) {
+  return (
+    <>
+      <Text style={styles.subheading}>fixing what was already archived</Text>
+      <Text style={styles.muted}>
+        A shared photograph records its album and who added it at the moment it is queued,
+        so anything archived by an earlier build kept neither. This forgets what the queue
+        remembers about shared items; the next run offers them again, the server answers
+        &ldquo;already have it&rdquo;, and each one is described on the way past. No bytes
+        are fetched and nothing is uploaded twice.
+      </Text>
+      <Pressable
+        style={[styles.button, disabled && styles.buttonDisabled]}
+        onPress={onForget}
+        disabled={disabled}
+      >
+        <Text style={styles.buttonText}>Re-send shared album details</Text>
+      </Pressable>
+      {forgotten !== null && (
+        <Text style={styles.muted}>
+          {forgotten === 0
+            ? 'Nothing shared was in the queue. Survey and tick an album, then run a backup.'
+            : `${formatCount(forgotten)} shared item(s) forgotten. Run a backup to re-send them.`}
+        </Text>
+      )}
+
+      <Text style={styles.muted}>
+        The contributor is read from PhotoKit properties Apple does not document, so an
+        empty &ldquo;added by&rdquo; can mean the photograph has no contributor or that this
+        iOS calls that field something else. This asks one photograph directly.
+      </Text>
+      <Pressable style={styles.button} onPress={onProbe}>
+        <Text style={styles.buttonText}>Read provenance for one photo</Text>
+      </Pressable>
+      {provenanceError && <Text style={styles.warning}>{provenanceError}</Text>}
+      {provenance && (
+        <View style={styles.block}>
+          <Text style={styles.mono}>
+            {provenance.class} · {provenance.sourceTypes.names.join(', ') || 'no source type'}
+          </Text>
+          <Text style={styles.mono}>
+            contributor: {provenance.contributor?.displayName ?? 'none'}
+          </Text>
+          <Text style={styles.mono}>looked under: {provenance.contributorKeys.join(', ')}</Text>
+          {provenance.albums.map((album, index) => (
+            <Text key={index} style={styles.mono}>
+              album {album.title ?? 'untitled'} · owner {album.contributor?.displayName ?? 'none'}
+            </Text>
+          ))}
+          {provenance.properties.map((line, index) => (
+            <Text key={`p${index}`} style={styles.mono}>
+              {line}
+            </Text>
+          ))}
+        </View>
+      )}
+    </>
+  );
+}
+
 function FetchPanel({
   sample,
   size,
@@ -1291,6 +1437,14 @@ const styles = StyleSheet.create({
     minWidth: 140,
   },
   code: { fontFamily: 'Menlo', color: '#aaa' },
+  mono: { fontFamily: 'Menlo', color: '#aaa', fontSize: 11 },
+  block: {
+    backgroundColor: '#161616',
+    borderRadius: 8,
+    padding: 10,
+    marginTop: 8,
+    gap: 2,
+  },
   numberInput: {
     backgroundColor: '#242424',
     color: '#eee',

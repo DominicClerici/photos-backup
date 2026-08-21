@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 	"unicode"
@@ -29,10 +30,48 @@ import (
 // rebuild_asset_search takes them as arguments for exactly that reason. The one
 // place they are written down as literals is migration 0018's initial fill,
 // where both tables were empty and the value could not have mattered.
-const (
-	CaptionModel = "qwen3-vl-4b-instruct"
+var (
+	CaptionModel = captionModelFromEnv()
 	OCRModel     = "rapidocr"
 )
+
+// captionModelFromEnv reads PHOTOD_CAPTION_MODEL, and is the Go half of
+// photo-ml's PHOTO_ML_CAPTION_MODEL.
+//
+// A variable rather than the constant this was, because ML_IMAGES.md §9 step 1
+// — "bench first, on this library" — needs two captioners writing into the same
+// tables at once, and `model` has been in the primary key of asset_descriptions
+// since 0016 precisely so they can. What was missing was a way to say which one
+// this process is talking to without recompiling.
+//
+// Validated rather than trusted, and that is not defensive habit: search.go
+// pastes this string into a query literal, because the column is compared
+// against a constant there and a bound parameter would cost the planner its
+// estimate. A name that cannot contain a quote is what makes that paste safe,
+// and anything else falls back to the default with a line on stderr — the same
+// rule photo-ml's settings.py applies to every value that comes out of an env
+// file.
+//
+// Setting this alone changes nothing already written. The rows under the old
+// name stay exactly where they are, which is the property that makes a bench a
+// delete and a requeue rather than a migration; it is also why the two halves
+// disagreeing is worth noticing, and worker.checkModel is what notices.
+func captionModelFromEnv() string {
+	const fallback = "qwen3-vl-4b-instruct"
+	name := strings.TrimSpace(os.Getenv("PHOTOD_CAPTION_MODEL"))
+	if name == "" {
+		return fallback
+	}
+	for _, r := range name {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '.' && r != '_' {
+			fmt.Fprintf(os.Stderr,
+				"PHOTOD_CAPTION_MODEL %q has a character a model name may not have; using %s\n",
+				name, fallback)
+			return fallback
+		}
+	}
+	return name
+}
 
 // Tag is one word a model wrote about a photograph, and how sure it was.
 //
@@ -198,6 +237,29 @@ const maxTagLength = 40
 // carefully.
 const maxTags = 12
 
+// maxPhrases bounds how many of those twelve may be more than one word.
+//
+// The prompt asks for this too — see photo_ml/captioner.py — and a prompt is a
+// request. This is the enforcement, and it lives here for the reason maxTags
+// does: what a model may invent is the write path's question, and a bound that
+// exists only in a prompt is a bound a differently-configured captioner
+// silently does not have.
+//
+// Two, and the number is measured. Of the first 3,505 words, 1,376 were phrases
+// — a fifth of the claims, two thirds of them used exactly once, and 71% with
+// every one of their words already in that photograph's own caption at the same
+// weight A. "white tank top" is not a thing anybody searches for and is not
+// evidence the caption did not already give; what it is, is another row in the
+// merge review. The tail they grow is the largest single input to how long that
+// review is, which is the cost ML_IMAGES.md §11 calls the bet on cleanup.
+//
+// Dropped rather than split into their words: splitting would file claims about
+// a photograph that no model made, which is the one thing this write path is
+// not allowed to do. The two that survive are the two the captioner itself
+// ranked highest, because _read turns its ordering into a confidence and this
+// loop reads them in that order.
+const maxPhrases = 2
+
 // normalizeTags turns what a model wrote into vocabulary.
 //
 // Lowercased and collapsed, because "Dog", "dog " and "dog" are one word and
@@ -206,10 +268,15 @@ const maxTags = 12
 // the time. Anything left that is empty, absurdly long, or not a word at all is
 // dropped rather than stored: the vocabulary is going to be read by a person
 // eventually, and this is the cheapest moment to keep it readable.
+//
+// Three bounds rather than two, as of the second captioning generation: the
+// third is on phrases, and it is there because "the vocabulary is read by a
+// person eventually" turned out to be the expensive half of this feature.
 func normalizeTags(tags []Tag) ([]string, []float32) {
 	seen := make(map[string]bool, len(tags))
 	names := make([]string, 0, len(tags))
 	confidences := make([]float32, 0, len(tags))
+	phrases := 0
 
 	for _, tag := range tags {
 		name := strings.ToLower(strings.Join(strings.Fields(tag.Name), " "))
@@ -221,6 +288,12 @@ func normalizeTags(tags []Tag) ([]string, []float32) {
 		}
 		if !strings.ContainsFunc(name, unicode.IsLetter) {
 			continue
+		}
+		if strings.Contains(name, " ") {
+			if phrases == maxPhrases {
+				continue
+			}
+			phrases++
 		}
 		seen[name] = true
 		names = append(names, name)

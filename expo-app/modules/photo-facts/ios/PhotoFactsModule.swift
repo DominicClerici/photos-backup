@@ -186,6 +186,16 @@ public class PhotoFactsModule: Module {
       }
     }
 
+    // What this iOS will actually say about who shared one photograph. See
+    // sharedProvenance().
+    AsyncFunction("sharedProvenanceAsync") { (localId: String, promise: Promise) in
+      guard let asset = findAsset(localId) else {
+        promise.resolve()
+        return
+      }
+      promise.resolve(sharedProvenance(of: asset))
+    }
+
     AsyncFunction("md5ForFileAsync") { (uri: String, promise: Promise) in
       do {
         let digest = try md5Digest(ofFileAt: uri)
@@ -744,28 +754,107 @@ private func pairedVideoResource(from resources: [PHAssetResource]) -> PHAssetRe
 ///
 /// The Photos app draws the name under every asset in a shared album, so the
 /// phone plainly knows it; what it does not have is a public property to read it
-/// from. PHAsset carries it in an undocumented one, which leaves a choice
-/// between reading that and losing the only piece of provenance a shared
-/// photograph has — a name that exists nowhere else, in nobody's EXIF, and not
-/// at all once the album is left.
+/// from. That leaves a choice between reading an undocumented one and losing the
+/// only piece of provenance a shared photograph has — a name that exists nowhere
+/// else, in nobody's EXIF, and not at all once the album is left.
 ///
-/// So it is read by key, and every read is guarded twice. `responds(to:)` is
-/// asked before the value is, because a `value(forKey:)` for a key the class
-/// does not have raises an Objective-C exception, and a Swift `do/catch` cannot
-/// catch one: an unguarded read of a key Apple renames is not a missing name, it
-/// is the app going down while somebody is backing up. And several spellings are
-/// tried, because the exact one is not something this file can verify — the
-/// first that answers wins, and an iOS that answers to none reports no
-/// contributor at all, which every caller already handles.
+/// The first attempt at this guessed the spelling: four hard-coded key names,
+/// tried in turn. Every one came back empty, and fifty-five photographs reached
+/// the archive with no contributor and no way to tell "Apple renamed it" from
+/// "this photograph has none". Guessing again is the same bet at the same odds,
+/// so the names are no longer guessed — they are found. The Objective-C runtime
+/// can be asked what a class actually declares, which is the difference between
+/// a key that might exist and one that does.
+///
+/// Reading is still guarded twice. `responds(to:)` is asked before the value is,
+/// because a `value(forKey:)` for a key the class does not have raises an
+/// Objective-C exception that a Swift `do/catch` cannot catch: an unguarded read
+/// is not a missing name, it is the app going down while somebody is backing up.
+/// An iOS that declares nothing matching reports no contributor at all, which
+/// every caller already handles — and `sharedProvenanceAsync` is then the way to
+/// see what it does declare, rather than another round of guessing.
 ///
 /// This is not App Store code and could not be. It is a personal archive, built
 /// against a dev client, and the trade is a name that would otherwise be lost
 /// against a private key that may stop working — in which case the field goes
 /// quiet and nothing else changes.
-private let contributorFirstNameKeys = ["cloudOwnerFirstName"]
-private let contributorLastNameKeys = ["cloudOwnerLastName"]
-private let contributorEmailKeys = ["cloudOwnerEmail", "cloudOwnerEmailAddress"]
-private let contributorIdentifierKeys = ["cloudOwnerHashedPersonID", "cloudOwnerHashedPersonId"]
+private enum ContributorField {
+  case firstName, lastName, email, displayName, identifier
+}
+
+/// The spellings worth trying before the runtime is asked, so that a key already
+/// known to work keeps working the same way whatever else a class declares.
+private let knownContributorKeys: [ContributorField: [String]] = [
+  .firstName: ["cloudOwnerFirstName"],
+  .lastName: ["cloudOwnerLastName"],
+  .email: ["cloudOwnerEmail", "cloudOwnerEmailAddress"],
+  .displayName: ["cloudOwnerDisplayName", "cloudOwnerFullName"],
+  .identifier: ["cloudOwnerHashedPersonID", "cloudOwnerHashedPersonId"]
+]
+
+/// Which part of a contributor a property name is describing, or nil for a name
+/// that is not describing one at all.
+///
+/// Matched on the name, because that is all the runtime offers. The subject test
+/// comes first and is deliberately narrow: plenty of PHAsset's properties end in
+/// "identifier" or contain "name", and only the ones that also say whose it is
+/// are about a person. The order of the field tests matters for the same reason
+/// — "firstName" contains "name", so the specific readings are taken before the
+/// general one.
+private func contributorField(for name: String) -> ContributorField? {
+  let lower = name.lowercased()
+  let aboutAPerson =
+    lower.contains("owner") || lower.contains("contributor") || lower.contains("sharedby")
+    || lower.contains("person")
+  guard aboutAPerson else { return nil }
+
+  if lower.contains("firstname") || lower.contains("givenname") { return .firstName }
+  if lower.contains("lastname") || lower.contains("familyname") { return .lastName }
+  if lower.contains("email") { return .email }
+  if lower.contains("displayname") || lower.contains("fullname") { return .displayName }
+  if lower.contains("identifier") || lower.contains("personid") { return .identifier }
+  if lower.contains("name") { return .displayName }
+  return nil
+}
+
+/// Every property this object's class declares, and every one its superclasses
+/// declare, stopping short of NSObject.
+///
+/// Superclasses are walked because a framework class routinely declares the
+/// interesting half of itself further up than the type in hand. NSObject is
+/// where the walk stops because nothing it declares is about a photograph.
+private func declaredProperties(of object: NSObject) -> [String] {
+  var names: [String] = []
+  var current: AnyClass? = type(of: object)
+
+  while let klass = current, klass != NSObject.self {
+    var count: UInt32 = 0
+    if let list = class_copyPropertyList(klass, &count) {
+      for index in 0..<Int(count) {
+        names.append(String(cString: property_getName(list[index])))
+      }
+      free(list)
+    }
+    current = class_getSuperclass(klass)
+  }
+  return names
+}
+
+/// The keys each part of a contributor can be read from, on this object's class.
+///
+/// Recomputed per call rather than cached. Caching would want a mutable global
+/// and a lock around it, and the thing it would save is a walk of sixty property
+/// names in a process that is about to ask iCloud for a photograph over the
+/// network.
+private func contributorKeys(of object: NSObject) -> [ContributorField: [String]] {
+  var keys = knownContributorKeys
+  for name in declaredProperties(of: object) {
+    guard let field = contributorField(for: name) else { continue }
+    if keys[field]?.contains(name) == true { continue }
+    keys[field, default: []].append(name)
+  }
+  return keys
+}
 
 /// Who owns the asset or album, or nil where nothing answered.
 ///
@@ -773,17 +862,19 @@ private let contributorIdentifierKeys = ["cloudOwnerHashedPersonID", "cloudOwner
 /// "this photograph has no contributor" are the same absence to everything
 /// downstream, and neither is worth a row in a panel.
 private func cloudOwner(of object: NSObject) -> [String: Any?]? {
-  let first = firstAnswer(from: object, keys: contributorFirstNameKeys)
-  let last = firstAnswer(from: object, keys: contributorLastNameKeys)
-  let email = firstAnswer(from: object, keys: contributorEmailKeys)
-  let identifier = firstAnswer(from: object, keys: contributorIdentifierKeys)
+  let keys = contributorKeys(of: object)
+  let first = firstAnswer(from: object, keys: keys[.firstName])
+  let last = firstAnswer(from: object, keys: keys[.lastName])
+  let email = firstAnswer(from: object, keys: keys[.email])
+  let identifier = firstAnswer(from: object, keys: keys[.identifier])
 
   let name = [first, last].compactMap { $0 }.joined(separator: " ")
   // The identifier is deliberately not a fallback for the name. It is a hash,
   // so it identifies the same person across assets without ever being something
   // to show anybody, and a panel reading "Added by 9f3c…" would be worse than
   // one saying nothing.
-  let displayName = !name.isEmpty ? name : email
+  let displayName =
+    !name.isEmpty ? name : (firstAnswer(from: object, keys: keys[.displayName]) ?? email)
 
   if displayName == nil && identifier == nil {
     return nil
@@ -798,8 +889,8 @@ private func cloudOwner(of object: NSObject) -> [String: Any?]? {
 }
 
 /// The first of these keys the object answers to with something worth having.
-private func firstAnswer(from object: NSObject, keys: [String]) -> String? {
-  for key in keys {
+private func firstAnswer(from object: NSObject, keys: [String]?) -> String? {
+  for key in keys ?? [] {
     if let value = readString(object, key) {
       return value
     }
@@ -820,12 +911,82 @@ private func readString(_ object: NSObject, _ key: String) -> String? {
   return trimmed.isEmpty ? nil : trimmed
 }
 
+/// Everything this iOS will say about one shared photograph's provenance, as
+/// text to read rather than fields to use.
+///
+/// A diagnostic, and it exists because the alternative was another guess. The
+/// contributor is read from properties that Apple neither documents nor
+/// promises, so "no name came back" has two causes that look identical from the
+/// outside: this photograph has no contributor recorded, or this iOS calls it
+/// something the matcher does not recognise. Only a listing of what the class
+/// actually declares tells them apart, and once seen it is one line to fix.
+///
+/// Every readable property is listed, not merely the ones that look like a name,
+/// because a name the matcher would have recognised is exactly the case that
+/// does not need diagnosing. Values are limited to strings and numbers to keep
+/// this to something a person can read, and the read is the same guarded one
+/// every other access here uses.
+///
+/// Nothing calls this during a backup.
+private func sharedProvenance(of asset: PHAsset) -> [String: Any?] {
+  let collections = PHAssetCollection.fetchAssetCollections(
+    with: .album, subtype: .albumCloudShared, options: nil)
+
+  var albums: [[String: Any?]] = []
+  collections.enumerateObjects { collection, _, _ in
+    let holds = PHAsset.fetchAssets(in: collection, options: nil).contains(asset)
+    guard holds else { return }
+    albums.append([
+      "title": collection.localizedTitle,
+      "class": String(cString: object_getClassName(collection)),
+      "contributor": cloudOwner(of: collection),
+      "properties": readableProperties(of: collection)
+    ])
+  }
+
+  return [
+    "localId": assetUriPrefix + asset.localIdentifier,
+    "class": String(cString: object_getClassName(asset)),
+    "sourceTypes": sourceType(of: asset),
+    "contributor": cloudOwner(of: asset),
+    // What the matcher settled on, so a key that was found but read as empty is
+    // distinguishable from one that was never a candidate.
+    "contributorKeys": contributorKeys(of: asset).values.flatMap { $0 }.sorted(),
+    "properties": readableProperties(of: asset),
+    "albums": albums
+  ]
+}
+
+/// Each declared property that answers with a string or a number, as
+/// "name = value".
+private func readableProperties(of object: NSObject) -> [String] {
+  var lines: [String] = []
+  for name in Set(declaredProperties(of: object)).sorted() {
+    guard object.responds(to: NSSelectorFromString(name)) else { continue }
+    guard let value = object.value(forKey: name) else { continue }
+    if let text = value as? String {
+      if !text.isEmpty { lines.append("\(name) = \(text)") }
+    } else if let number = value as? NSNumber {
+      lines.append("\(name) = \(number)")
+    }
+  }
+  return lines
+}
+
 /// The shared albums this asset is in, by title.
 ///
-/// The album name is the other half of a shared photograph's provenance, and it
-/// is the half the archive files on — so it has to be answerable per asset, at
-/// the point the upload is being described, rather than only from the
-/// enumeration that queued it weeks earlier.
+/// Expected to come back empty, and kept anyway.
+///
+/// `fetchAssetCollectionsContaining` does not return cloud shared albums: an
+/// asset that is plainly in one, whose album title the Photos app is drawing
+/// above it, reports being in none. That is how fifty-five photographs reached
+/// the archive filed under no album at all. The album a shared asset came from
+/// is now carried from the enumeration that walked it — see SharedOrigin on the
+/// JavaScript side — and this is the fallback rather than the source.
+///
+/// It stays because it costs nothing to ask and it is the only thing that would
+/// notice iOS starting to answer. The caller prefers whatever this returns, so
+/// the day the answer arrives is the day it is used.
 ///
 /// Guarded on the source type because the fetch is not free and the answer is
 /// empty for everything in the camera roll, which is nearly everything this is

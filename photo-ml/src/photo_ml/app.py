@@ -110,6 +110,11 @@ class EmbedResponse(BaseModel):
 def build(settings: Settings) -> FastAPI:
     residency = Residency(settings.idle_seconds, settings.sweep_seconds)
     device, dtype = enc.resolve_device(settings.device)
+    # Resolved once, here, rather than read from the environment wherever a name
+    # is needed: /health, the two routes that report a model, and the residency
+    # entry must all agree, and the only way to be sure they do is for there to
+    # be one object.
+    caption = cap.spec_for(settings.caption_model)
 
     def register(key: str, **kwargs) -> None:
         """Register a model unless this instance was told not to hold it."""
@@ -132,7 +137,7 @@ def build(settings: Settings) -> FastAPI:
 
     register(
         CAPTION,
-        name=cap.MODEL_NAME,
+        name=caption.name,
         # On demand, and the reason the whole residency mechanism exists. Nine
         # gigabytes is more than half this card, the archive machine transcodes
         # with h264_nvenc, and NVENC is a separate silicon block that will not
@@ -140,7 +145,7 @@ def build(settings: Settings) -> FastAPI:
         # getting slower during a backfill is acceptable; transcodes failing to
         # allocate is not.
         role=Role.ON_DEMAND,
-        load=lambda: cap.Captioner(device, dtype, settings.cache_dir),
+        load=lambda: cap.Captioner(device, dtype, settings.cache_dir, caption),
     )
     register(
         OCR,
@@ -289,7 +294,7 @@ def build(settings: Settings) -> FastAPI:
         images = _images(req, settings)
         results = _guard("describe", lambda: describer.submit(images))
         return {
-            "model": cap.MODEL_NAME,
+            "model": caption.name,
             "results": results,
             "took_ms": round((time.perf_counter() - started) * 1000, 1),
         }
@@ -340,7 +345,7 @@ def build(settings: Settings) -> FastAPI:
         with residency.use(CAPTION) as model:
             results = _guard("triage", lambda: model.judge(list(req.words)))
         return {
-            "model": cap.MODEL_NAME,
+            "model": caption.name,
             "results": results,
             "took_ms": round((time.perf_counter() - started) * 1000, 1),
         }

@@ -1,5 +1,6 @@
 import type { SharedAlbum, SharedAsset } from '../../../modules/photo-facts';
 import {
+  albumsByAsset,
   assetsOf,
   formatDuration,
   pickSample,
@@ -221,5 +222,57 @@ describe('formatDuration', () => {
 
   it('reads a still as zero rather than as an error', () => {
     expect(formatDuration(0)).toBe('0s');
+  });
+});
+
+describe('albumsByAsset', () => {
+  it('names every album an asset was found in', () => {
+    const shared = asset();
+    const other = asset();
+
+    const found = albumsByAsset([album([shared, other], 'Iceland'), album([shared], 'Trips')]);
+
+    expect(found.get(shared.localId)).toEqual(['Iceland', 'Trips']);
+    expect(found.get(other.localId)).toEqual(['Iceland']);
+  });
+
+  it('names an album once however often the asset is in it', () => {
+    const shared = asset();
+    const found = albumsByAsset([album([shared, shared], 'Iceland')]);
+
+    expect(found.get(shared.localId)).toEqual(['Iceland']);
+  });
+
+  // An album with no title of its own has nothing to file anything under, and
+  // an empty album row on the server is worse than no row.
+  it('contributes nothing for an album with no usable title', () => {
+    const shared = asset();
+    const found = albumsByAsset([album([shared], ''), album([shared], '   ')]);
+
+    expect(found.has(shared.localId)).toBe(false);
+  });
+
+  it('has nothing to say about an asset in none of the albums given', () => {
+    expect(albumsByAsset([album([asset()], 'Iceland')]).get('ph://elsewhere')).toBeUndefined();
+  });
+});
+
+describe('the cap measurement', () => {
+  // The reading that sent this whole feature down the wrong path once: PhotoKit
+  // describes a capped still as 2049px and then downloads it at 2048. Counted
+  // strictly, 4,400 of 4,700 stills looked like escapees from the cap.
+  it('does not read one pixel over as an original that escaped the cap', () => {
+    const survey = summarize([album([asset({ pixelWidth: 2049, pixelHeight: 1537 })])]);
+
+    expect(survey.still.overCap).toBe(0);
+    expect(survey.still.maxLongEdge).toBe(2049);
+    expect(survey.still.atMax).toBe(1);
+  });
+
+  // A genuine original is not one pixel over, it is twice the size.
+  it('still counts a still that is actually full size', () => {
+    const survey = summarize([album([asset({ pixelWidth: 4032, pixelHeight: 3024 })])]);
+
+    expect(survey.still.overCap).toBe(1);
   });
 });

@@ -242,3 +242,44 @@ test('the downloaded copy is released whether the upload worked or not', async (
 
   expect(h.media.releases).toContain('ph://shared-1');
 });
+
+// The repair path for photographs archived before the phone knew how to record
+// an album title. `done` is the one state nothing else can leave, and the origin
+// only ever arrives on a fresh row — so the fix is to delete and re-enumerate.
+// It costs no bytes: the archive answers `have` and describes on the way past.
+test('forgetting shared items re-offers them with what this build knows', async () => {
+  const h = build({
+    transport: new FakeTransport(alwaysRespond('have')),
+    media: shared('ph://shared-1'),
+    // Archived by a build that could not name the album it came out of.
+    seed: [{ ...queuedShared('ph://shared-1'), state: 'done', assetId: 'asset-1' }],
+  });
+  h.media.facts_.set('ph://shared-1', {
+    favorite: false,
+    subtypes: [],
+    albums: ['GTI-IS-ST'],
+    location: null,
+    photoKit: null,
+  });
+
+  expect(await h.store.forgetShared()).toBe(1);
+  await h.engine.run();
+
+  expect(h.transport.uploads).toEqual([]);
+  expect(h.transport.described.map((d) => d.facts.albums)).toEqual([['GTI-IS-ST']]);
+  expect(h.engine.counts.done).toBe(1);
+});
+
+// Deleting more than was asked for would mean re-uploading a camera roll.
+test('forgetting shared items leaves the library alone', async () => {
+  const h = build({
+    transport: new FakeTransport(alwaysRespond('have')),
+    seed: [
+      { ...queuedShared('ph://shared-1'), state: 'done' },
+      { ...queued('ph://library-1'), state: 'done' },
+    ],
+  });
+
+  expect(await h.store.forgetShared()).toBe(1);
+  expect(h.store.snapshot().map((item) => item.localId)).toEqual(['ph://library-1']);
+});

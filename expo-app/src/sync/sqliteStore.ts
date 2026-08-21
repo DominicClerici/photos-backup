@@ -9,6 +9,7 @@ import {
   type NewItem,
   type QueueItem,
   type QueueStore,
+  type SharedOrigin,
   type StateCounts,
 } from './types';
 
@@ -32,6 +33,7 @@ type ItemRow = {
   attempts: number;
   next_attempt_at: number;
   last_error: string | null;
+  shared: string | null;
 };
 
 /**
@@ -56,8 +58,8 @@ export class SqliteQueueStore implements QueueStore {
         const result = await this.db.runAsync(
           `insert or ignore into items
              (local_id, kind, source, parent_local_id, filename, created_at, modified_at,
-              size, md5, state, asset_id, attempts, next_attempt_at, last_error)
-           values (?, ?, ?, ?, ?, ?, ?, null, null, 'pending', null, 0, 0, null)`,
+              shared, size, md5, state, asset_id, attempts, next_attempt_at, last_error)
+           values (?, ?, ?, ?, ?, ?, ?, ?, null, null, 'pending', null, 0, 0, null)`,
           [
             item.localId,
             item.kind,
@@ -66,12 +68,18 @@ export class SqliteQueueStore implements QueueStore {
             item.filename,
             item.createdAt,
             item.modifiedAt,
+            item.shared === null ? null : JSON.stringify(item.shared),
           ]
         );
         added += result.changes;
       }
     });
     return added;
+  }
+
+  async forgetShared(): Promise<number> {
+    const result = await this.db.runAsync(`delete from items where source = 'shared'`);
+    return result.changes;
   }
 
   async pruneShared(keep: string[]): Promise<number> {
@@ -222,7 +230,8 @@ async function createSchema(db: SQLite.SQLiteDatabase): Promise<void> {
       asset_id        text,
       attempts        integer not null default 0,
       next_attempt_at integer not null default 0,
-      last_error      text
+      last_error      text,
+      shared          text
     );
     create index if not exists items_state_idx on items (state, next_attempt_at);
     create table if not exists meta (
@@ -236,6 +245,12 @@ async function createSchema(db: SQLite.SQLiteDatabase): Promise<void> {
   // added rather than the table recreated because those rows are the record of
   // what has already been archived, and losing them would re-upload a library.
   await addColumn(db, 'source', "text not null default 'library'");
+
+  // Nullable with no default, because null is the honest value for every row
+  // already here: a camera roll item has no shared origin, and a shared item
+  // queued by a build that could not read one has none recorded. Telling those
+  // two apart is what forgetShared() is for.
+  await addColumn(db, 'shared', 'text');
 }
 
 /** Adds a column to `items` unless it is already there. */
@@ -266,6 +281,7 @@ function toItem(row: ItemRow): QueueItem {
     filename: row.filename,
     createdAt: row.created_at,
     modifiedAt: row.modified_at,
+    shared: parseShared(row.shared),
     size: row.size,
     md5: row.md5,
     state: isItemState(row.state) ? row.state : 'pending',
@@ -274,6 +290,25 @@ function toItem(row: ItemRow): QueueItem {
     nextAttemptAt: row.next_attempt_at,
     lastError: row.last_error,
   };
+}
+
+/**
+ * Reads back what enumerate() wrote, and treats anything unreadable as absent.
+ *
+ * A row whose JSON will not parse is a row written by some version of this app
+ * that this one cannot understand, and the cost of ignoring it is one photograph
+ * filed under no album — where throwing would take down a whole backup run over
+ * a caption.
+ */
+function parseShared(value: string | null): SharedOrigin | null {
+  if (value === null) return null;
+  try {
+    const parsed = JSON.parse(value) as SharedOrigin;
+    if (!parsed || !Array.isArray(parsed.albums)) return null;
+    return { albums: parsed.albums, contributor: parsed.contributor ?? null };
+  } catch {
+    return null;
+  }
 }
 
 function isItemState(value: string): value is ItemState {

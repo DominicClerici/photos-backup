@@ -37,6 +37,23 @@ export const STILL_LONG_EDGE_CAP = 2048;
 export const VIDEO_LONG_EDGE_CAP = 1280;
 export const VIDEO_SECONDS_CAP = 15 * 60;
 
+/**
+ * How far past a cap a dimension has to reach before it is evidence of anything.
+ *
+ * PHAsset reports 2049x1537 for a shared still whose resource downloads as
+ * exactly 2048x1536 — one pixel over, on every capped still measured. Counted
+ * strictly, that read as "4,400 of 4,700 stills are above the cap", which was
+ * taken as a sign that the originals were reachable after all. They were not:
+ * the cap was being enforced precisely, and the survey was measuring PhotoKit's
+ * description rather than the bytes Apple sends.
+ *
+ * So one pixel of slack, which is exactly the discrepancy observed and nowhere
+ * near enough to hide a real original — a shared iPhone still would come back at
+ * 4032, not 2049. The resource inventory is the sounder signal for the same
+ * question, and it is reported beside this one.
+ */
+export const CAP_SLACK = 1;
+
 /** How many assets the byte-fetch step tries unless it is told otherwise. */
 export const SAMPLE_SIZE = 3;
 
@@ -77,6 +94,7 @@ export type AlbumSummary = {
 export type EdgeSummary = {
   maxLongEdge: number | null;
   atMax: number;
+  /** Meaningfully over, rather than merely over. See CAP_SLACK. */
   overCap: number;
 };
 
@@ -215,6 +233,36 @@ export function assetsOf(albums: SharedAlbum[]): SharedAsset[] {
 }
 
 /**
+ * The titles of the albums each asset was found in, by local id.
+ *
+ * The companion to assetsOf(), and the half of the walk that deduplication
+ * throws away. An asset in three albums is one thing to fetch and one row in a
+ * queue, but it belongs to three albums and the archive should say so.
+ *
+ * This is the only place the answer exists. PhotoKit will not name a cloud
+ * shared album when it is asked which albums contain an asset, so an asset
+ * holding a title has to have been reached *through* the album that has it,
+ * which is what walking a list of albums does and what asking about one asset
+ * cannot. Albums with no title of their own contribute none.
+ */
+export function albumsByAsset(albums: SharedAlbum[]): Map<string, string[]> {
+  const found = new Map<string, string[]>();
+  for (const album of albums) {
+    const title = album.title?.trim();
+    if (!title) continue;
+    for (const asset of album.assets) {
+      const titles = found.get(asset.localId);
+      if (titles === undefined) {
+        found.set(asset.localId, [title]);
+      } else if (!titles.includes(title)) {
+        titles.push(title);
+      }
+    }
+  }
+  return found;
+}
+
+/**
  * The handful of assets worth actually downloading.
  *
  * Spread across kinds before depth, because the three of them fail differently:
@@ -292,7 +340,7 @@ function edges(assets: SharedAsset[], cap: number): EdgeSummary {
   return {
     maxLongEdge,
     atMax: longest.filter((edge) => edge === maxLongEdge).length,
-    overCap: longest.filter((edge) => edge > cap).length,
+    overCap: longest.filter((edge) => edge > cap + CAP_SLACK).length,
   };
 }
 

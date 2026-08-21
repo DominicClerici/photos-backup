@@ -1,11 +1,23 @@
 // Package mediatype classifies an upload into a content type, a canonical file
 // extension, and an image/video kind.
 //
-// The filename's extension is trusted when it is one we recognise. When it is
-// absent or unrecognised the leading bytes settle it, which is not a nicety:
-// a Google Takeout export strips the extension off every Live Photo's paired
-// video, and without sniffing those arrive as application/octet-stream, get
-// filed as images, and fail their thumbnail with no playback rendition queued.
+// A filename's extension is a claim and its leading bytes are evidence. The
+// extension is trusted while nothing contradicts it — when it is absent or
+// unrecognised the bytes settle it, which is not a nicety: a Google Takeout
+// export strips the extension off every Live Photo's paired video, and without
+// sniffing those arrive as application/octet-stream, get filed as images, and
+// fail their thumbnail with no playback rendition queued.
+//
+// When the two disagree outright the bytes win, because a name is what some
+// other system decided to call the file and the bytes are what it actually is.
+// iCloud Shared Albums are the case that forced this: Apple re-encodes every
+// shared photograph to JPEG and goes on calling it IMG_6822.HEIC, so trusting
+// the name stored 39 of this archive's 45 shared stills as HEIC — a label no
+// browser will open and no download will name correctly.
+//
+// Disagreement means disagreement about the file, not about vocabulary. See
+// agrees(): an extension that merely names its container more precisely than a
+// sniff can keeps its say.
 package mediatype
 
 import (
@@ -97,14 +109,56 @@ var ftypBrands = map[string]string{
 // extension its name carried, including none.
 func Detect(filename string, head []byte) (contentType, ext string) {
 	ext = normalizeExt(filepath.Ext(filename))
+	named, sniffed := byExt[ext], Sniff(head)
 
-	if ct := byExt[ext]; ct != "" {
-		return ct, ext
+	switch {
+	case named == "" && sniffed == "":
+		return Octet, ext
+	case named == "":
+		return sniffed, canonicalExt[sniffed]
+	case sniffed == "" || agrees(named, sniffed):
+		return named, ext
+	default:
+		return sniffed, canonicalExt[sniffed]
 	}
-	if ct := Sniff(head); ct != "" {
-		return ct, canonicalExt[ct]
+}
+
+// agrees reports whether a name's claim and the bytes' evidence are describing
+// the same file, allowing for the two ways they can differ without either being
+// wrong.
+//
+// The first is precision. A DNG is a TIFF carrying extra tags, and telling them
+// apart means walking the IFD for SubIFDs — so every raw file in the archive
+// sniffs as image/tiff, and a rule of "bytes win" would quietly restore the
+// bug Sniff's own comment describes.
+//
+// The second is container brands. MP4 and QuickTime are the same ISO base media
+// format under two names, and which one a file declares says more about the
+// camera that wrote it than about what is inside: measured against this
+// archive, a quarter of its videos declare the brand of the other extension.
+// Relabelling them would rename thousands of blobs to change nothing a player
+// can perceive.
+func agrees(named, sniffed string) bool {
+	if named == sniffed {
+		return true
 	}
-	return Octet, ext
+	if refines[named] == sniffed {
+		return true
+	}
+	return isoBaseMedia[named] && isoBaseMedia[sniffed]
+}
+
+// Content types that are a narrower reading of another — the key is what the
+// extension claims, the value what the bytes can be expected to say.
+var refines = map[string]string{
+	"image/x-adobe-dng": "image/tiff",
+}
+
+// The container the sniffer can identify but not name any more exactly than the
+// extension already does.
+var isoBaseMedia = map[string]bool{
+	"video/mp4":       true,
+	"video/quicktime": true,
 }
 
 // FromExt reports the content type an extension implies, or "" when it implies

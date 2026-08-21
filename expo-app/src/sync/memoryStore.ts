@@ -43,6 +43,16 @@ export class MemoryQueueStore implements QueueStore {
     return added;
   }
 
+  async forgetShared(): Promise<number> {
+    let removed = 0;
+    for (const item of [...this.items.values()]) {
+      if (item.source !== 'shared') continue;
+      this.items.delete(item.localId);
+      removed += 1;
+    }
+    return removed;
+  }
+
   async pruneShared(keep: string[]): Promise<number> {
     const wanted = new Set(keep);
     let removed = 0;

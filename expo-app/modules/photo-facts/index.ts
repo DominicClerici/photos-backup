@@ -66,6 +66,27 @@ export type SharedContributor = {
   displayName: string | null;
 };
 
+/**
+ * A dump of one asset's provenance, for reading rather than for using. Every
+ * `properties` entry is a "name = value" line straight off the object.
+ */
+export type SharedProvenance = {
+  localId: string;
+  /** The Objective-C class the value was read from. */
+  class: string;
+  sourceTypes: { value: number; names: string[] };
+  contributor: SharedContributor | null;
+  /** The keys the contributor was looked for under, found or not. */
+  contributorKeys: string[];
+  properties: string[];
+  albums: {
+    title: string | null;
+    class: string;
+    contributor: SharedContributor | null;
+    properties: string[];
+  }[];
+};
+
 export type PhotoKitFacts = {
   localId: string;
   /** The Hidden album: a decision a person made, and invisible in the file. */
@@ -265,6 +286,7 @@ type PhotoFactsNativeModule = {
     destination: string,
     want: SharedResourceWanted
   ): Promise<NativeDownloadResult | null>;
+  sharedProvenanceAsync(localId: string): Promise<SharedProvenance | null>;
   md5ForFileAsync(uri: string): Promise<string>;
   addListener(
     event: 'onSharedFetchProgress',
@@ -300,6 +322,23 @@ function carries(name: keyof PhotoFactsNativeModule): boolean {
  * lets the screen say so first.
  */
 export const canDownloadShared = carries('downloadSharedResourceAsync');
+
+export const canReadSharedProvenance = carries('sharedProvenanceAsync');
+
+/**
+ * What this iOS will say about who shared one photograph, as text to read.
+ *
+ * A diagnostic with no part in a backup. The contributor comes off properties
+ * Apple does not document, so a photograph that reports none is ambiguous
+ * between having none and this build not recognising the name of the field that
+ * holds it. This lists what the class actually declares, which settles it.
+ */
+export async function photoKitSharedProvenance(
+  localId: string
+): Promise<SharedProvenance | null> {
+  if (!carries('sharedProvenanceAsync')) return null;
+  return (await native!.sharedProvenanceAsync(localId)) ?? null;
+}
 
 /**
  * Everything PhotoKit knows about one asset, or null when this build has no

@@ -1130,11 +1130,21 @@ else had shared with this phone — and every one this phone had shared back —
 invisible to the backup and to the archive.
 
 **The survey answered the question that decides whether any of this is worth
-doing.** Apple documents a 2,048-pixel cap on the long edge of anything in a
-shared album, which would make the shared copy a downscale and archiving it a
-matter of keeping a thumbnail. Measured on this phone: **4,400 of 4,700 shared
-stills are above it.** Whatever the documentation says, what is actually sitting
-in these albums is at or near original resolution, and worth having.
+doing, and the first answer was wrong.** Apple documents a 2,048-pixel cap on the
+long edge of anything in a shared album. The survey reported 4,400 of 4,700
+stills above it, which was read as the cap not being enforced and the originals
+being reachable after all. They are not. PhotoKit describes a capped still as
+**2049x1537** and then hands over a resource of exactly **2048x1536** — one pixel
+of difference, on every capped still in the library, and the survey was measuring
+the description rather than the bytes. The cap is enforced precisely, every
+shared still arrives as a JPEG whatever it was shot as, and there is no
+`fullSizePhoto` resource to ask for instead.
+
+So archiving a shared album means archiving Apple's downscale, and it is still
+worth doing: for a photograph somebody else took, that downscale is the only copy
+that exists anywhere on this phone. The survey now allows one pixel of slack
+(`CAP_SLACK`) so the reading that caused this cannot recur, and says in words
+that the resource inventory is the sounder signal for the same question.
 
 **Nothing is backed up until an album is ticked.** The picker was built during
 the survey, where an unanswered question could safely default to "all of them"
@@ -1179,22 +1189,60 @@ added it, in the sidecar, surfaced as one row in the viewer's panel. That name i
 the only provenance a shared photograph has: Apple re-encodes the file, so there
 is no maker note to read, and the name is gone the day the album is left.
 
-**Getting it means reading a key Apple does not document.** PhotoKit has no
-public property for the contributor — the Photos app draws the name under every
-asset in a shared album, and there is no supported way to ask for it. So it is
-read by KVC, and every read is guarded by `responds(to:)` first, because
-`value(forKey:)` on a key the class does not have raises an Objective-C exception
-that Swift cannot catch: an unguarded read of a key Apple renames is not a
-missing name, it is the app going down mid-backup. This is not App Store code and
-could not be. The trade is a name that would otherwise be lost against a private
-key that may stop working, in which case the row goes quiet and nothing else
-changes.
+**Neither the album nor the contributor can be asked for one asset at a time,
+which is how the first fifty-five arrived with neither.**
+`PHAssetCollection.fetchAssetCollectionsContaining` does not return cloud shared
+albums: an asset that is plainly in one, with the album's name drawn above it in
+the Photos app, reports being in none. And the contributor has no public property
+at all. Both are therefore recorded during the enumeration that *walks* the
+albums — which reaches each asset through an album rather than holding one and
+asking — and carried on the queue row in a `shared` column, for the same reason
+`source` is carried: the run that knew is not the run that uploads.
 
-**What the resource is called outranks what the asset is called.** PhotoKit goes
-on calling a shared asset `IMG_4021.HEIC` after iCloud has handed over a JPEG,
-and the server trusts a recognised extension over the sniffed bytes. Left alone,
-every shared JPEG in the archive would be stored and served as a HEIC. The
-upload is named after the resource Apple actually sent.
+**The contributor's key is found rather than guessed.** The first attempt
+hard-coded four spellings of an undocumented property name. All four came back
+empty, and fifty-five photographs reached the archive with no contributor and no
+way to tell "Apple renamed it" from "this photograph has none". Guessing again is
+the same bet at the same odds, so the Objective-C runtime is asked what the class
+actually declares (`class_copyPropertyList`, up the superclass chain) and the
+names are matched against what a contributor field looks like. Every read is
+still guarded by `responds(to:)` first, because `value(forKey:)` on a key the
+class does not have raises an Objective-C exception that Swift cannot catch: an
+unguarded read is not a missing name, it is the app going down mid-backup. When
+nothing matches, `sharedProvenanceAsync` dumps what the class does declare, so
+the next step is reading a list rather than guessing again. This is not App Store
+code and could not be.
+
+**What the bytes are outranks what anything calls them.** PhotoKit goes on
+calling a shared asset `IMG_6822.HEIC` after iCloud has handed over a JPEG — the
+*resource's* own filename included, so naming the upload after the resource was
+not enough. Only the resource's uniform type identifier describes what was
+actually sent, and it is what names the file now. The server was fixed to match:
+`mediatype.Detect` trusted a recognised extension outright, and now lets a
+confident sniff overrule one that contradicts it, keeping the extension only
+where it is more precise than the bytes (a DNG is a TIFF) or names the same
+container differently (MP4 and QuickTime). Before both fixes, 39 of the first 45
+shared stills were stored and served as `image/heic` while being ordinary JPEGs.
+
+**The gallery was making a second-generation copy of a second-generation file.**
+Previews render at 2048px and WebP quality 82, which is invisible on a 4032px
+camera original because the downscale throws away the artefacts along with three
+quarters of the pixels. A shared still is *already* 2048px, so there is no
+downscale and nothing to hide behind — the render was pure loss, measured at 39.4
+dB PSNR against its own source, and it landed on exactly the photographs least
+able to spare it. Preview now takes the source's long edge and spends quality 94
+when it will not be downscaling: 44.0 dB on the same photograph, brick texture
+and neon edges visibly restored, and camera originals unchanged. Preview ETags
+carry a recipe version so an improvement reaches browsers that already cached
+the old one.
+
+**Repairing what was already archived costs no bytes.** The album and the
+contributor arrive on a fresh queue row, and `done` is the one state nothing else
+can leave — so a re-run alone changes nothing. `forgetShared()` deletes the
+shared rows; the next run offers them again, the archive answers `have` from the
+device mapping it already holds, and each item settles straight back to done,
+describing itself on the way past. Nothing is fetched from iCloud and nothing is
+uploaded twice.
 
 ### v2
 

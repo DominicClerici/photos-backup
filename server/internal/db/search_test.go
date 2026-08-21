@@ -31,6 +31,50 @@ func TestPutDescriptionWritesCaptionTagsAndSearchRow(t *testing.T) {
 	}
 }
 
+// The third bound on what a model may invent, and the one that is about the
+// person who has to read the vocabulary rather than about the tsvector.
+//
+// A captioner that answers with six phrases is not wrong about the photograph;
+// it is filing five rows the merge review will have to read, each used once,
+// each with its words already in the caption above at the same weight. Two
+// survive, and they are the two it ranked first.
+func TestNormalizeTagsKeepsOnlyTheFirstTwoPhrases(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	id := seedAsset(t, store, 1, time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC))
+
+	if err := store.PutDescription(ctx, id, CaptionModel,
+		"A man in a white tank top at the top of a ski slope",
+		[]Tag{
+			{Name: "ski resort", Confidence: 0.95},
+			{Name: "skier", Confidence: 0.90},
+			{Name: "power lines", Confidence: 0.85},
+			{Name: "white tank top", Confidence: 0.80},
+			{Name: "high vantage point", Confidence: 0.75},
+			{Name: "snow", Confidence: 0.70},
+		},
+	); err != nil {
+		t.Fatalf("PutDescription: %v", err)
+	}
+
+	got := tagsOf(t, store, id)
+	want := map[string]bool{"ski resort": true, "skier": true, "power lines": true, "snow": true}
+	if len(got) != len(want) {
+		t.Fatalf("tags = %v, want the single words and the first two phrases", got)
+	}
+	for _, name := range got {
+		if !want[name] {
+			t.Errorf("tags = %v, want %q dropped", got, name)
+		}
+	}
+	// The cap is on phrases alone: a single word after two phrases have already
+	// been spent is still a word, and dropping it would make the bound a
+	// position rather than a rule.
+	if !matches(t, store, id, "snow") {
+		t.Error("a single word past the phrase cap did not reach the tsvector")
+	}
+}
+
 // The whole of the free-form-then-merge plan, in one test: the model wrote
 // "puppy", somebody merged it into "dog", and both words now find the
 // photograph without a single row being rewritten.

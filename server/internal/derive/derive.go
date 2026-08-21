@@ -41,6 +41,18 @@ type Converter struct {
 	// scaled up.
 	PreviewSize    int
 	PreviewQuality int
+	// PreviewNativeQuality is used instead when the source is already inside
+	// PreviewSize, so the render downscales nothing.
+	//
+	// A downscale is what makes a modest quality honest: throwing away three
+	// quarters of the pixels also throws away the artefacts of whatever
+	// compressed them last, so 82 applied to a 4032px camera original is
+	// invisible. Applied to a source already at 2048 it is a second lossy
+	// generation with nothing to hide behind, and it lands on exactly the
+	// photographs least able to spare it — an iCloud Shared Album's stills
+	// arrive as 2048px JPEGs, already generation two, and the gallery was
+	// making them three.
+	PreviewNativeQuality int
 	// PreviewConcurrency caps simultaneous on-demand conversions. Without it, a
 	// viewer opened while prefetching neighbours can fork an ImageMagick per
 	// in-flight request and take the machine down; requests past the cap wait
@@ -53,12 +65,13 @@ type Converter struct {
 
 func New() *Converter {
 	return &Converter{
-		Binary:             "magick",
-		ThumbQuality:       75,
-		MLQuality:          80,
-		PreviewSize:        2048,
-		PreviewQuality:     82,
-		PreviewConcurrency: 4,
+		Binary:               "magick",
+		ThumbQuality:         75,
+		MLQuality:            80,
+		PreviewSize:          2048,
+		PreviewQuality:       82,
+		PreviewNativeQuality: 94,
+		PreviewConcurrency:   4,
 	}
 }
 
@@ -219,7 +232,12 @@ func (c *Converter) MLRendition(ctx context.Context, src string, over *Layer, ed
 }
 
 // Preview writes a WebP bounded by PreviewSize on its longest edge.
-func (c *Converter) Preview(ctx context.Context, src string, over *Layer, w io.Writer) error {
+//
+// srcLongEdge is the source's own longest edge, which decides the quality: see
+// PreviewNativeQuality. Zero means the caller does not know, and is read as
+// "large" — the common case for an unknown is a file nothing could measure, and
+// guessing small would spend bytes on every one of them.
+func (c *Converter) Preview(ctx context.Context, src string, over *Layer, srcLongEdge int, w io.Writer) error {
 	if err := c.acquire(ctx); err != nil {
 		return err
 	}
@@ -238,7 +256,7 @@ func (c *Converter) Preview(ctx context.Context, src string, over *Layer, w io.W
 	ops = append(ops, keepColour...)
 	ops = append(ops,
 		"-resize", resize,
-		"-quality", fmt.Sprint(c.previewQuality()),
+		"-quality", fmt.Sprint(c.previewQualityFor(srcLongEdge)),
 		"webp:-",
 	)
 	return c.run(ctx, w, "webp", src, ops...)
@@ -486,6 +504,23 @@ func (c *Converter) previewSize() int {
 		return 2048
 	}
 	return c.PreviewSize
+}
+
+// previewQualityFor picks between the two preview qualities on whether this
+// render will actually downscale. The comparison is >= rather than >, because a
+// source exactly at PreviewSize is resized by nothing at all.
+func (c *Converter) previewQualityFor(srcLongEdge int) int {
+	if srcLongEdge > 0 && srcLongEdge <= c.previewSize() {
+		return c.previewNativeQuality()
+	}
+	return c.previewQuality()
+}
+
+func (c *Converter) previewNativeQuality() int {
+	if c.PreviewNativeQuality <= 0 {
+		return 94
+	}
+	return c.PreviewNativeQuality
 }
 
 func (c *Converter) previewQuality() int {

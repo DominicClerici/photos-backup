@@ -4,7 +4,7 @@
  * declared here, which is what makes the engine testable in plain Node.
  */
 
-import type { PhotoKitFacts } from '../../modules/photo-facts';
+import type { PhotoKitFacts, SharedContributor } from '../../modules/photo-facts';
 
 export type ItemKind = 'still' | 'video' | 'live_video';
 
@@ -39,6 +39,29 @@ export const ITEM_STATES: ItemState[] = ['pending', 'unknown', 'hashed', 'want',
 /** States that still have work left. `done` is finished and `failed` is parked. */
 export const RETRYABLE_STATES: ItemState[] = ['pending', 'unknown', 'hashed', 'want'];
 
+/**
+ * What the enumeration knew about a shared asset and nothing later can find out.
+ *
+ * Both halves have to be carried rather than looked up at describe time, and for
+ * the same reason: PhotoKit will not answer either question about a single
+ * asset. `PHAssetCollection.fetchAssetCollectionsContaining` does not return
+ * cloud shared albums at all, so an asset that is plainly in one reports being
+ * in none — which is how fifty-five photographs reached the archive filed under
+ * no album while the phone was showing the album's name above them. The
+ * contributor has no documented door at all; see cloudOwner() in the native
+ * module.
+ *
+ * Walking the chosen albums is what does know both, because it arrives at each
+ * asset *through* an album rather than holding one and asking. So the answer is
+ * written down at the moment it is in hand, and outlives the run that had it.
+ */
+export type SharedOrigin = {
+  /** Titles of the chosen shared albums this asset was found in. */
+  albums: string[];
+  /** Who put it there, or null where the phone would not say. */
+  contributor: SharedContributor | null;
+};
+
 export type QueueItem = {
   /** Opaque. A Live Photo's paired video uses `<localId>#live`. */
   localId: string;
@@ -52,6 +75,8 @@ export type QueueItem = {
    * changes the bytes, so this is what tells the server to look again.
    */
   modifiedAt: number | null;
+  /** Null for everything in the camera roll. See SharedOrigin. */
+  shared: SharedOrigin | null;
   size: number | null;
   md5: string | null;
   state: ItemState;
@@ -63,7 +88,14 @@ export type QueueItem = {
 
 export type NewItem = Pick<
   QueueItem,
-  'localId' | 'kind' | 'source' | 'parentLocalId' | 'filename' | 'createdAt' | 'modifiedAt'
+  | 'localId'
+  | 'kind'
+  | 'source'
+  | 'parentLocalId'
+  | 'filename'
+  | 'createdAt'
+  | 'modifiedAt'
+  | 'shared'
 >;
 
 export type ItemPatch = Partial<
@@ -132,6 +164,20 @@ export interface QueueStore {
    * later.
    */
   pruneShared(keep: string[]): Promise<number>;
+  /**
+   * Deletes every shared row, finished ones included, and returns how many went.
+   *
+   * The queue is additive and enqueue() is `insert or ignore`, which means a row
+   * that entered it before the phone knew how to record an album title keeps
+   * that gap forever: re-enumeration skips it, and pruneShared() spares it for
+   * being done. Deleting is what lets the next run offer it again as a new item,
+   * with everything this build knows attached.
+   *
+   * It costs no bytes. Each one comes back as `pending`, the archive answers
+   * `have` from the device mapping it already holds, and the item settles to
+   * done — describing itself on the way past, which is the point.
+   */
+  forgetShared(): Promise<number>;
 }
 
 export type CheckStatus = 'have' | 'unknown' | 'want';
@@ -289,11 +335,12 @@ export type OpenedAsset = {
    * turned out to know better than the queue did.
    *
    * Only a shared asset sets it, and the reason is the archive's file naming: a
-   * shared HEIC comes back from iCloud re-encoded, PhotoKit goes on calling the
-   * asset IMG_4021.HEIC, and the server trusts a recognised extension over the
-   * bytes. Left alone, every shared JPEG in the archive would be stored and
-   * served as a HEIC. The resource Apple actually handed over knows its own
-   * name; this is it.
+   * shared HEIC comes back from iCloud re-encoded to JPEG and PhotoKit goes on
+   * calling the asset IMG_4021.HEIC — the resource's own filename included.
+   * Only the type identifier beside it says what the bytes are, and this is the
+   * name built from it. Left alone, every shared JPEG in the archive is stored
+   * and served as a HEIC, which is what happened to thirty-nine of the first
+   * forty-five. See sharedalbums/naming.ts.
    */
   filename?: string;
   release: () => Promise<void>;

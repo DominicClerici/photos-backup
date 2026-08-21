@@ -233,6 +233,7 @@ export function asset(localId: string, overrides: Partial<EnumeratedAsset> = {})
     filename: `${localId}.HEIC`,
     createdAt: 1_600_000_000_000,
     modifiedAt: 1_600_000_000_000,
+    shared: null,
     ...overrides,
   };
 }
@@ -246,6 +247,7 @@ export function queued(localId: string, overrides: Partial<QueueItem> = {}): Que
     filename: `${localId}.HEIC`,
     createdAt: 1_600_000_000_000,
     modifiedAt: 1_600_000_000_000,
+    shared: null,
     size: null,
     md5: null,
     state: 'pending',

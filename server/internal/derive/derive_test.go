@@ -118,7 +118,7 @@ func TestPreviewPreservesAspectRatio(t *testing.T) {
 	c.PreviewSize = 100
 
 	var out bytes.Buffer
-	if err := c.Preview(context.Background(), fixture("sample.heic"), nil, &out); err != nil {
+	if err := c.Preview(context.Background(), fixture("sample.heic"), nil, 0, &out); err != nil {
 		t.Fatalf("Preview: %v", err)
 	}
 
@@ -132,7 +132,7 @@ func TestPreviewPreservesAspectRatio(t *testing.T) {
 // blown up into a larger, blurrier file than the source.
 func TestPreviewDoesNotUpscaleASmallOriginal(t *testing.T) {
 	var out bytes.Buffer
-	if err := New().Preview(context.Background(), fixture("sample.heic"), nil, &out); err != nil {
+	if err := New().Preview(context.Background(), fixture("sample.heic"), nil, 0, &out); err != nil {
 		t.Fatalf("Preview: %v", err)
 	}
 
@@ -149,7 +149,7 @@ func TestPreviewRotatesAccordingToOrientation(t *testing.T) {
 	c.PreviewSize = 800
 
 	var out bytes.Buffer
-	if err := c.Preview(context.Background(), fixture("iphone-portrait.heic"), nil, &out); err != nil {
+	if err := c.Preview(context.Background(), fixture("iphone-portrait.heic"), nil, 0, &out); err != nil {
 		t.Fatalf("Preview: %v", err)
 	}
 
@@ -198,7 +198,7 @@ func TestPreviewRunsConcurrentlyUpToTheCap(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			var out bytes.Buffer
-			if err := c.Preview(context.Background(), fixture("sample.heic"), nil, &out); err != nil {
+			if err := c.Preview(context.Background(), fixture("sample.heic"), nil, 0, &out); err != nil {
 				errs <- err
 			}
 		}()
@@ -342,11 +342,11 @@ func TestPreviewComposesALayerOverThePhotograph(t *testing.T) {
 	layer := &Layer{Path: layerFixture(t, 101, 253), Width: 400, Height: 300}
 
 	var plain bytes.Buffer
-	if err := c.Preview(context.Background(), fixture("sample.heic"), nil, &plain); err != nil {
+	if err := c.Preview(context.Background(), fixture("sample.heic"), nil, 0, &plain); err != nil {
 		t.Fatalf("Preview: %v", err)
 	}
 	var composed bytes.Buffer
-	if err := c.Preview(context.Background(), fixture("sample.heic"), layer, &composed); err != nil {
+	if err := c.Preview(context.Background(), fixture("sample.heic"), layer, 0, &composed); err != nil {
 		t.Fatalf("Preview with a layer: %v", err)
 	}
 
@@ -380,7 +380,7 @@ func TestPreviewMeasuresThePhotographWhenTheLayerDoesNotSayHowBig(t *testing.T) 
 	layer := &Layer{Path: layerFixture(t, 101, 253)}
 
 	var out bytes.Buffer
-	if err := New().Preview(context.Background(), fixture("sample.heic"), layer, &out); err != nil {
+	if err := New().Preview(context.Background(), fixture("sample.heic"), layer, 0, &out); err != nil {
 		t.Fatalf("Preview with an unmeasured layer: %v", err)
 	}
 	if w, h := decode(t, &out); w != 400 || h != 300 {
@@ -423,11 +423,61 @@ func TestConversionReportsAMissingLayer(t *testing.T) {
 	layer := &Layer{Path: filepath.Join(t.TempDir(), "gone.png"), Width: 400, Height: 300}
 
 	var out bytes.Buffer
-	err := New().Preview(context.Background(), fixture("sample.heic"), layer, &out)
+	err := New().Preview(context.Background(), fixture("sample.heic"), layer, 0, &out)
 	if err == nil {
 		t.Fatal("Preview succeeded with a missing layer, want an error")
 	}
 	if !bytes.Contains([]byte(err.Error()), []byte("gone.png")) {
 		t.Errorf("error does not mention the missing layer: %v", err)
+	}
+}
+
+// A source that is already inside the preview box gets no downscale, and a
+// downscale is what usually hides the renderer's own compression. Told the
+// source's size, Preview stops spending that hiding place it does not have.
+//
+// The fixture is 400x300, so a PreviewSize of 2048 resizes nothing either way;
+// the only difference between the two renders is the quality that was chosen.
+func TestPreviewSpendsMoreOnASourceItWillNotDownscale(t *testing.T) {
+	var blind, told bytes.Buffer
+
+	if err := New().Preview(context.Background(), fixture("sample.heic"), nil, 0, &blind); err != nil {
+		t.Fatalf("Preview without a size: %v", err)
+	}
+	if err := New().Preview(context.Background(), fixture("sample.heic"), nil, 400, &told); err != nil {
+		t.Fatalf("Preview with a size: %v", err)
+	}
+
+	if told.Len() <= blind.Len() {
+		t.Errorf("preview of a small source is %d bytes, no larger than the %d spent when the size was unknown",
+			told.Len(), blind.Len())
+	}
+
+	w, h := decode(t, &told)
+	if w != 400 || h != 300 {
+		t.Errorf("preview is %dx%d, want the original 400x300", w, h)
+	}
+}
+
+// The other half of the same rule: a camera original is downscaled by three
+// quarters, which is where the modest quality belongs and where the extra bytes
+// would buy nothing an eye could find.
+func TestPreviewDoesNotSpendMoreOnASourceItWillDownscale(t *testing.T) {
+	c := New()
+	c.PreviewSize = 200
+
+	var out bytes.Buffer
+	if err := c.Preview(context.Background(), fixture("sample.heic"), nil, 400, &out); err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+
+	var same bytes.Buffer
+	if err := c.Preview(context.Background(), fixture("sample.heic"), nil, 0, &same); err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+
+	if out.Len() != same.Len() {
+		t.Errorf("downscaled preview is %d bytes told the source size and %d bytes not; they should be the same render",
+			out.Len(), same.Len())
 	}
 }

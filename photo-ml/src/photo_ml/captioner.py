@@ -28,23 +28,113 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 
 import torch
 from PIL import Image
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoModelForImageTextToText, AutoProcessor, FineGrainedFP8Config
 
 log = logging.getLogger("photo_ml.captioner")
 
-# The checkpoint, and the name that ends up in asset_descriptions.model.
+@dataclass(frozen=True)
+class Spec:
+    """One captioner: which weights, how to load them, and what its rows are
+    called.
+
+    Two strings on purpose, as with the encoder: the row records what produced a
+    caption and will outlive whatever the weights were called on whichever
+    mirror they came from, so the identity is ours. `name` is what lands in
+    asset_descriptions.model, and PHOTOD_CAPTION_MODEL on the Go side has to
+    agree with it — rebuild_asset_search reads captions by that string, so a
+    service quietly running something else writes rows that are correct, stored,
+    and never reach the tsvector. photod's worker compares the two on every
+    result and says so; see worker.checkModel.
+    """
+
+    name: str
+    hf_id: str
+    # Quantise the weights on load, in FP8 with a 128-block scale.
+    #
+    # This is a deliberate reversal of what the module docstring above says
+    # about 4-bit, and the reasoning survives the reversal intact. The objection
+    # was never to quantisation as such: it was that the AWQ and GPTQ *kernels*
+    # are community code and sm_120 is the architecture most likely to be
+    # missing from them, so the failure mode is a service that installs, starts
+    # and then dies on the first forward pass. FP8 is not community code. It is
+    # Blackwell's own datatype, transformers dispatches it to DeepGEMM on
+    # SM100+, and it falls back to a Triton kernel rather than to nothing.
+    #
+    # What it buys is the only thing that lets a 9B model onto this card at all:
+    # 19.3GB of bf16 becomes about 10, which is the envelope the 4B already
+    # occupies. What it costs is a load that reads the full bf16 checkpoint into
+    # host memory first — minutes, and once per residency load rather than once
+    # per batch.
+    fp8: bool = False
+    # Modules the FP8 quantiser must leave in bf16, and this list is a bug
+    # worked around rather than a tuning choice.
+    #
+    # transformers' on-the-fly quantiser writes a `weight_scale_inv` beside
+    # every block it converts, and for Qwen3.5 it silently fails to write them
+    # for the Gated DeltaNet projections and the vision MLPs — the load report
+    # says MISSING and initialises them fresh, which means the dequantisation is
+    # multiplying by noise. There is no error. What comes out is a model that
+    # loads, runs at full speed, reports no NaN in its weights, and answers
+    # every one of two hundred photographs with a caption that is two hundred
+    # exclamation marks.
+    #
+    # Excluding those two families leaves the language MLPs — which is where the
+    # parameters actually are — quantised, and costs about half a gigabyte
+    # against a whole-model conversion that does not work. Worth re-testing
+    # empty on a later transformers; the symptom is loud once you know it.
+    fp8_skip: tuple[str, ...] = ()
+
+
+# Every captioner this service knows how to be, keyed by the name its rows carry.
 #
-# Two strings on purpose, as with the encoder: the row records what produced a
-# caption and will outlive whatever the weights were called on whichever mirror
-# they came from, so the identity is ours. db.CaptionModel holds the same
-# constant on the Go side, and rebuild_asset_search reads captions by it — a
-# service quietly running something else writes rows that are correct, stored,
-# and never reach the tsvector.
-HF_ID = "Qwen/Qwen3-VL-4B-Instruct"
-MODEL_NAME = "qwen3-vl-4b-instruct"
+# A registry rather than a constant because ML_IMAGES.md §9 step 1 — "bench
+# first, on this library" — is the one item of that plan still unstruck, and the
+# schema was built for it: `model` is in the primary key of asset_descriptions,
+# so two captioners coexist in the tables and a bench is a delete and a requeue
+# rather than a migration. This is the other half of that, and it is what makes
+# choosing one an env var instead of an edit.
+CAPTIONERS: dict[str, Spec] = {
+    spec.name: spec
+    for spec in (
+        # The incumbent. Qwen3-VL's 4B at bf16, about 9GB on the card.
+        Spec("qwen3-vl-4b-instruct", "Qwen/Qwen3-VL-4B-Instruct"),
+        # The same size, one generation on. Qwen3.5 is natively multimodal —
+        # there is no separate -VL line, because text and image tokens were
+        # interleaved from scratch rather than a vision tower being adapted onto
+        # a language model — and its own documentation claims it beats Qwen3-VL
+        # on visual understanding. Same VRAM as the incumbent, so the swap is
+        # free if the claim holds here.
+        Spec("qwen3.5-4b", "Qwen/Qwen3.5-4B"),
+        # Twice the parameters, in the same VRAM, at the cost of a slower load
+        # and a Triton fallback if DeepGEMM has no sm_120 kernel. See Spec.fp8.
+        Spec("qwen3.5-9b-fp8", "Qwen/Qwen3.5-9B", fp8=True,
+             fp8_skip=("linear_attn", "visual")),
+    )
+}
+
+# What runs when nobody has said otherwise, and it is the incumbent rather than
+# the newest: the archive already holds rows under this name, and a default that
+# moves with the registry would silently orphan them.
+DEFAULT_CAPTIONER = "qwen3-vl-4b-instruct"
+
+
+def spec_for(name: str | None) -> Spec:
+    """The captioner a name asks for, or the default.
+
+    Falls back rather than raising, which is settings.py's rule for every value
+    that comes out of an env file: a typo should cost you the default, not the
+    service. What it costs is visible — /health reports the name that is
+    actually loaded, and photod logs a mismatch on the first result it reads.
+    """
+    if name and name in CAPTIONERS:
+        return CAPTIONERS[name]
+    if name:
+        log.warning("unknown captioner %r; falling back to %s", name, DEFAULT_CAPTIONER)
+    return CAPTIONERS[DEFAULT_CAPTIONER]
 
 # The ML renditions are 512px on their longest edge (derivstore.MLEdge), so
 # capping the processor here costs nothing and bounds the vision tokens: a
@@ -60,22 +150,52 @@ MIN_PIXELS = 224 * 224
 # back to being read as prose; see _read.
 MAX_NEW_TOKENS = 192
 
+# The four prohibitions in the rules below were not in the first version of this
+# prompt, and they are not guesses. They are TRIAGE_SYSTEM's own categories,
+# moved forward from the second thing these weights are asked to the first,
+# after 2,572 photographs showed what asking loosely produces.
+#
+# The mood clause is the clearest of them. This prompt used to ask for "the
+# occasion or mood when it is obvious", and TRIAGE_SYSTEM ninety lines below
+# names "casual" and "friendly" as junk by way of example. The model obeyed both
+# — 94 casual, 46 peaceful, 26 calm, 25 relaxed — writing words it would later
+# strike out itself. The occasion half of that clause was the good half (concert
+# 50, party 50, graduation 43), so it is split rather than dropped.
+#
+# The phrase rule is the other measured one. 1,376 of the first 3,505 words were
+# two-word phrases; they carried a fifth of the claims, two thirds of them were
+# used exactly once, and 71% had every one of their words already in that
+# photograph's own caption, at the same weight A, from the same model, about the
+# same picture. They grow a tail the merge review has to read and buy the
+# tsvector almost nothing. db.normalizeTags enforces what this asks for rather
+# than trusting it — see maxPhrases there, and see ML_IMAGES.md §9 for why the
+# vocabulary is still open.
 PROMPT = """You are indexing a personal photo library so that its owner can search it later.
 
 Look at the image and reply with JSON only, in exactly this shape:
 {"caption": "one sentence", "tags": ["word", "word", "word"]}
 
 caption: one plain sentence, at most 25 words, describing what is visible.
-tags: 4 to 10 lowercase words or two-word phrases. Cover the subject, the
-setting, notable objects, the activity, and the occasion or mood when it is
-obvious.
+tags: 4 to 10 lowercase tags. Cover the subject, the setting, notable objects,
+the activity, and the occasion when there is one — a birthday, a concert, a
+graduation, a holiday.
+
+Prefer single words. Use a two-word phrase only when the two words name one
+thing that has no single-word name: "ski resort", "power lines", "christmas
+tree". Not "white tank top", not "high vantage point" — say "shirt", say
+"overlook".
 
 Rules:
 - Describe only what you can actually see.
 - Never guess anyone's name, and never guess a city, country or landmark name.
   Say "a man", "a dog", "a beach", "a ski resort".
 - If the image is a screenshot or a photograph of text, say so and describe what
-  kind of thing it shows.
+  kind of thing it shows — but do not copy the words off the screen.
+  "screenshot", "chat", "receipt", "map"; never "login", "submit", "result".
+- No mood, no opinion, no judgement. Not "casual", "peaceful", "professional",
+  "modern". A tag is a thing that is there.
+- No words about photography itself. Not "photo", "image", "screen",
+  "high quality", "well composed".
 - No preamble, no explanation, no markdown fence. JSON only."""
 
 
@@ -114,21 +234,43 @@ TRIAGE_BATCH = 8
 
 
 class Captioner:
-    """Loaded weights, and the one thing they are asked."""
+    """Loaded weights, and the two things they are asked."""
 
-    name = MODEL_NAME
-
-    def __init__(self, device: torch.device, dtype: torch.dtype, cache_dir: str | None) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        cache_dir: str | None,
+        spec: Spec | None = None,
+    ) -> None:
+        self.spec = spec or CAPTIONERS[DEFAULT_CAPTIONER]
+        # The instance carries the name rather than the class, because there is
+        # more than one of these now and a class attribute would report whichever
+        # checkpoint was written down first. photod reads this off every result.
+        self.name = self.spec.name
         self.device = device
         self.dtype = dtype
-        self._model = (
-            AutoModelForImageTextToText.from_pretrained(HF_ID, dtype=dtype, cache_dir=cache_dir)
-            .to(device)
-            .eval()
-        )
+
+        load: dict = {"dtype": dtype, "cache_dir": cache_dir}
+        if self.spec.fp8:
+            # device_map, and it is not optional here: quantising on load places
+            # the weights as it converts them, and a .to(device) afterwards would
+            # move already-quantised blocks a second time. The block size is the
+            # 128 the Blackwell path expects.
+            load |= {
+                "quantization_config": FineGrainedFP8Config(
+                    weight_block_size=(128, 128),
+                    modules_to_not_convert=list(self.spec.fp8_skip) or None,
+                ),
+                "device_map": device,
+            }
+
+        model = AutoModelForImageTextToText.from_pretrained(self.spec.hf_id, **load)
+        self._model = model.eval() if self.spec.fp8 else model.to(device).eval()
         self._processor = AutoProcessor.from_pretrained(
-            HF_ID, cache_dir=cache_dir, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS
+            self.spec.hf_id, cache_dir=cache_dir, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS
         )
+        self._template = _template_kwargs(self._processor)
 
     def unload(self) -> None:
         """Drop the weights. Residency calls empty_cache() after this, which is
@@ -150,7 +292,9 @@ class Captioner:
             for _ in images
         ]
         prompts = [
-            self._processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+            self._processor.apply_chat_template(
+                m, tokenize=False, add_generation_prompt=True, **self._template
+            )
             for m in messages
         ]
 
@@ -210,6 +354,13 @@ class Captioner:
                     ],
                     tokenize=False,
                     add_generation_prompt=True,
+                    # Doubly required here. judge() reads its answer off the
+                    # logits of the *first* generated position, and a reasoning
+                    # template makes that position the opening of a thought
+                    # rather than KEEP or JUNK — so the verdict would be a
+                    # coin toss between two tokens the model was never about to
+                    # write.
+                    **self._template,
                 )
                 for word in chunk
             ]
@@ -251,6 +402,30 @@ class Captioner:
 # refusing that answer would throw away a perfectly good caption over three
 # backticks.
 _OBJECT = re.compile(r"\{.*\}", re.DOTALL)
+
+def _template_kwargs(processor) -> dict:
+    """Turn a reasoning model's thinking off, where it has any to turn off.
+
+    Found the expensive way, and it is the reason a bench measures output rather
+    than trusting a model card. Qwen3.5 is a reasoning model whose chat template
+    defaults `enable_thinking` to true, so the answer begins "The user wants me
+    to index a photo..." and works towards the JSON — and MAX_NEW_TOKENS cuts it
+    off two hundred words before it arrives. Measured over 200 photographs: 200
+    captions of unusable prose and not one tag, which _read cannot distinguish
+    from a model that is simply bad at this. The incumbent has no such notion in
+    its template, and comparing the two without this would have been comparing
+    a default rather than a model.
+
+    Detected rather than configured per spec, because the thing being asked is a
+    property of the checkpoint's own template and a Spec field would be a second
+    place for it to be wrong. Absent the toggle the dict is empty, which is
+    exactly what every non-reasoning checkpoint wants.
+    """
+    template = getattr(processor, "chat_template", None) or getattr(
+        getattr(processor, "tokenizer", None), "chat_template", ""
+    )
+    return {"enable_thinking": False} if "enable_thinking" in (template or "") else {}
+
 
 def _read(answer: str) -> dict:
     """Turn whatever the model said into a caption and some tags.

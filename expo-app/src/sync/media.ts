@@ -21,7 +21,9 @@ import {
 } from '../../modules/photo-facts';
 import { SharedFetchGate } from '../sharedalbums/gate';
 import { describeFailure } from '../sharedalbums/run';
-import { assetsOf } from '../sharedalbums/summary';
+import { albumTitles, sharedFacts } from '../sharedalbums/facts';
+import { sharedResourceName } from '../sharedalbums/naming';
+import { albumsByAsset, assetsOf } from '../sharedalbums/summary';
 import { sweepChunks } from './chunked';
 import {
   errorText,
@@ -32,6 +34,7 @@ import {
   type MediaSource,
   type OpenedAsset,
   type QueueItem,
+  type SharedOrigin,
 } from './types';
 
 /**
@@ -115,6 +118,7 @@ export class PhotoKitMediaSource implements MediaSource {
         filename,
         createdAt: entry.createdAt,
         modifiedAt: entry.modifiedAt,
+        shared: null,
       });
 
       if (!entry.isLive) continue;
@@ -125,6 +129,7 @@ export class PhotoKitMediaSource implements MediaSource {
         source: 'library',
         parentLocalId: entry.localId,
         filename: pairedVideoName(filename),
+        shared: null,
         createdAt: entry.createdAt,
         modifiedAt: entry.modifiedAt,
       });
@@ -144,8 +149,10 @@ export class PhotoKitMediaSource implements MediaSource {
    * answer than either backing it up or not.
    *
    * Deduplicated across albums, because an asset in three of them is one thing
-   * to fetch and one row in the queue — the three album titles are recovered at
-   * describe time, from the asset itself, and all three are recorded.
+   * to fetch and one row in the queue. All three titles are still recorded: they
+   * are attached here, walking the albums, because that is the only place they
+   * can be got — see SharedOrigin for what happens to a photograph whose album
+   * is asked for later instead.
    *
    * Nothing here may fail the enumeration, which is the one step of a run that
    * cannot degrade: an empty list is a backup that does nothing, and it must not
@@ -162,10 +169,17 @@ export class PhotoKitMediaSource implements MediaSource {
     if (albums === null) return [];
 
     const wanted = new Set(this.sharedAlbumIds);
+    const chosen = albums.filter((album) => wanted.has(album.localId));
+    const titles = albumsByAsset(chosen);
     const assets: EnumeratedAsset[] = [];
 
-    for (const asset of assetsOf(albums.filter((album) => wanted.has(album.localId)))) {
+    for (const asset of assetsOf(chosen)) {
       const filename = asset.filename ?? asset.localId;
+      const shared: SharedOrigin = {
+        albums: titles.get(asset.localId) ?? [],
+        contributor: asset.contributor,
+      };
+
       assets.push({
         localId: asset.localId,
         kind: asset.kind,
@@ -174,6 +188,7 @@ export class PhotoKitMediaSource implements MediaSource {
         filename,
         createdAt: asset.createdAt,
         modifiedAt: asset.modifiedAt,
+        shared,
       });
 
       // Queued only where iCloud actually kept one. A shared Live Photo whose
@@ -189,6 +204,7 @@ export class PhotoKitMediaSource implements MediaSource {
         filename: pairedVideoName(filename),
         createdAt: asset.createdAt,
         modifiedAt: asset.modifiedAt,
+        shared,
       });
     }
     return assets;
@@ -233,17 +249,21 @@ export class PhotoKitMediaSource implements MediaSource {
 
     const titles = await Promise.all(albums.map((album) => quietly(() => album.getTitle(), '')));
 
+    const shared = sharedFacts(photoKit, item.shared);
+
     return {
       favorite,
       subtypes: subtypes.map((subtype) => String(subtype)),
       // The two lists come from different places and mean the same thing. The
       // library's albums arrive through expo-media-library, which cannot see a
-      // shared album at all; the shared ones come off PHAsset directly. Merging
-      // them here is what files a shared photograph under its album name on the
-      // server without the archive ever being told it was shared.
-      albums: albumTitles(titles, photoKit?.sharedAlbums ?? []),
+      // shared album at all; the shared ones were written down when this item
+      // was enumerated, because by the time it is being described there is
+      // nothing left to ask. Merging them here is what files a shared
+      // photograph under its album name on the server without the archive ever
+      // being told it was shared.
+      albums: albumTitles(titles, shared?.sharedAlbums ?? []),
       location: assetLocation(location, photoKit?.location ?? null),
-      photoKit,
+      photoKit: shared,
     };
   }
 
@@ -299,9 +319,14 @@ export class PhotoKitMediaSource implements MediaSource {
       uri: destination.uri,
       size: download.bytes,
       md5: download.md5,
-      // Apple's name for what it actually sent, which outranks PhotoKit's name
-      // for the asset. See OpenedAsset.filename.
-      filename: download.originalFilename ?? undefined,
+      // Named after what Apple actually sent. Its own filename is not enough on
+      // its own: a shared album's stills come back as JPEG still called .HEIC,
+      // and only the type identifier beside the name says so. See
+      // sharedResourceName().
+      filename: sharedResourceName(
+        download.originalFilename ?? item.filename,
+        download.uniformTypeIdentifier
+      ),
       release: async () => {
         deleteQuietly(destination);
       },
@@ -421,22 +446,6 @@ function sharedDirectory(): Directory {
 /** True when iCloud kept the motion half of a shared Live Photo. */
 function hasPairedVideo(asset: SharedAsset): boolean {
   return asset.resourceTypes.some((type) => PAIRED_VIDEO_RESOURCES.includes(type));
-}
-
-/**
- * The albums an asset is in, from both places that know, once each.
- *
- * Deduplicated because a title is the whole identity of an album on the server —
- * sending "Iceland" twice would be one album either way, and asking twice is
- * still two round trips.
- */
-function albumTitles(library: string[], shared: string[]): string[] {
-  const titles = new Set<string>();
-  for (const title of [...library, ...shared]) {
-    const trimmed = title.trim();
-    if (trimmed !== '') titles.add(trimmed);
-  }
-  return [...titles];
 }
 
 /**

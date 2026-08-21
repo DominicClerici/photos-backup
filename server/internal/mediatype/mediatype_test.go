@@ -158,3 +158,80 @@ func TestExtForAndFromExt(t *testing.T) {
 		t.Errorf("ExtFor(octet-stream) = %q, want empty", got)
 	}
 }
+
+// What iCloud Shared Albums actually hand over: Apple re-encodes the shared
+// copy to JPEG and keeps calling it by the original's HEIC name. Trusting the
+// name filed 39 of this archive's 45 shared stills as image/heic, which no
+// browser will open and no "download original" will name correctly.
+func TestDetectBytesOverruleAContradictingExtension(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		filename      string
+		fixture       string
+		wantType      string
+		wantExtension string
+	}{
+		{"jpeg named heic", "IMG_6822.HEIC", "photo.jpg", "image/jpeg", ".jpg"},
+		{"jpeg named png", "memory.png", "photo.jpg", "image/jpeg", ".jpg"},
+		{"heic named jpg", "IMG_1.jpg", "sample.heic", "image/heic", ".heic"},
+		{"jpeg named mov", "IMG_2.mov", "bare.jpg", "image/jpeg", ".jpg"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ct, ext := mediatype.Detect(tc.filename, head(t, tc.fixture))
+			if ct != tc.wantType {
+				t.Errorf("content type = %q, want %q", ct, tc.wantType)
+			}
+			if ext != tc.wantExtension {
+				t.Errorf("ext = %q, want %q", ext, tc.wantExtension)
+			}
+		})
+	}
+}
+
+// A raw file sniffs as the TIFF it is built on, because telling the two apart
+// means walking the IFD. The extension is the only thing that knows, so it
+// keeps its say — otherwise every DNG in the archive would be relabelled.
+func TestDetectKeepsAnExtensionThatIsMorePreciseThanTheBytes(t *testing.T) {
+	tiff := []byte("II\x2A\x00")
+
+	ct, ext := mediatype.Detect("DSC_0001.dng", tiff)
+	if ct != "image/x-adobe-dng" {
+		t.Errorf("content type = %q, want image/x-adobe-dng", ct)
+	}
+	if ext != ".dng" {
+		t.Errorf("ext = %q, want .dng", ext)
+	}
+}
+
+// MP4 and QuickTime are one format under two names, and which brand a file
+// declares says more about the camera than the contents: a quarter of this
+// archive's videos declare the other extension's brand. Relabelling them would
+// rename thousands of blobs to change nothing a player can perceive.
+func TestDetectKeepsTheVideoExtensionAcrossContainerBrands(t *testing.T) {
+	for _, tc := range []struct{ filename, fixture, want, wantExt string }{
+		{"clip.mp4", "clip.mov", "video/mp4", ".mp4"},
+		{"clip.mov", "clip.mov", "video/quicktime", ".mov"},
+	} {
+		t.Run(tc.filename, func(t *testing.T) {
+			ct, ext := mediatype.Detect(tc.filename, head(t, tc.fixture))
+			if ct != tc.want {
+				t.Errorf("content type = %q, want %q", ct, tc.want)
+			}
+			if ext != tc.wantExt {
+				t.Errorf("ext = %q, want %q", ext, tc.wantExt)
+			}
+		})
+	}
+}
+
+// Bytes that say nothing leave the name in charge, which is what keeps every
+// format the sniffer has no signature for working exactly as before.
+func TestDetectKeepsTheExtensionWhenTheBytesAreSilent(t *testing.T) {
+	ct, ext := mediatype.Detect("scan.tiff", []byte("nothing recognisable here"))
+	if ct != "image/tiff" {
+		t.Errorf("content type = %q, want image/tiff", ct)
+	}
+	if ext != ".tiff" {
+		t.Errorf("ext = %q, want .tiff", ext)
+	}
+}
