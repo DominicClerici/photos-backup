@@ -115,9 +115,11 @@ type TagCounts struct {
 	// Vocabulary: a word that has been folded into another is on neither.
 	Kept int64 `json:"kept"`
 	Junk int64 `json:"junk"`
-	// Untriaged is words no model has judged, and Unreviewed is words a model
-	// has judged and nobody has confirmed. The first is what the analyse pass
-	// has left to do; the second is what approving is for.
+	// Untriaged is words nothing has judged — no model, and no person either:
+	// striking a word out before ever running the pass is an answer, and the
+	// pass has nothing left to ask about it. Unreviewed is words a model has
+	// judged and nobody has confirmed. The first is what the analyse pass has
+	// left to do; the second is what approving is for.
 	Untriaged  int64 `json:"untriaged"`
 	Unreviewed int64 `json:"unreviewed"`
 	// Unembedded is kept words with no vector for the current model, which is
@@ -138,7 +140,7 @@ func (s *Store) TagCleanupCounts(ctx context.Context) (TagCounts, error) {
 		    (select count(*) from asset_tags),
 		    (select count(*) from tags where not junk and canonical_id is null),
 		    (select count(*) from tags where junk and canonical_id is null),
-		    (select count(*) from tags where triaged_at is null),
+		    (select count(*) from tags where triaged_at is null and judged_at is null),
 		    (select count(*) from tags where triaged_at is not null and judged_at is null),
 		    (select count(*) from tags t
 		      where not t.junk and t.canonical_id is null
@@ -166,6 +168,14 @@ func (s *Store) TagCleanupCounts(ctx context.Context) (TagCounts, error) {
 // which loses anything if the page is closed halfway. `triaged_at is null` is
 // the resume point and it is an index.
 //
+// `judged_at is null` as well, because a word somebody has already struck out
+// or kept is not waiting for anything. Without it such a word is a permanent
+// resident of this query: it has no triage stamp, so it is selected on every
+// pass; PutTriage refuses to overrule the person who judged it, so it is never
+// stamped; and the count the review screen loops on never reaches zero. The
+// captioner is asked about it once per pass, forever, to have the answer thrown
+// away — and the progress bar stops short of its own total.
+//
 // Most-used first, so a pass that is interrupted has judged the words that
 // matter rather than an arbitrary third of the tail.
 func (s *Store) UntriagedTags(ctx context.Context, limit int) ([]TagWord, error) {
@@ -173,7 +183,7 @@ func (s *Store) UntriagedTags(ctx context.Context, limit int) ([]TagWord, error)
 		select t.id, t.name, count(at.asset_id)
 		from tags t
 		left join asset_tags at on at.tag_id = t.id
-		where t.triaged_at is null
+		where t.triaged_at is null and t.judged_at is null
 		group by t.id, t.name
 		order by count(at.asset_id) desc, t.name
 		limit $1`

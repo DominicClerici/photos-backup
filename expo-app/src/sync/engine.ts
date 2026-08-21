@@ -163,8 +163,18 @@ export class SyncEngine {
     this.report('enumerating', 'Reading the photo library');
     const assets = await this.deps.media.enumerate(this.config.maxItems);
     const added = await this.deps.store.enqueue(assets);
+
+    // What this enumeration offered is the whole of what a shared album is
+    // currently asking for. Anything unfinished that it did not offer is from an
+    // album nobody is backing up any more, or a photograph its owner has taken
+    // out of one. See QueueStore.pruneShared.
+    const dropped = await this.deps.store.pruneShared(
+      assets.filter((asset) => asset.source === 'shared').map((asset) => asset.localId)
+    );
+
     await this.refreshCounts();
     this.log(`enumerated ${assets.length} item(s), ${added} new to the queue`);
+    if (dropped > 0) this.log(`dropped ${dropped} shared item(s) no longer offered`);
   }
 
   private async drain(): Promise<void> {
@@ -330,9 +340,20 @@ export class SyncEngine {
         // Round two supplied a digest, so the server has everything it needs and
         // "unknown" is not an answer it should give. Treat it as a request for
         // the bytes; looping the item back to hashing would never terminate.
+        //
+        // A shared asset skips the hashing state for a different reason: there
+        // is nothing on this phone to hash. Reading it means downloading it from
+        // iCloud, so sending it round the hash-then-check loop would fetch every
+        // shared photograph from Apple twice — once to learn its digest and
+        // again to send it. It goes straight to the upload path, which hashes
+        // the bytes as they arrive. The cost is that the archive is never asked
+        // whether it already holds this content, and the price of that is small:
+        // Apple re-encodes what goes into a shared album, so its copy rarely
+        // matches anything already archived, and the upload is content-addressed
+        // and refuses to store the same bytes twice regardless.
         await this.deps.store.update(item.localId, {
           ...settled,
-          state: withDigest ? 'want' : 'unknown',
+          state: withDigest || item.source === 'shared' ? 'want' : 'unknown',
         });
         return;
       default:
@@ -412,27 +433,41 @@ export class SyncEngine {
   }
 
   private async uploadOne(item: QueueItem): Promise<void> {
-    if (item.md5 === null || item.size === null) {
+    // A library original was hashed in its own pass, before the archive was
+    // asked whether it wanted the bytes. A shared asset arrives here without a
+    // digest by design — see applyCheckResult — and gets one from the download
+    // itself, which is the same read.
+    const shared = item.source === 'shared';
+    if (!shared && (item.md5 === null || item.size === null)) {
       await this.deps.store.update(item.localId, { state: 'unknown', nextAttemptAt: 0 });
       return;
     }
 
-    const resumable = item.size >= this.config.chunkThreshold;
-    this.report('uploading', `Uploading ${item.filename}`, true);
+    this.report('uploading', shared ? `Fetching ${item.filename}` : `Uploading ${item.filename}`, true);
 
     let opened: OpenedAsset;
     try {
-      opened = await this.deps.media.open(item, { hash: false });
+      opened = await this.deps.media.open(item, { hash: shared });
     } catch (e) {
       await this.blameItem(item, asSyncError(e, 'item'));
       return;
     }
 
     try {
+      // Whichever of the two reads produced it. For a library original the queue
+      // is the authority and `opened` was not asked to hash; for a shared asset
+      // there is nothing in the queue yet and the download is the only source.
+      const md5 = opened.md5 ?? item.md5;
+      if (md5 === null) {
+        throw new SyncError('the original arrived without a digest', 'item');
+      }
+
       // The declared digest and length have to describe the same read. If the
       // original changed since it was hashed, re-hash it instead of sending
-      // bytes the server is bound to reject five times over.
-      if (opened.size !== item.size) {
+      // bytes the server is bound to reject five times over. A shared asset has
+      // nothing to compare against: the size and the digest are both from the
+      // download that just happened, so they cannot disagree.
+      if (!shared && opened.size !== item.size) {
         await this.deps.store.update(item.localId, {
           state: 'unknown',
           size: null,
@@ -444,13 +479,18 @@ export class SyncEngine {
         return;
       }
 
+      const resumable = opened.size >= this.config.chunkThreshold;
+      if (shared) this.report('uploading', `Uploading ${item.filename}`, true);
+
       const request = {
         deviceId: this.config.deviceId,
         localId: item.localId,
         uri: opened.uri,
-        filename: item.filename,
-        md5: item.md5,
-        size: item.size,
+        // What the download turned out to be called, where it knew better than
+        // the queue did. See OpenedAsset.filename.
+        filename: opened.filename ?? item.filename,
+        md5,
+        size: opened.size,
         createdAt: item.createdAt,
         modifiedAt: item.modifiedAt,
         // Only a paired video carries this, and it is exactly what stops the
@@ -474,9 +514,17 @@ export class SyncEngine {
 
       // Only now, after the ack. A crash before this point costs one re-upload;
       // marking it earlier would cost the photo.
+      //
+      // The digest and the length are written down here as well as the state,
+      // which for a library original is what it already had and for a shared one
+      // is new: it is the record of what was sent, and it is what lets a later
+      // reopenDone() settle the item by content rather than by fetching it out
+      // of iCloud all over again.
       await this.deps.store.update(item.localId, {
         state: 'done',
         assetId: response.id,
+        size: opened.size,
+        md5,
         attempts: 0,
         nextAttemptAt: 0,
         lastError: null,

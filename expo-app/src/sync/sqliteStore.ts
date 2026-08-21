@@ -14,9 +14,13 @@ import {
 
 export const QUEUE_DATABASE = 'photobackup-queue.db';
 
+/** How many local ids one delete statement binds. Well under SQLite's ceiling. */
+const DELETE_BATCH = 400;
+
 type ItemRow = {
   local_id: string;
   kind: string;
+  source: string;
   parent_local_id: string | null;
   filename: string;
   created_at: number | null;
@@ -51,12 +55,13 @@ export class SqliteQueueStore implements QueueStore {
         // the queue keeps whatever state it has reached.
         const result = await this.db.runAsync(
           `insert or ignore into items
-             (local_id, kind, parent_local_id, filename, created_at, modified_at,
+             (local_id, kind, source, parent_local_id, filename, created_at, modified_at,
               size, md5, state, asset_id, attempts, next_attempt_at, last_error)
-           values (?, ?, ?, ?, ?, ?, null, null, 'pending', null, 0, 0, null)`,
+           values (?, ?, ?, ?, ?, ?, ?, null, null, 'pending', null, 0, 0, null)`,
           [
             item.localId,
             item.kind,
+            item.source,
             item.parentLocalId,
             item.filename,
             item.createdAt,
@@ -67,6 +72,32 @@ export class SqliteQueueStore implements QueueStore {
       }
     });
     return added;
+  }
+
+  async pruneShared(keep: string[]): Promise<number> {
+    const wanted = new Set(keep);
+    const rows = await this.db.getAllAsync<{ local_id: string }>(
+      `select local_id from items where source = 'shared' and state <> 'done'`
+    );
+    const doomed = rows.map((row) => row.local_id).filter((id) => !wanted.has(id));
+    if (doomed.length === 0) return 0;
+
+    // Read and diffed here rather than expressed as one `not in (…)` statement,
+    // because the set being kept is every asset in every chosen album — several
+    // thousand of them — and SQLite has a ceiling on how many parameters one
+    // statement may bind. The deletes are batched under it for the same reason.
+    let removed = 0;
+    await this.db.withTransactionAsync(async () => {
+      for (let at = 0; at < doomed.length; at += DELETE_BATCH) {
+        const batch = doomed.slice(at, at + DELETE_BATCH);
+        const result = await this.db.runAsync(
+          `delete from items where local_id in (${batch.map(() => '?').join(', ')})`,
+          batch
+        );
+        removed += result.changes;
+      }
+    });
+    return removed;
   }
 
   async due(state: ItemState, limit: number, now: number): Promise<QueueItem[]> {
@@ -180,6 +211,7 @@ async function createSchema(db: SQLite.SQLiteDatabase): Promise<void> {
     create table if not exists items (
       local_id        text primary key,
       kind            text    not null,
+      source          text    not null default 'library',
       parent_local_id text,
       filename        text    not null,
       created_at      integer,
@@ -198,6 +230,19 @@ async function createSchema(db: SQLite.SQLiteDatabase): Promise<void> {
       value text
     );
   `);
+
+  // Every queue that existed before shared albums did holds nothing but camera
+  // roll, so the default is the truth for every row already in it. The column is
+  // added rather than the table recreated because those rows are the record of
+  // what has already been archived, and losing them would re-upload a library.
+  await addColumn(db, 'source', "text not null default 'library'");
+}
+
+/** Adds a column to `items` unless it is already there. */
+async function addColumn(db: SQLite.SQLiteDatabase, name: string, definition: string): Promise<void> {
+  const columns = await db.getAllAsync<{ name: string }>('pragma table_info(items)');
+  if (columns.some((column) => column.name === name)) return;
+  await db.execAsync(`alter table items add column ${name} ${definition}`);
 }
 
 /** Patch field to column. Also the allowlist that keeps update() SQL-safe. */
@@ -216,6 +261,7 @@ function toItem(row: ItemRow): QueueItem {
   return {
     localId: row.local_id,
     kind: row.kind as ItemKind,
+    source: row.source === 'shared' ? 'shared' : 'library',
     parentLocalId: row.parent_local_id,
     filename: row.filename,
     createdAt: row.created_at,

@@ -47,6 +47,25 @@ export type PhotoKitLocation = {
   timestamp: string | null;
 };
 
+/**
+ * Who put a photograph into a shared album, as far as the phone will say.
+ *
+ * Every field is optional and the whole thing is null far more often than not:
+ * see cloudOwner() in the Swift for why this is read through an undocumented
+ * door and what happens when that door closes. `displayName` is the one to show
+ * — a name where there is one, an address where there is not, and never the
+ * hashed identifier, which is for telling two contributors apart rather than for
+ * telling anybody who they are.
+ */
+export type SharedContributor = {
+  firstName: string | null;
+  lastName: string | null;
+  email: string | null;
+  /** Stable per person across assets, and not a thing to put on screen. */
+  personId: string | null;
+  displayName: string | null;
+};
+
 export type PhotoKitFacts = {
   localId: string;
   /** The Hidden album: a decision a person made, and invisible in the file. */
@@ -75,6 +94,18 @@ export type PhotoKitFacts = {
   originalFilename: string | null;
   resources: ResourceFact[];
   location: PhotoKitLocation | null;
+  /**
+   * The shared albums this asset is in, by title. Empty for everything in the
+   * camera roll, which is nearly everything.
+   *
+   * Read here, at describe time, rather than carried down from the enumeration
+   * that queued the asset: the album is what the archive files the photograph
+   * under, and a title read weeks ago is a title that may since have been
+   * renamed.
+   */
+  sharedAlbums: string[];
+  /** Who added it, for an asset in somebody else's album. Usually null. */
+  contributor: SharedContributor | null;
 };
 
 /**
@@ -112,6 +143,8 @@ export type SharedAsset = PhotoKitAsset & {
   sourceTypes: OptionSetFact;
   /** Apple's constant names, one per PHAssetResource the asset carries. */
   resourceTypes: string[];
+  /** Who put it in the album, where the phone would say. See SharedContributor. */
+  contributor: SharedContributor | null;
 };
 
 /**
@@ -128,6 +161,8 @@ export type SharedAlbum = {
   /** The album's own span, as PhotoKit reports it. Milliseconds. */
   startDate: number | null;
   endDate: number | null;
+  /** Whose album it is, as opposed to who added any one photograph to it. */
+  owner: SharedContributor | null;
   assets: SharedAsset[];
 };
 
@@ -176,9 +211,48 @@ export type SharedFetchProgress = {
   fraction: number;
 };
 
+/**
+ * One shared asset, downloaded and kept.
+ *
+ * The digest is computed while the bytes go past rather than by reading the
+ * finished file, which is not a micro-optimization: it is what makes one trip to
+ * iCloud enough. The queue has to declare an MD5 the server will verify, and the
+ * only other ways to get one are to fetch the asset twice or to read every byte
+ * back off flash.
+ */
+export type SharedDownload = {
+  /** Where the bytes are. The caller's file now, including to delete. */
+  path: string;
+  bytes: number;
+  md5: string;
+  elapsedMs: number;
+  uniformTypeIdentifier: string | null;
+  /**
+   * What Apple calls the file, which is not always what PhotoKit calls the
+   * asset — a shared HEIC comes back re-encoded, and the name is the better
+   * evidence of what the bytes actually are.
+   */
+  originalFilename: string | null;
+  resourceType: string;
+};
+
+export type SharedDownloadResult =
+  | { ok: true; download: SharedDownload }
+  | { ok: false; failure: SharedFetchFailure };
+
+/**
+ * Which half of a shared Live Photo to read. `primary` is the asset itself and
+ * is what everything else asks for.
+ */
+export type SharedResourceWanted = 'primary' | 'pairedVideo';
+
 /** The flat dictionary the native side resolves, before it is given its shape. */
 type NativeFetchResult =
   | ({ ok: true } & SharedResourceRead)
+  | ({ ok: false } & SharedFetchFailure);
+
+type NativeDownloadResult =
+  | ({ ok: true } & SharedDownload)
   | ({ ok: false } & SharedFetchFailure);
 
 type PhotoFactsNativeModule = {
@@ -186,6 +260,11 @@ type PhotoFactsNativeModule = {
   enumerateAsync(limit: number): Promise<PhotoKitAsset[]>;
   sharedAlbumsAsync(): Promise<SharedAlbum[]>;
   fetchSharedResourceAsync(localId: string): Promise<NativeFetchResult | null>;
+  downloadSharedResourceAsync(
+    localId: string,
+    destination: string,
+    want: SharedResourceWanted
+  ): Promise<NativeDownloadResult | null>;
   md5ForFileAsync(uri: string): Promise<string>;
   addListener(
     event: 'onSharedFetchProgress',
@@ -210,6 +289,17 @@ export const hasPhotoFacts = native != null;
 function carries(name: keyof PhotoFactsNativeModule): boolean {
   return typeof native?.[name] === 'function';
 }
+
+/**
+ * Whether this build can read a shared asset's bytes at all.
+ *
+ * Asked because the two halves of the shared-album feature can be in a build
+ * separately, and the in-between state is quiet in the worst way: a dev client
+ * that carries the enumerator but not the downloader lists every album, lets
+ * them be ticked, and then fails every asset in them one at a time. This is what
+ * lets the screen say so first.
+ */
+export const canDownloadShared = carries('downloadSharedResourceAsync');
 
 /**
  * Everything PhotoKit knows about one asset, or null when this build has no
@@ -299,6 +389,59 @@ export async function photoKitReadSharedResource(
       ok: true,
       read: {
         bytes: result.bytes,
+        elapsedMs: result.elapsedMs,
+        uniformTypeIdentifier: result.uniformTypeIdentifier,
+        originalFilename: result.originalFilename,
+        resourceType: result.resourceType,
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    failure: {
+      domain: result.domain,
+      code: result.code,
+      message: result.message,
+      bytes: result.bytes,
+      elapsedMs: result.elapsedMs,
+    },
+  };
+}
+
+/**
+ * Reads one shared asset out of iCloud and keeps it at `destination`.
+ *
+ * The backup's version of photoKitReadSharedResource, and it answers in the same
+ * three ways for the same three reasons: a resolved failure for a fetch that did
+ * not work, null for a build that cannot do this or an identifier that no longer
+ * names anything, and a success carrying what came back.
+ *
+ * The file belongs to the caller from the moment this resolves, and so does
+ * deleting it. Nothing is left behind by a failure — see downloadResource() in
+ * the Swift for why a half-written original is worse than none.
+ */
+export async function photoKitDownloadSharedResource(
+  localId: string,
+  destination: string,
+  want: SharedResourceWanted = 'primary'
+): Promise<SharedDownloadResult | null> {
+  if (!carries('downloadSharedResourceAsync')) return null;
+
+  const result = await native!.downloadSharedResourceAsync(localId, destination, want);
+  if (!result) return null;
+
+  // Copied field by field rather than spread, for the reason
+  // photoKitReadSharedResource is: the two halves of the union share `bytes`,
+  // and a spread would carry a failure's partial count into a success and
+  // typecheck while doing it.
+  if (result.ok) {
+    return {
+      ok: true,
+      download: {
+        path: result.path,
+        bytes: result.bytes,
+        md5: result.md5,
         elapsedMs: result.elapsedMs,
         uniformTypeIdentifier: result.uniformTypeIdentifier,
         originalFilename: result.originalFilename,

@@ -109,3 +109,77 @@ func TestMalformedSidecarIsRefused(t *testing.T) {
 		t.Error("a truncated sidecar was accepted")
 	}
 }
+
+// The one piece of provenance a shared photograph has. Everything else about it
+// can be re-read off the file; this exists on the phone and nowhere else.
+func TestNormalizeReadsWhoSharedIt(t *testing.T) {
+	got, err := Normalize([]byte(`{
+		"favorite": false,
+		"photoKit": {
+			"sharedAlbums": ["Iceland"],
+			"contributor": {
+				"firstName": "Anna", "lastName": "Smith",
+				"email": "anna@example.com",
+				"personId": "9f3c",
+				"displayName": "Anna Smith"
+			}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if got.Contributor != "Anna Smith" {
+		t.Errorf("Contributor = %q, want the display name", got.Contributor)
+	}
+	if !bytes.Contains(got.Raw, []byte("Iceland")) {
+		t.Error("the shared album title did not survive into Raw")
+	}
+}
+
+// A phone that found a name but no display name still knows who it was, and a
+// panel that said nothing there would be losing the fact over a formatting
+// preference.
+func TestAContributorWithNoDisplayNameIsStillNamed(t *testing.T) {
+	got, err := Normalize([]byte(`{"photoKit":{"contributor":{"firstName":"Anna","lastName":"Smith"}}}`))
+	if err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if got.Contributor != "Anna Smith" {
+		t.Errorf("Contributor = %q, want the two names joined", got.Contributor)
+	}
+}
+
+// An address is a poor label and a better one than nothing, which is the same
+// call the phone makes before it gets here.
+func TestAContributorKnownOnlyByAddress(t *testing.T) {
+	got, err := Normalize([]byte(`{"photoKit":{"contributor":{"email":"anna@example.com"}}}`))
+	if err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if got.Contributor != "anna@example.com" {
+		t.Errorf("Contributor = %q, want the address", got.Contributor)
+	}
+}
+
+// The hash tells two contributors apart and identifies neither, so it must
+// never become the name on screen.
+func TestAHashedIdentifierIsNotAName(t *testing.T) {
+	got, err := Normalize([]byte(`{"photoKit":{"contributor":{"personId":"9f3c0b"}}}`))
+	if err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if got.Contributor != "" {
+		t.Errorf("Contributor = %q, want nothing showable", got.Contributor)
+	}
+}
+
+// Every asset off this phone's own camera, which is nearly all of them.
+func TestAnAssetNobodySharedHasNoContributor(t *testing.T) {
+	got, err := Normalize([]byte(`{"favorite": true, "photoKit": {"hasAdjustments": true}}`))
+	if err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if got.Contributor != "" {
+		t.Errorf("Contributor = %q, want empty", got.Contributor)
+	}
+}

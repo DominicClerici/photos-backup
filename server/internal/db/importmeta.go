@@ -434,11 +434,21 @@ func applyAlbums(ctx context.Context, tx pgx.Tx, assetID, source string, albums 
 	return nil
 }
 
-// AssetExtras are the parts of an asset that live in their own tables, fetched
-// only for a single open asset rather than for every tile on a page.
+// AssetExtras are the parts of an asset that are too expensive or too rarely
+// wanted to load with every tile on a page, fetched for a single open asset.
 type AssetExtras struct {
 	Albums []string
 	People []string
+	// Contributor is who added this photograph to a shared album, and empty for
+	// everything else — which is nearly everything. See photokit.Contributor.
+	//
+	// Read out of the stored sidecar rather than off a column of its own,
+	// because the archive shows it and does nothing else with it: it does not
+	// sort, filter, group or search on it, and modelling a field is a claim that
+	// something does. Reading it here also means it inherits the one property
+	// that matters most — a hidden photograph's sidecar is scrubbed, so a name
+	// cannot leak out of the vault through this panel.
+	Contributor string
 }
 
 func (s *Store) AssetExtras(ctx context.Context, assetID string) (AssetExtras, error) {
@@ -456,6 +466,19 @@ func (s *Store) AssetExtras(ctx context.Context, assetID string) (AssetExtras, e
 	const people = `select name from asset_people where asset_id = $1::uuid order by name`
 	if err := collect(ctx, s, people, assetID, &out.People); err != nil {
 		return out, fmt.Errorf("load people for %s: %w", assetID, err)
+	}
+
+	sidecar, err := s.ImportSidecar(ctx, assetID)
+	if err != nil {
+		return out, fmt.Errorf("load the sidecar for %s: %w", assetID, err)
+	}
+	// A sidecar that will not parse is not this handler's problem. It was
+	// written by an importer, it is stored verbatim, and the panel it feeds is
+	// worth more open with one row missing than refused.
+	if len(sidecar) > 0 {
+		if parsed, err := photokit.Normalize(sidecar); err == nil {
+			out.Contributor = parsed.Contributor
+		}
 	}
 	return out, nil
 }

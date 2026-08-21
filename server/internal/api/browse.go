@@ -323,6 +323,9 @@ type assetDetail struct {
 	Archived    bool     `json:"archived,omitempty"`
 	Albums      []string `json:"albums,omitempty"`
 	People      []string `json:"people,omitempty"`
+	// Contributor is who added this to a shared album on the phone it came off.
+	// Empty on everything else, which is nearly everything.
+	Contributor string `json:"contributor,omitempty"`
 
 	// HasOverlay says the renditions above are composites, and that the plain
 	// routes will answer for this asset. It is the whole of what the viewer
@@ -386,6 +389,7 @@ func (s *Server) handleAssetDetail(w http.ResponseWriter, r *http.Request) {
 		Archived:        asset.Archived,
 		Albums:          extras.Albums,
 		People:          extras.People,
+		Contributor:     extras.Contributor,
 		HasOverlay:      asset.OverlayAssetID != nil,
 		State:           asset.DerivedState,
 		PlaybackState:   asset.PlaybackState,

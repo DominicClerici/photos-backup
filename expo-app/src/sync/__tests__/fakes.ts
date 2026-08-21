@@ -126,7 +126,7 @@ export function twoRound(second: 'have' | 'want'): CheckResponder {
     });
 }
 
-export type FakeFile = { size: number; md5: string };
+export type FakeFile = { size: number; md5: string; filename?: string };
 
 export class FakeMedia implements MediaSource {
   readonly opens: { localId: string; hash: boolean }[] = [];
@@ -155,6 +155,9 @@ export class FakeMedia implements MediaSource {
       uri: `file:///fake/${item.localId}`,
       size: file.size,
       md5: opts.hash ? file.md5 : null,
+      // Only where the fake was given one, so an ordinary item goes on being
+      // named by the queue — which is what every library asset does.
+      filename: file.filename,
       release: async () => {
         this.releases.push(item.localId);
       },
@@ -215,6 +218,8 @@ export function photoKit(overrides: Partial<PhotoKitFacts> = {}): PhotoKitFacts 
       },
     ],
     location: null,
+    sharedAlbums: [],
+    contributor: null,
     ...overrides,
   };
 }
@@ -223,6 +228,7 @@ export function asset(localId: string, overrides: Partial<EnumeratedAsset> = {})
   return {
     localId,
     kind: 'still',
+    source: 'library',
     parentLocalId: null,
     filename: `${localId}.HEIC`,
     createdAt: 1_600_000_000_000,
@@ -235,6 +241,7 @@ export function queued(localId: string, overrides: Partial<QueueItem> = {}): Que
   return {
     localId,
     kind: 'still',
+    source: 'library',
     parentLocalId: null,
     filename: `${localId}.HEIC`,
     createdAt: 1_600_000_000_000,

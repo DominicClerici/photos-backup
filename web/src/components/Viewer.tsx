@@ -704,6 +704,13 @@ function MetadataPanel({
           <Row label="Duration">{formatDuration(detail.duration)}</Row>
         ) : null}
 
+        {detail.contributor ? (
+          <Row label="Added by">
+            {detail.contributor}
+            <span className={PANEL_HINT}>from a shared album</span>
+          </Row>
+        ) : null}
+
         {camera ? <Row label="Camera">{camera}</Row> : null}
         {detail.lens ? <Row label="Lens">{detail.lens}</Row> : null}
 

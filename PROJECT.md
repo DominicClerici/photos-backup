@@ -1119,6 +1119,83 @@ will never link again — and an undone join lands in `dismissed` rather than ba
 in `pending`, because a pending set of segments would be re-joined by the worker
 within the minute and the undo would appear not to have worked.
 
+### Phase 16 — Shared albums
+
+An iCloud Shared Album is not in the photo library. `PHFetchOptions` defaults to
+`typeUserLibrary`, so the enumerator that has read this camera roll since Phase 2
+cannot see one however it is sorted or predicated: shared assets exist only
+inside collections of subtype `albumCloudShared`, and the way to them is through
+the collection. Which meant that for fifteen phases, every photograph anybody
+else had shared with this phone — and every one this phone had shared back — was
+invisible to the backup and to the archive.
+
+**The survey answered the question that decides whether any of this is worth
+doing.** Apple documents a 2,048-pixel cap on the long edge of anything in a
+shared album, which would make the shared copy a downscale and archiving it a
+matter of keeping a thumbnail. Measured on this phone: **4,400 of 4,700 shared
+stills are above it.** Whatever the documentation says, what is actually sitting
+in these albums is at or near original resolution, and worth having.
+
+**Nothing is backed up until an album is ticked.** The picker was built during
+the survey, where an unanswered question could safely default to "all of them"
+because looking cost nothing. Ticking an album now means uploading it, so the
+default inverted: an empty selection is the honest starting state. The cost is
+stated rather than hidden — an album joined next month is not archived until
+somebody ticks it.
+
+**Shared assets go in the same queue, and the queue grew a column to say so.**
+`items.source` is `library` or `shared`, and it is stored rather than derived
+because the distinction outlives the run that discovered it: nothing about a
+local identifier says which of the two it names, and an item queued today is
+opened by a run tomorrow. Everything else — the states, the backoff, the circuit
+breaker, resume after a kill — is the machinery that already worked, unchanged.
+
+**A shared asset never enters the hashing state, and that is the whole design.**
+The Phase 2 rule is that the phone must not hash 100GB to discover the server
+already has it, so an item is checked by local id first and hashed only if the
+answer is inconclusive. For a shared asset the rule inverts: there is no local
+original, so *reading it is downloading it from iCloud*, and hashing before
+uploading would fetch every shared photograph from Apple twice. So it goes
+straight from the first check to the upload path, and the native download hashes
+the bytes as they stream past — one trip, both answers. The price is that the
+archive is never asked whether it already holds this content, and it is small:
+Apple re-encodes what goes into a shared album, so its copy rarely matches
+anything already archived, and the upload is content-addressed and refuses to
+store the same bytes twice regardless.
+
+**One download at a time, through a gate that breathes.** Three upload workers
+each opening whatever the queue handed them is right for a LAN and wrong for
+Apple. `SharedFetchGate` serializes the downloads and stretches the pause between
+them as failures accumulate, shrinking it again as they stop — the arithmetic
+the survey's pacer already used, shared with it so the two cannot drift apart.
+The retrying itself stays with the engine: a second retry loop nested inside the
+first would multiply the two and take an hour to declare one asset failed.
+
+**The album is the filing and the contributor is the provenance.** A shared
+photograph arrives filed under the shared album's title, in the same
+`ios-photokit` namespace as any other album off this phone — nothing on the
+server records that it was shared, which is deliberate. What is recorded is who
+added it, in the sidecar, surfaced as one row in the viewer's panel. That name is
+the only provenance a shared photograph has: Apple re-encodes the file, so there
+is no maker note to read, and the name is gone the day the album is left.
+
+**Getting it means reading a key Apple does not document.** PhotoKit has no
+public property for the contributor — the Photos app draws the name under every
+asset in a shared album, and there is no supported way to ask for it. So it is
+read by KVC, and every read is guarded by `responds(to:)` first, because
+`value(forKey:)` on a key the class does not have raises an Objective-C exception
+that Swift cannot catch: an unguarded read of a key Apple renames is not a
+missing name, it is the app going down mid-backup. This is not App Store code and
+could not be. The trade is a name that would otherwise be lost against a private
+key that may stop working, in which case the row goes quiet and nothing else
+changes.
+
+**What the resource is called outranks what the asset is called.** PhotoKit goes
+on calling a shared asset `IMG_4021.HEIC` after iCloud has handed over a JPEG,
+and the server trusts a recognised extension over the sniffed bytes. Left alone,
+every shared JPEG in the archive would be stored and served as a HEIC. The
+upload is named after the resource Apple actually sent.
+
 ### v2
 
 - **ML service.** Python, CLIP semantic search, then face detection and clustering.

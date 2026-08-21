@@ -9,13 +9,19 @@ import {
 } from 'expo-media-library';
 
 import {
+  photoKitDownloadSharedResource,
   photoKitEnumerate,
   photoKitFacts,
   photoKitMd5,
+  photoKitSharedAlbums,
   type PhotoKitAsset,
   type PhotoKitFacts,
   type PhotoKitLocation,
+  type SharedAsset,
 } from '../../modules/photo-facts';
+import { SharedFetchGate } from '../sharedalbums/gate';
+import { describeFailure } from '../sharedalbums/run';
+import { assetsOf } from '../sharedalbums/summary';
 import { sweepChunks } from './chunked';
 import {
   errorText,
@@ -45,7 +51,43 @@ export const LIVE_SUFFIX = '#live';
  */
 const LIVE_DIRECTORY = 'livephotos';
 
+/**
+ * Where shared-album downloads are kept between arriving and being uploaded.
+ *
+ * Separate from the Live Photo cache above because the two are cleaned on the
+ * same schedule and confused by nothing: both are temporary copies this app
+ * made, both are swept at the start of a run, and telling them apart in a
+ * directory listing is worth the extra constant.
+ */
+const SHARED_DIRECTORY = 'sharedalbums';
+
+/** Apple's names for the resource behind a Live Photo's motion. */
+const PAIRED_VIDEO_RESOURCES = ['pairedVideo', 'fullSizePairedVideo'];
+
+/**
+ * How the media source is told which shared albums are being backed up.
+ *
+ * A list of PHAssetCollection identifiers, and an empty one means none — which
+ * is the default, and is the whole of what keeps this feature off for anyone who
+ * has not chosen an album. There is no "all" here on purpose: what "all" means
+ * changes every time somebody joins an album, and that decision belongs to the
+ * screen where it can be seen, not to the enumerator.
+ */
+export type SharedAlbumOptions = {
+  albumIds?: string[];
+  /** The pacing shared with nothing else. Injected only by tests. */
+  gate?: SharedFetchGate;
+};
+
 export class PhotoKitMediaSource implements MediaSource {
+  private readonly sharedAlbumIds: string[];
+  private readonly gate: SharedFetchGate;
+
+  constructor(options: SharedAlbumOptions = {}) {
+    this.sharedAlbumIds = options.albumIds ?? [];
+    this.gate = options.gate ?? new SharedFetchGate();
+  }
+
   /**
    * Lists the newest assets, adding a second queue entry for each Live Photo's
    * paired video.
@@ -68,6 +110,7 @@ export class PhotoKitMediaSource implements MediaSource {
       assets.push({
         localId: entry.localId,
         kind: entry.kind,
+        source: 'library',
         parentLocalId: null,
         filename,
         createdAt: entry.createdAt,
@@ -79,16 +122,80 @@ export class PhotoKitMediaSource implements MediaSource {
       assets.push({
         localId: entry.localId + LIVE_SUFFIX,
         kind: 'live_video',
+        source: 'library',
         parentLocalId: entry.localId,
         filename: pairedVideoName(filename),
         createdAt: entry.createdAt,
         modifiedAt: entry.modifiedAt,
       });
     }
+
+    assets.push(...(await this.enumerateShared()));
+    return assets;
+  }
+
+  /**
+   * Everything in the shared albums that were chosen, as queue entries.
+   *
+   * `maxItems` does not reach here, and that is not an oversight. It exists to
+   * cap a camera roll of tens of thousands for a deliberately limited test run;
+   * a shared album is a handful of collections somebody has ticked by hand, and
+   * silently backing up the newest slice of a chosen album would be a worse
+   * answer than either backing it up or not.
+   *
+   * Deduplicated across albums, because an asset in three of them is one thing
+   * to fetch and one row in the queue — the three album titles are recovered at
+   * describe time, from the asset itself, and all three are recorded.
+   *
+   * Nothing here may fail the enumeration, which is the one step of a run that
+   * cannot degrade: an empty list is a backup that does nothing, and it must not
+   * be possible for a shared album to be the reason the camera roll went
+   * unarchived. A build with no shared-album enumerator in it, and a lookup that
+   * blew up, both add nothing and let the rest of the run happen. Neither is
+   * silent for long — the items they did not offer are dropped from the queue
+   * and re-offered by the next run that can see them.
+   */
+  private async enumerateShared(): Promise<EnumeratedAsset[]> {
+    if (this.sharedAlbumIds.length === 0) return [];
+
+    const albums = await quietly(() => photoKitSharedAlbums(), null);
+    if (albums === null) return [];
+
+    const wanted = new Set(this.sharedAlbumIds);
+    const assets: EnumeratedAsset[] = [];
+
+    for (const asset of assetsOf(albums.filter((album) => wanted.has(album.localId)))) {
+      const filename = asset.filename ?? asset.localId;
+      assets.push({
+        localId: asset.localId,
+        kind: asset.kind,
+        source: 'shared',
+        parentLocalId: null,
+        filename,
+        createdAt: asset.createdAt,
+        modifiedAt: asset.modifiedAt,
+      });
+
+      // Queued only where iCloud actually kept one. A shared Live Photo whose
+      // motion was not shared is an ordinary still, and an entry for a clip that
+      // does not exist would fail five times before parking itself as failed.
+      if (!hasPairedVideo(asset)) continue;
+
+      assets.push({
+        localId: asset.localId + LIVE_SUFFIX,
+        kind: 'live_video',
+        source: 'shared',
+        parentLocalId: asset.localId,
+        filename: pairedVideoName(filename),
+        createdAt: asset.createdAt,
+        modifiedAt: asset.modifiedAt,
+      });
+    }
     return assets;
   }
 
   async open(item: QueueItem, opts: { hash: boolean }): Promise<OpenedAsset> {
+    if (item.source === 'shared') return this.openShared(item);
     return item.kind === 'live_video' ? this.openPairedVideo(item, opts) : this.openOriginal(item, opts);
   }
 
@@ -129,9 +236,75 @@ export class PhotoKitMediaSource implements MediaSource {
     return {
       favorite,
       subtypes: subtypes.map((subtype) => String(subtype)),
-      albums: titles.filter((title) => title.trim() !== ''),
+      // The two lists come from different places and mean the same thing. The
+      // library's albums arrive through expo-media-library, which cannot see a
+      // shared album at all; the shared ones come off PHAsset directly. Merging
+      // them here is what files a shared photograph under its album name on the
+      // server without the archive ever being told it was shared.
+      albums: albumTitles(titles, photoKit?.sharedAlbums ?? []),
       location: assetLocation(location, photoKit?.location ?? null),
       photoKit,
+    };
+  }
+
+  /**
+   * Fetches one shared asset out of iCloud and leaves it in a file of our own.
+   *
+   * The one path in this class where opening an asset is a network request, and
+   * everything unusual about it follows from that.
+   *
+   * `opts.hash` is ignored, because the digest costs nothing here: the bytes go
+   * past the hasher on their way to the file, so the answer is already in hand
+   * by the time the download finishes. That is also why a shared item never
+   * passes through the queue's hashing state — doing so would fetch every shared
+   * asset from Apple twice, once to hash and once to send.
+   *
+   * Every download goes through the gate, which serializes them and paces them
+   * against how much trouble iCloud has been giving. See sharedalbums/gate.ts.
+   */
+  private async openShared(item: QueueItem): Promise<OpenedAsset> {
+    const paired = item.kind === 'live_video';
+    const assetId = paired ? item.parentLocalId : item.localId;
+    if (!assetId) {
+      throw new SyncError('a shared paired video has no parent asset recorded', 'item');
+    }
+
+    const directory = sharedDirectory();
+    directory.create({ intermediates: true, idempotent: true });
+    const destination = new File(directory, cacheName(item.localId));
+
+    const result = await this.gate.run(() =>
+      photoKitDownloadSharedResource(assetId, destination.uri, paired ? 'pairedVideo' : 'primary')
+    );
+
+    // Null is this build, not this asset — the same meaning it carries
+    // everywhere in the native module's façade. Charged to the item anyway,
+    // because there is nothing else here to charge it to and the run has to keep
+    // going; the alternative is a shared album that fails the whole backup.
+    if (result === null) {
+      throw new SyncError(
+        `this build cannot download shared assets, or ${assetId} is no longer in a shared album`,
+        'item'
+      );
+    }
+    if (!result.ok) {
+      throw new SyncError(
+        `iCloud would not hand over ${item.filename}: ${describeFailure(result.failure)}`,
+        'item'
+      );
+    }
+
+    const { download } = result;
+    return {
+      uri: destination.uri,
+      size: download.bytes,
+      md5: download.md5,
+      // Apple's name for what it actually sent, which outranks PhotoKit's name
+      // for the asset. See OpenedAsset.filename.
+      filename: download.originalFilename ?? undefined,
+      release: async () => {
+        deleteQuietly(destination);
+      },
     };
   }
 
@@ -227,11 +400,11 @@ export class PhotoKitMediaSource implements MediaSource {
   async sweep(): Promise<number> {
     let removed = sweepChunks();
 
-    const directory = liveDirectory();
-    if (!directory.exists) return removed;
-
-    for (const entry of directory.list()) {
-      if (entry instanceof File && deleteQuietly(entry)) removed += 1;
+    for (const directory of [liveDirectory(), sharedDirectory()]) {
+      if (!directory.exists) continue;
+      for (const entry of directory.list()) {
+        if (entry instanceof File && deleteQuietly(entry)) removed += 1;
+      }
     }
     return removed;
   }
@@ -239,6 +412,31 @@ export class PhotoKitMediaSource implements MediaSource {
 
 function liveDirectory(): Directory {
   return new Directory(Paths.cache, LIVE_DIRECTORY);
+}
+
+function sharedDirectory(): Directory {
+  return new Directory(Paths.cache, SHARED_DIRECTORY);
+}
+
+/** True when iCloud kept the motion half of a shared Live Photo. */
+function hasPairedVideo(asset: SharedAsset): boolean {
+  return asset.resourceTypes.some((type) => PAIRED_VIDEO_RESOURCES.includes(type));
+}
+
+/**
+ * The albums an asset is in, from both places that know, once each.
+ *
+ * Deduplicated because a title is the whole identity of an album on the server —
+ * sending "Iceland" twice would be one album either way, and asking twice is
+ * still two round trips.
+ */
+function albumTitles(library: string[], shared: string[]): string[] {
+  const titles = new Set<string>();
+  for (const title of [...library, ...shared]) {
+    const trimmed = title.trim();
+    if (trimmed !== '') titles.add(trimmed);
+  }
+  return [...titles];
 }
 
 /**

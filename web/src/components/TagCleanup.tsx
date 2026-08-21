@@ -78,7 +78,7 @@ export function TagCleanup() {
   const [tab, setTab] = useState<Tab>("keep");
   const { counts, setCounts, error: countsError } = useTagCounts();
   const apply = useCallback((next: TagCounts) => setCounts(next), [setCounts]);
-  const passes = useTagPasses(apply);
+  const passes = useTagPasses(counts, apply);
 
   return (
     <div className="flex h-dvh flex-col">

@@ -43,6 +43,18 @@ export class MemoryQueueStore implements QueueStore {
     return added;
   }
 
+  async pruneShared(keep: string[]): Promise<number> {
+    const wanted = new Set(keep);
+    let removed = 0;
+    for (const item of [...this.items.values()]) {
+      if (item.source !== 'shared' || item.state === 'done') continue;
+      if (wanted.has(item.localId)) continue;
+      this.items.delete(item.localId);
+      removed += 1;
+    }
+    return removed;
+  }
+
   async due(state: ItemState, limit: number, now: number): Promise<QueueItem[]> {
     return [...this.items.values()]
       .filter((item) => item.state === state && item.nextAttemptAt <= now)

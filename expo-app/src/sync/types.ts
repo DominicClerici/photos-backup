@@ -9,6 +9,21 @@ import type { PhotoKitFacts } from '../../modules/photo-facts';
 export type ItemKind = 'still' | 'video' | 'live_video';
 
 /**
+ * Where an item's bytes come from, which is a different question from what kind
+ * of thing it is.
+ *
+ * `library` is the camera roll: the original is on the flash of this phone and
+ * opening it is a file read. `shared` is an iCloud Shared Album, where there is
+ * no original on the phone at all — only Apple's rendition of somebody else's
+ * upload, reachable by asking iCloud for it over the network.
+ *
+ * It is stored rather than derived because the difference outlives the run that
+ * discovered it: an item queued today is opened by a run tomorrow, and nothing
+ * about a local identifier says which of the two it names.
+ */
+export type ItemSource = 'library' | 'shared';
+
+/**
  * Every state is durable. There is deliberately no "in flight" state: the engine
  * is the only writer and JavaScript is single-threaded, so nothing needs
  * unwinding after a kill. An item resumes from its last recorded state and
@@ -28,6 +43,7 @@ export type QueueItem = {
   /** Opaque. A Live Photo's paired video uses `<localId>#live`. */
   localId: string;
   kind: ItemKind;
+  source: ItemSource;
   parentLocalId: string | null;
   filename: string;
   createdAt: number | null;
@@ -47,7 +63,7 @@ export type QueueItem = {
 
 export type NewItem = Pick<
   QueueItem,
-  'localId' | 'kind' | 'parentLocalId' | 'filename' | 'createdAt' | 'modifiedAt'
+  'localId' | 'kind' | 'source' | 'parentLocalId' | 'filename' | 'createdAt' | 'modifiedAt'
 >;
 
 export type ItemPatch = Partial<
@@ -96,6 +112,26 @@ export interface QueueStore {
    * back to done, and only what is genuinely missing goes on to upload.
    */
   reopenDone(): Promise<number>;
+  /**
+   * Drops unfinished shared items that this enumeration did not offer, and
+   * returns how many went.
+   *
+   * What makes it necessary is that the queue is additive: enqueue() is `insert
+   * or ignore`, so a row that entered it once stays until it is done or failed.
+   * That is right for the camera roll, where a photograph nobody deleted is
+   * still there next run. It is wrong for a shared album, where two things
+   * happen that have no equivalent locally — somebody unticks the album, and
+   * somebody else removes a photograph from it. Without this, an unticked album
+   * would go on uploading everything a previous run had already queued out of
+   * it, which is the checkbox meaning nothing.
+   *
+   * `done` rows are kept, and they are the reason this can be safe: they are the
+   * record that the archive holds the photograph, so re-ticking the album settles
+   * them in one check rather than fetching them all again. Everything dropped is
+   * work that had not finished, and dropping it costs at most doing that work
+   * later.
+   */
+  pruneShared(keep: string[]): Promise<number>;
 }
 
 export type CheckStatus = 'have' | 'unknown' | 'want';
@@ -248,6 +284,18 @@ export type OpenedAsset = {
   uri: string;
   size: number;
   md5: string | null;
+  /**
+   * What the file should be called on the way to the archive, where opening it
+   * turned out to know better than the queue did.
+   *
+   * Only a shared asset sets it, and the reason is the archive's file naming: a
+   * shared HEIC comes back from iCloud re-encoded, PhotoKit goes on calling the
+   * asset IMG_4021.HEIC, and the server trusts a recognised extension over the
+   * bytes. Left alone, every shared JPEG in the archive would be stored and
+   * served as a HEIC. The resource Apple actually handed over knows its own
+   * name; this is it.
+   */
+  filename?: string;
   release: () => Promise<void>;
 };
 

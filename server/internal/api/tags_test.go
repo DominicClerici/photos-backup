@@ -218,6 +218,50 @@ func TestTriageKeepsWhatItLearnedBeforeAFailure(t *testing.T) {
 	}
 }
 
+// A word struck out before the pass ever ran is answered, and the pass leaves
+// it alone.
+//
+// The loop the review screen runs is "call again while untriaged is above
+// zero", so a word this query could never finish with is not a wasted forward
+// pass but a pass that never ends: selected every time because it has no triage
+// stamp, skipped every time because PutTriage will not overrule a person, and
+// counted every time because it is still waiting. The progress bar stops short
+// of its own total and the Analyse button never goes away.
+func TestTriageLeavesAWordAPersonAlreadyJudged(t *testing.T) {
+	h := newHarness(t)
+	ml := newFakeML(t)
+	h.srv.ML = mlclient.New(ml.URL)
+	ids := intern(t, h, "dog", "login")
+
+	// Struck out from the Words tab before anything analysed it: judged_at is
+	// set and triaged_at is still null.
+	h.postJSON(t, "/v1/tags/judge", fmt.Sprintf(`{"ids":[%d],"junk":true}`, ids["login"]))
+
+	res := h.postJSON(t, "/v1/tags/triage", `{}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("triage = %s", res.Status)
+	}
+	var out struct {
+		Triaged int64         `json:"triaged"`
+		Counts  tagCountsBody `json:"counts"`
+	}
+	decode(t, res, &out)
+
+	if out.Triaged != 1 {
+		t.Errorf("triaged = %d, want only the word nobody had answered", out.Triaged)
+	}
+	if out.Counts.Untriaged != 0 {
+		t.Errorf("untriaged = %d, want the pass to be able to finish", out.Counts.Untriaged)
+	}
+	if len(ml.sizes) != 1 || ml.sizes[0] != 1 {
+		t.Errorf("asked the captioner about %v words, want one: the other was already answered", ml.sizes)
+	}
+	// And the person's verdict is untouched by a pass that ran around it.
+	if out.Counts.Junk != 1 {
+		t.Errorf("junk = %d, want the struck-out word still struck out", out.Counts.Junk)
+	}
+}
+
 // The two review lists, and the third state that is on neither of them.
 func TestTagWordsAreTwoListsAndAMergeIsOnNeither(t *testing.T) {
 	h := newHarness(t)

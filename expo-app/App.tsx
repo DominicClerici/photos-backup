@@ -23,7 +23,7 @@ import {
   saveCachedStats,
   type CachedStats,
 } from './src/stats/cache';
-import type { SharedAsset } from './modules/photo-facts';
+import { canDownloadShared, type SharedAsset } from './modules/photo-facts';
 import { fetchSharedAssets } from './src/sharedalbums/fetch';
 import type { FetchRun, SampleRead } from './src/sharedalbums/run';
 import { loadSelection, saveSelection } from './src/sharedalbums/selection';
@@ -90,8 +90,8 @@ export default function App() {
   const [library, setLibrary] = useState<SharedLibrary | null>(null);
   const [surveying, setSurveying] = useState(false);
   const [surveyError, setSurveyError] = useState<string | null>(null);
-  /** The albums chosen for import, or null while nobody has chosen any. */
-  const [chosenIds, setChosenIds] = useState<string[] | null>(loadSelection);
+  /** The shared albums ticked for backup. Empty until somebody ticks one. */
+  const [chosenIds, setChosenIds] = useState<string[]>(loadSelection);
   const [sampleSize, setSampleSize] = useState(SAMPLE_SIZE);
   const [fetchRun, setFetchRun] = useState<FetchRun | null>(null);
   const [fetchingSamples, setFetchingSamples] = useState(false);
@@ -302,17 +302,14 @@ export default function App() {
   }, []);
 
   /**
-   * The albums a fetch would draw from: the chosen ones, or all of them while
-   * nothing has been chosen.
+   * The albums the backup will take, which is exactly the ones that are ticked.
    *
-   * Null is not the same as empty here. Nobody having chosen means everything is
-   * in, which is the right default for a backup — an album joined next month
-   * should not be excluded by a decision made before it existed. Choosing
-   * nothing means nothing, and is left to mean it.
+   * Nothing is in by default. See src/sharedalbums/selection.ts: while this was
+   * a survey an unanswered question could mean "all of them" for free, and now
+   * that ticking an album uploads it, it cannot.
    */
   const chosenAlbums = useMemo(() => {
     if (!library) return [];
-    if (chosenIds === null) return library.albums;
     const wanted = new Set(chosenIds);
     return library.albums.filter((album) => wanted.has(album.localId));
   }, [library, chosenIds]);
@@ -334,15 +331,13 @@ export default function App() {
 
   const toggleAlbum = useCallback(
     (localId: string) => {
-      // Starting from every album rather than from nothing, because until the
-      // first tap the selection *is* every album, and a tap meaning "not that
-      // one" must not be read as "only that one".
-      const base = chosenIds ?? library?.albums.map((album) => album.localId) ?? [];
       chooseAlbums(
-        base.includes(localId) ? base.filter((id) => id !== localId) : [...base, localId]
+        chosenIds.includes(localId)
+          ? chosenIds.filter((id) => id !== localId)
+          : [...chosenIds, localId]
       );
     },
-    [chosenIds, library, chooseAlbums]
+    [chosenIds, chooseAlbums]
   );
 
   /**
@@ -389,7 +384,10 @@ export default function App() {
       const instance = new SyncEngine(
         {
           store,
-          media: new PhotoKitMediaSource(),
+          // The ticked albums, read at the moment the run starts rather than
+          // held by the source: enumeration happens once per run, and a run
+          // already going should finish the set it was started on.
+          media: new PhotoKitMediaSource({ albumIds: chosenIds }),
           transport: new HttpTransport(() => serverUrl.current, () => deviceToken.current, log),
           clock: systemClock,
           onProgress: setProgress,
@@ -422,7 +420,7 @@ export default function App() {
         await refreshStats();
       }
     },
-    [store, credential, config.maxItems, refreshQueue, refreshStats, unpair]
+    [store, credential, config.maxItems, chosenIds, refreshQueue, refreshStats, unpair]
   );
 
   const pause = useCallback(() => {
@@ -612,9 +610,10 @@ export default function App() {
 
         <Section title="Shared albums">
           <Text style={styles.muted}>
-            iCloud Shared Albums are not in the library the backup enumerates — they live in
-            collections of their own, and nothing has ever archived them. This looks at what is
-            there before anything is built to send it.
+            iCloud Shared Albums live in collections of their own, outside the library the
+            backup enumerates. Tick the ones to archive: their photos join the ordinary
+            backup, filed under the album&rsquo;s name, with whoever added each one recorded
+            beside it.
           </Text>
           <Pressable
             style={[styles.button, (!granted || surveying) && styles.buttonDisabled]}
@@ -633,6 +632,14 @@ export default function App() {
             </Text>
           )}
 
+          {library?.supported && library.albums.length > 0 && !canDownloadShared && (
+            <Text style={styles.warning}>
+              This dev client can list shared albums but not fetch them, so ticking one would
+              queue photos that every run then fails on. Rebuild it with{' '}
+              <Text style={styles.code}>pnpm ios</Text> first.
+            </Text>
+          )}
+
           {library && !library.supported && (
             <Text style={styles.warning}>
               This dev client has no shared-album enumerator in it. Rebuild it with{' '}
@@ -645,6 +652,13 @@ export default function App() {
               No shared albums on this phone — so there is nothing missing from the backup,
               and nothing here to decide about. Shared Albums can also be switched off
               entirely under Settings › Photos, which looks exactly like this.
+            </Text>
+          )}
+
+          {chosenIds.length > 0 && !library && (
+            <Text style={styles.muted}>
+              {formatCount(chosenIds.length)} album(s) are ticked from a previous session and
+              will be backed up by the next run. Survey to see them.
             </Text>
           )}
 
@@ -809,17 +823,17 @@ function AlbumPicker({
   onChoose,
 }: {
   albums: AlbumSummary[];
-  chosen: string[] | null;
+  chosen: string[];
   onToggle: (localId: string) => void;
   onChoose: (ids: string[]) => void;
 }) {
-  const isChosen = (localId: string) => chosen === null || chosen.includes(localId);
+  const isChosen = (localId: string) => chosen.includes(localId);
   const count = albums.filter((album) => isChosen(album.localId)).length;
 
   return (
     <>
       <View style={styles.subheadingRow}>
-        <Text style={styles.subheadingPlain}>albums to import</Text>
+        <Text style={styles.subheadingPlain}>albums to back up</Text>
         <Pressable onPress={() => onChoose(albums.map((album) => album.localId))}>
           <Text style={styles.linkText}>all</Text>
         </Pressable>
@@ -829,7 +843,7 @@ function AlbumPicker({
       </View>
       <Text style={styles.muted}>
         {count} of {albums.length} chosen
-        {chosen === null && ' — everything, until something is unticked'}
+        {count === 0 && ' — nothing shared is backed up until one is ticked'}
       </Text>
 
       {albums.map((album) => (

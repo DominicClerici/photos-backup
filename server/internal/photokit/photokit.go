@@ -39,6 +39,56 @@ type Sidecar struct {
 	// false when it could not ask, so absent and "not hidden" read the same
 	// here and differ only in the sidecar kept beside this.
 	Hidden bool `json:"hidden"`
+	// PhotoKit is everything the phone read straight off PHAsset, nested as the
+	// app sends it. Almost all of it stays in Raw and is not modelled; the one
+	// field pulled out of it is the contributor, for the reason below.
+	PhotoKit *Facts `json:"photoKit"`
+}
+
+// Facts is the nested block, reduced to the part this package reads.
+//
+// Everything else PHAsset answered — the burst, the resource inventory, the
+// playback style — is deliberately absent and lives on in Raw. Adding a field
+// here is a claim that the archive does something with it.
+type Facts struct {
+	Contributor *Contributor `json:"contributor"`
+}
+
+// Contributor is the person who put a photograph into an iCloud Shared Album.
+//
+// It is the only provenance a shared photograph has. The file carries nothing:
+// Apple re-encodes what goes into a shared album, so there is no maker note and
+// no owner field to read, and the name exists on the phone and nowhere else —
+// until the album is left, after which it exists nowhere. That is what earns it
+// a modelled field where the burst identifier does not.
+//
+// DisplayName is the phone's own choice of what to call them: a name where there
+// was one, an address where there was not. The rest is kept for the same reason
+// the sidecar is kept whole — so that a later idea about people, or a merge with
+// the face tags, has something to work from.
+type Contributor struct {
+	DisplayName string `json:"displayName"`
+	FirstName   string `json:"firstName"`
+	LastName    string `json:"lastName"`
+	Email       string `json:"email"`
+	// PersonID is a hash. It tells two contributors apart and identifies
+	// neither, and it is never a thing to put on a screen.
+	PersonID string `json:"personId"`
+}
+
+// Name is who to say added the photograph, or empty where nobody is named.
+func (c *Contributor) Name() string {
+	if c == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(c.DisplayName); name != "" {
+		return name
+	}
+	full := strings.TrimSpace(strings.TrimSpace(c.FirstName) + " " + strings.TrimSpace(c.LastName))
+	if full != "" {
+		return full
+	}
+	return strings.TrimSpace(c.Email)
 }
 
 type Location struct {
@@ -74,6 +124,9 @@ type Metadata struct {
 	Subtypes []string
 	GPSLat   *float64
 	GPSLon   *float64
+	// Contributor is who added this to a shared album, and empty for everything
+	// that came off the phone's own camera. See the type.
+	Contributor string
 }
 
 // Normalize reads one sidecar.
@@ -85,6 +138,9 @@ func Normalize(raw []byte) (Metadata, error) {
 
 	m := Metadata{Raw: json.RawMessage(raw), Favorite: s.Favorite, Hidden: s.Hidden}
 	m.GPSLat, m.GPSLon = s.Location.Coordinates()
+	if s.PhotoKit != nil {
+		m.Contributor = s.PhotoKit.Contributor.Name()
+	}
 	for _, subtype := range s.Subtypes {
 		if name := strings.TrimSpace(subtype); name != "" {
 			m.Subtypes = append(m.Subtypes, name)

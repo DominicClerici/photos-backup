@@ -70,14 +70,25 @@ export function useTagCounts() {
  *
  * Closing the tab stops it and loses nothing: the resume point is a column.
  */
-export function useTagPasses(apply: (counts: TagCounts) => void) {
+export function useTagPasses(counts: TagCounts | null, apply: (counts: TagCounts) => void) {
   const [running, setRunning] = useState<"triage" | "embed" | null>(null);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   // Set on unmount, and checked between calls. Without it, navigating away
   // during a two-minute pass leaves a loop firing requests at a page nobody is
   // looking at — and, worse, one that goes on calling setState.
+  //
+  // Cleared on mount as well as set on unmount, and that half is not
+  // symmetry-for-its-own-sake: StrictMode mounts, unmounts and mounts again in
+  // development, so a ref that is only ever set latches on the first simulated
+  // unmount and stays latched for the life of the page. Every pass then stops
+  // after one slice, having written it, with the banner stuck at 0/0 and the
+  // counts never updating — the loop still running, and nothing on screen
+  // saying so.
   const stopped = useRef(false);
-  useEffect(() => () => void (stopped.current = true), []);
+  useEffect(() => {
+    stopped.current = false;
+    return () => void (stopped.current = true);
+  }, []);
 
   const run = useCallback(
     async (
@@ -88,7 +99,16 @@ export function useTagPasses(apply: (counts: TagCounts) => void) {
     ) => {
       setRunning(kind);
       let done = 0;
-      let total = 0;
+      // Seeded from the figure the page is already showing, so the bar is a
+      // real fraction from the first frame. Learning the total from the first
+      // response instead means 0/0 for however long one slice takes — six
+      // seconds of the captioner, which is exactly the moment somebody is
+      // looking to see whether the button did anything.
+      //
+      // A floor rather than a promise: the loop raises it below if the work
+      // turns out to be more than the counts said.
+      let total = counts ? left(counts) : 0;
+      setProgress({ done, total });
       try {
         for (;;) {
           const out = await call();
@@ -113,7 +133,7 @@ export function useTagPasses(apply: (counts: TagCounts) => void) {
         }
       }
     },
-    [apply],
+    [apply, counts],
   );
 
   const analyse = useCallback(

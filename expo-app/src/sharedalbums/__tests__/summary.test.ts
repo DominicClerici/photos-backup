@@ -24,12 +24,20 @@ function asset(overrides: Partial<SharedAsset> = {}): SharedAsset {
     durationSeconds: 0,
     sourceTypes: { value: 2, names: ['typeCloudShared'] },
     resourceTypes: ['photo'],
+    contributor: null,
     ...overrides,
   };
 }
 
 function album(assets: SharedAsset[], title = 'Iceland'): SharedAlbum {
-  return { localId: `ph://album-${title}`, title, startDate: null, endDate: null, assets };
+  return {
+    localId: `ph://album-${title}`,
+    title,
+    startDate: null,
+    endDate: null,
+    owner: null,
+    assets,
+  };
 }
 
 describe('summarize', () => {

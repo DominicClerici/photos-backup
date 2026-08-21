@@ -24,12 +24,11 @@
 // against a phone with iCloud Photos off — the resource inventory below is
 // metadata PhotoKit already holds, not a request for any of it.
 //
-// fetchSharedResourceAsync is the one exception, and it is narrow on purpose: an
-// iCloud Shared Album asset has no local original for the rule to protect. The
-// phone holds a cached rendition of somebody else's upload and nothing else, so
-// a fetch is the only way to read one at all, and the function is unreachable
-// for anything that is not in a shared album. The rule above is unchanged for
-// every asset it was written about.
+// The two shared-album fetches are the exception, and they are narrow on
+// purpose: an iCloud Shared Album asset has no local original for the rule to
+// protect. The phone holds a cached rendition of somebody else's upload and
+// nothing else, so a fetch is the only way to read one at all. The rule above is
+// unchanged for every asset it was written about.
 //
 // The module also carries two things the sync engine cannot get cheaply from
 // expo-media-library, and they are here rather than in a module of their own
@@ -49,8 +48,8 @@
 //                       reach the queue as this item's failure rather than as a
 //                       hash of nothing.
 //
-// And two more for the shared-album survey, which is scaffolding rather than
-// backup: nothing in the sync engine calls either of these yet.
+// And three more for the shared albums, which stopped being scaffolding: the
+// sync engine enumerates them, downloads them and uploads what comes back.
 //
 //   sharedAlbumsAsync         never throws, like the enumerator it sits beside.
 //                             A phone with Shared Albums switched off has none,
@@ -67,6 +66,16 @@
 //                             how many bytes had arrived before it gave up.
 //                             Zero bytes is never mistaken for success, because
 //                             `ok` says which of the two it is.
+//   downloadSharedResourceAsync
+//                             the same fetch, kept rather than counted, and the
+//                             one the backup runs on. It writes to a path the
+//                             caller owns and hashes as the bytes go past, so a
+//                             single trip to iCloud yields both the file to
+//                             upload and the digest to declare it by — where
+//                             fetching and then hashing separately would mean
+//                             asking Apple for the same photograph twice. Its
+//                             failures are data for the same reason the other's
+//                             are, and a failed download leaves no file behind.
 //
 // It also emits the module's one event, onSharedFetchProgress, while a fetch is
 // in flight. A shared video takes seconds to come down from iCloud and a run of
@@ -77,6 +86,7 @@ import CoreLocation
 import CryptoKit
 import ExpoModulesCore
 import Foundation
+import ObjectiveC
 import Photos
 
 /// Hashing runs on a queue of its own.
@@ -111,6 +121,11 @@ private let photoFactsErrorDomain = "PhotoFacts"
 /// No photo, video or audio resource on the asset at all. Nothing to fetch, and
 /// nothing a retry would change.
 private let noResourceCode = 404
+
+/// The bytes arrived and could not be written down: no room, no permission, a
+/// path that is not there. Apple's side of the transfer worked, so this is
+/// reported as ours.
+private let notWrittenCode = 507
 
 public class PhotoFactsModule: Module {
   public func definition() -> ModuleDefinition {
@@ -153,6 +168,20 @@ public class PhotoFactsModule: Module {
         return
       }
       fetchResource(of: asset, localId: localId, promise: promise) { body in
+        self?.sendEvent(sharedFetchProgressEvent, body)
+      }
+    }
+
+    // The same fetch, kept rather than counted. See downloadResource().
+    AsyncFunction("downloadSharedResourceAsync") {
+      [weak self] (localId: String, destination: String, want: String, promise: Promise) in
+      guard let asset = findAsset(localId) else {
+        promise.resolve()
+        return
+      }
+      downloadResource(
+        of: asset, localId: localId, destination: destination, want: want, promise: promise
+      ) { body in
         self?.sendEvent(sharedFetchProgressEvent, body)
       }
     }
@@ -308,6 +337,8 @@ private func sharedAlbums() -> [[String: Any?]] {
       "title": collection.localizedTitle,
       "startDate": milliseconds(collection.startDate),
       "endDate": milliseconds(collection.endDate),
+      // Whose album it is, as opposed to who put any one photograph in it.
+      "owner": cloudOwner(of: collection),
       "assets": assets
     ])
   }
@@ -342,29 +373,60 @@ private func describeShared(_ asset: PHAsset) -> [String: Any?] {
     // Expected to be exactly ["typeCloudShared"] for everything in here.
     // Carried anyway, because "expected" is what a survey is for.
     "sourceTypes": sourceType(of: asset),
-    "resourceTypes": resources.map { resourceTypeName($0.type) }
+    "resourceTypes": resources.map { resourceTypeName($0.type) },
+    // The only provenance a shared photograph has. See cloudOwner().
+    "contributor": cloudOwner(of: asset)
   ]
 }
 
-/// The running totals for one fetch, and the decision about when to report them.
+/// Everything one fetch in flight has to keep: the bytes, the digest, the file
+/// they are being written to, and the decision about when to report progress.
 ///
 /// A lock, where the byte handler on its own would have needed none: PhotoKit
 /// delivers data on one queue and download progress on another, and the two
-/// touch the same counters. Each mutation hands back the body to send, or nil
-/// when the last report was too recent to follow.
-private final class FetchProgress {
+/// touch the same counters.
+///
+/// The file handle is optional because the two callers want different halves of
+/// this. The survey counts bytes and keeps none of them; the backup keeps every
+/// one and needs its MD5, and needs it computed here rather than by a second
+/// pass over the file — the digest is wanted for a declaration the server will
+/// verify, and re-reading a 40MB video off flash to get it is a cost with no
+/// purpose. Hashing only when there is somewhere to write is what keeps the
+/// survey as cheap as it was.
+private final class SharedFetchSink {
   private let lock = NSLock()
   private let localId: String
+  private let handle: FileHandle?
+  private var hasher = Insecure.MD5()
   private var bytes = 0
   private var fraction = 0.0
   private var reportedAt = 0.0
+  /// The first write that failed. Kept rather than thrown: this runs inside
+  /// PhotoKit's delivery handler, where there is nobody to throw to, and the
+  /// completion handler is where a caller is listening.
+  private var writeFailure: Error?
 
-  init(localId: String) {
+  init(localId: String, writingTo handle: FileHandle? = nil) {
     self.localId = localId
+    self.handle = handle
   }
 
-  func received(_ count: Int) -> [String: Any?]? {
-    return update { self.bytes += count }
+  func received(_ data: Data) -> [String: Any?]? {
+    return update {
+      self.bytes += data.count
+      guard let handle = self.handle else { return }
+      self.hasher.update(data: data)
+      // Only the first failure is recorded. Once the file is short, every
+      // subsequent write is failing for the same reason, and the last of them
+      // is no more informative than the first.
+      if self.writeFailure == nil {
+        do {
+          try handle.write(contentsOf: data)
+        } catch {
+          self.writeFailure = error
+        }
+      }
+    }
   }
 
   func downloaded(_ value: Double) -> [String: Any?]? {
@@ -375,6 +437,20 @@ private final class FetchProgress {
     lock.lock()
     defer { lock.unlock() }
     return bytes
+  }
+
+  func failedToWrite() -> Error? {
+    lock.lock()
+    defer { lock.unlock() }
+    return writeFailure
+  }
+
+  /// The digest of everything written, and the end of the file. Call once.
+  func finish() -> String {
+    lock.lock()
+    defer { lock.unlock() }
+    try? handle?.close()
+    return hasher.finalize().map { String(format: "%02hhx", $0) }.joined()
   }
 
   private func update(_ change: () -> Void) -> [String: Any?]? {
@@ -427,7 +503,7 @@ private func fetchResource(
     return
   }
 
-  let progress = FetchProgress(localId: localId)
+  let progress = SharedFetchSink(localId: localId)
 
   let options = PHAssetResourceRequestOptions()
   options.isNetworkAccessAllowed = true
@@ -446,7 +522,7 @@ private func fetchResource(
     for: resource,
     options: options,
     dataReceivedHandler: { data in
-      if let body = progress.received(data.count) { onProgress(body) }
+      if let body = progress.received(data) { onProgress(body) }
     },
     completionHandler: { error in
       let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - started) * 1000.0).rounded())
@@ -504,6 +580,142 @@ private func fetchFailure(
   ]
 }
 
+/// Reads one shared asset out of iCloud and writes it where the caller asked.
+///
+/// The backup's version of fetchResource above, and the differences are the
+/// point of having two. This one keeps the bytes, hashes them as they go past,
+/// and hands back the digest with the file — because the queue has to declare an
+/// MD5 the server will check, and the alternatives are both worse than doing it
+/// here: fetching once to hash and again to upload asks Apple for the same
+/// photograph twice, and hashing the finished file afterwards re-reads every
+/// byte off flash for a number that was already in hand.
+///
+/// The file is the caller's from the moment this resolves — including the
+/// caller's to delete. What this owns is the failed case: a download that did
+/// not finish leaves nothing behind, because a half-written file that survived
+/// would be a plausible-looking original with a digest that matches nothing, and
+/// the retry that follows would be uploading it.
+///
+/// `want` names which half of a Live Photo to read. Everything else asks for the
+/// asset itself; a paired video asks for the clip, and there is no sense in
+/// which the still would do instead — so a missing one is a failure rather than
+/// a fallback.
+private func downloadResource(
+  of asset: PHAsset,
+  localId: String,
+  destination: String,
+  want: String,
+  promise: Promise,
+  onProgress: @escaping ([String: Any?]) -> Void
+) {
+  let resources = PHAssetResource.assetResources(for: asset)
+  let wanted = want == wantPairedVideo
+    ? pairedVideoResource(from: resources)
+    : primaryResource(from: resources)
+
+  guard let resource = wanted else {
+    promise.resolve(fetchFailure(
+      domain: photoFactsErrorDomain,
+      code: noResourceCode,
+      message: want == wantPairedVideo
+        ? "the asset carries no paired video"
+        : "the asset carries no photo, video or audio resource",
+      bytes: 0,
+      elapsedMs: 0
+    ))
+    return
+  }
+
+  let url = fileURL(from: destination)
+  guard let handle = createFile(at: url) else {
+    promise.resolve(fetchFailure(
+      domain: photoFactsErrorDomain,
+      code: notWrittenCode,
+      message: "could not open \(url.path) for writing",
+      bytes: 0,
+      elapsedMs: 0
+    ))
+    return
+  }
+
+  let sink = SharedFetchSink(localId: localId, writingTo: handle)
+
+  let options = PHAssetResourceRequestOptions()
+  options.isNetworkAccessAllowed = true
+  options.progressHandler = { (fraction: Double) in
+    if let body = sink.downloaded(fraction) { onProgress(body) }
+  }
+
+  let started = CFAbsoluteTimeGetCurrent()
+
+  PHAssetResourceManager.default().requestData(
+    for: resource,
+    options: options,
+    dataReceivedHandler: { data in
+      if let body = sink.received(data) { onProgress(body) }
+    },
+    completionHandler: { error in
+      let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - started) * 1000.0).rounded())
+      let received = sink.count()
+      let writeFailure = sink.failedToWrite()
+      let md5 = sink.finish()
+
+      if let error {
+        let ns = error as NSError
+        discard(url)
+        promise.resolve(fetchFailure(
+          domain: ns.domain, code: ns.code, message: ns.localizedDescription,
+          bytes: received, elapsedMs: elapsedMs))
+        return
+      }
+
+      // Apple's half worked and ours did not, which is worth saying in our own
+      // domain: a full disk is not a reason to back off iCloud, and a caller
+      // that could not tell them apart would treat it as one.
+      if let writeFailure {
+        discard(url)
+        promise.resolve(fetchFailure(
+          domain: photoFactsErrorDomain, code: notWrittenCode,
+          message: "could not write \(url.lastPathComponent): \(writeFailure.localizedDescription)",
+          bytes: received, elapsedMs: elapsedMs))
+        return
+      }
+
+      let downloaded: [String: Any?] = [
+        "ok": true,
+        "path": url.path,
+        "bytes": received,
+        "md5": md5,
+        "elapsedMs": elapsedMs,
+        "uniformTypeIdentifier": resource.uniformTypeIdentifier,
+        "originalFilename": resource.originalFilename,
+        "resourceType": resourceTypeName(resource.type)
+      ]
+      promise.resolve(downloaded)
+    }
+  )
+}
+
+/// What the caller passes to ask for a Live Photo's clip instead of its still.
+private let wantPairedVideo = "pairedVideo"
+
+/// Truncates anything already there and opens it for writing, or nil when the
+/// path cannot be written to at all.
+private func createFile(at url: URL) -> FileHandle? {
+  let manager = FileManager.default
+  try? manager.createDirectory(
+    at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+  guard manager.createFile(atPath: url.path, contents: nil) else { return nil }
+  return try? FileHandle(forWritingTo: url)
+}
+
+/// Removes a download that did not finish. Failures here are deliberately
+/// silent: the caller is already being told about a failed fetch, and a file
+/// that could not be deleted is the sweep's problem rather than this one's.
+private func discard(_ url: URL) {
+  try? FileManager.default.removeItem(at: url)
+}
+
 /// The resource carrying the asset itself, as opposed to a thumbnail, an
 /// adjustment, or a Live Photo's paired clip.
 ///
@@ -515,6 +727,124 @@ private func primaryResource(from resources: [PHAssetResource]) -> PHAssetResour
     return full
   }
   return resources.first { $0.type == .photo || $0.type == .video || $0.type == .audio }
+}
+
+/// The clip behind a Live Photo, full-size where iCloud kept one.
+private func pairedVideoResource(from resources: [PHAssetResource]) -> PHAssetResource? {
+  if let full = resources.first(where: { $0.type == .fullSizePairedVideo }) {
+    return full
+  }
+  return resources.first { $0.type == .pairedVideo }
+}
+
+// MARK: - Who shared it
+
+/// A shared photograph was put there by somebody, and PhotoKit will not say who
+/// through any documented door.
+///
+/// The Photos app draws the name under every asset in a shared album, so the
+/// phone plainly knows it; what it does not have is a public property to read it
+/// from. PHAsset carries it in an undocumented one, which leaves a choice
+/// between reading that and losing the only piece of provenance a shared
+/// photograph has — a name that exists nowhere else, in nobody's EXIF, and not
+/// at all once the album is left.
+///
+/// So it is read by key, and every read is guarded twice. `responds(to:)` is
+/// asked before the value is, because a `value(forKey:)` for a key the class
+/// does not have raises an Objective-C exception, and a Swift `do/catch` cannot
+/// catch one: an unguarded read of a key Apple renames is not a missing name, it
+/// is the app going down while somebody is backing up. And several spellings are
+/// tried, because the exact one is not something this file can verify — the
+/// first that answers wins, and an iOS that answers to none reports no
+/// contributor at all, which every caller already handles.
+///
+/// This is not App Store code and could not be. It is a personal archive, built
+/// against a dev client, and the trade is a name that would otherwise be lost
+/// against a private key that may stop working — in which case the field goes
+/// quiet and nothing else changes.
+private let contributorFirstNameKeys = ["cloudOwnerFirstName"]
+private let contributorLastNameKeys = ["cloudOwnerLastName"]
+private let contributorEmailKeys = ["cloudOwnerEmail", "cloudOwnerEmailAddress"]
+private let contributorIdentifierKeys = ["cloudOwnerHashedPersonID", "cloudOwnerHashedPersonId"]
+
+/// Who owns the asset or album, or nil where nothing answered.
+///
+/// Nil rather than a dictionary of nulls: "this build could not find out" and
+/// "this photograph has no contributor" are the same absence to everything
+/// downstream, and neither is worth a row in a panel.
+private func cloudOwner(of object: NSObject) -> [String: Any?]? {
+  let first = firstAnswer(from: object, keys: contributorFirstNameKeys)
+  let last = firstAnswer(from: object, keys: contributorLastNameKeys)
+  let email = firstAnswer(from: object, keys: contributorEmailKeys)
+  let identifier = firstAnswer(from: object, keys: contributorIdentifierKeys)
+
+  let name = [first, last].compactMap { $0 }.joined(separator: " ")
+  // The identifier is deliberately not a fallback for the name. It is a hash,
+  // so it identifies the same person across assets without ever being something
+  // to show anybody, and a panel reading "Added by 9f3c…" would be worse than
+  // one saying nothing.
+  let displayName = !name.isEmpty ? name : email
+
+  if displayName == nil && identifier == nil {
+    return nil
+  }
+  return [
+    "firstName": first,
+    "lastName": last,
+    "email": email,
+    "personId": identifier,
+    "displayName": displayName
+  ]
+}
+
+/// The first of these keys the object answers to with something worth having.
+private func firstAnswer(from object: NSObject, keys: [String]) -> String? {
+  for key in keys {
+    if let value = readString(object, key) {
+      return value
+    }
+  }
+  return nil
+}
+
+/// One key, read only if the object has it. See the note above on why the guard
+/// is a `responds(to:)` rather than a `try`.
+private func readString(_ object: NSObject, _ key: String) -> String? {
+  guard object.responds(to: NSSelectorFromString(key)) else {
+    return nil
+  }
+  guard let value = object.value(forKey: key) as? String else {
+    return nil
+  }
+  let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+  return trimmed.isEmpty ? nil : trimmed
+}
+
+/// The shared albums this asset is in, by title.
+///
+/// The album name is the other half of a shared photograph's provenance, and it
+/// is the half the archive files on — so it has to be answerable per asset, at
+/// the point the upload is being described, rather than only from the
+/// enumeration that queued it weeks earlier.
+///
+/// Guarded on the source type because the fetch is not free and the answer is
+/// empty for everything in the camera roll, which is nearly everything this is
+/// called for.
+private func sharedAlbumTitles(of asset: PHAsset) -> [String] {
+  guard asset.sourceType.contains(.typeCloudShared) else {
+    return []
+  }
+
+  let collections = PHAssetCollection.fetchAssetCollectionsContaining(
+    asset, with: .album, options: nil)
+
+  var titles: [String] = []
+  collections.enumerateObjects { collection, _, _ in
+    guard collection.assetCollectionSubtype == .albumCloudShared else { return }
+    guard let title = collection.localizedTitle, !title.isEmpty else { return }
+    titles.append(title)
+  }
+  return titles
 }
 
 // MARK: - Hashing
@@ -589,7 +919,11 @@ private func facts(of asset: PHAsset) -> [String: Any?] {
     "hasAdjustments": hasAdjustments,
     "originalFilename": originalFilename(from: resources),
     "resources": described,
-    "location": location(of: asset)
+    "location": location(of: asset),
+    // Both empty for anything off this camera, and both irrecoverable for
+    // anything that came out of somebody else's album. See cloudOwner().
+    "sharedAlbums": sharedAlbumTitles(of: asset),
+    "contributor": cloudOwner(of: asset)
   ]
 }
 

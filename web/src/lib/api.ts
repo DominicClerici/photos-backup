@@ -70,6 +70,15 @@ export interface AssetDetail {
   albums?: string[];
   people?: string[];
   /**
+   * Who put this into an iCloud Shared Album, on the phone it came off.
+   *
+   * Absent on everything else, which is nearly everything. It is the only
+   * provenance a shared photograph has — Apple re-encodes what goes into a
+   * shared album, so there is nothing in the file that knows, and the name is
+   * gone the day the album is left.
+   */
+  contributor?: string;
+  /**
    * A Snapchat memory: the photograph and the caption layer drawn over it are
    * two archived files, and every rendition the server serves is the two
    * composed. Absent on everything else. It is the whole of what the viewer

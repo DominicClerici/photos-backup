@@ -25,6 +25,7 @@ function asset(overrides: Partial<SharedAsset> = {}): SharedAsset {
     durationSeconds: 0,
     sourceTypes: { value: 2, names: ['typeCloudShared'] },
     resourceTypes: ['photo'],
+    contributor: null,
     ...overrides,
   };
 }

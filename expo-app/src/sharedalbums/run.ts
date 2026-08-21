@@ -131,7 +131,7 @@ export class Pacer {
 
   /** How long to wait before starting the next asset. */
   gapMs(): number {
-    return Math.min(MAX_GAP_MS, Math.round(CALM_GAP_MS * 2 ** this.strain));
+    return strainedGapMs(this.strain);
   }
 
   beginAsset(): void {
@@ -180,7 +180,21 @@ export class Pacer {
   }
 }
 
-function strainCeiling(): number {
+/**
+ * The pause between two fetches at a given level of strain: the calm gap
+ * doubled once per failure, up to the ceiling.
+ *
+ * Exported because the backup paces itself the same way and must not pace itself
+ * *differently* — two ideas of how hard iCloud may be leaned on, drifting apart
+ * over releases, is exactly the kind of thing nobody would notice going wrong.
+ * See src/sharedalbums/gate.ts.
+ */
+export function strainedGapMs(strain: number): number {
+  return Math.min(MAX_GAP_MS, Math.round(CALM_GAP_MS * 2 ** strain));
+}
+
+/** Where doubling the gap stops making any difference. */
+export function strainCeiling(): number {
   return Math.ceil(Math.log2(MAX_GAP_MS / CALM_GAP_MS));
 }
 

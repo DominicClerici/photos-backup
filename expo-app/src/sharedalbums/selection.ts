@@ -1,5 +1,5 @@
 /**
- * Which shared albums are meant to be imported.
+ * Which shared albums are being backed up.
  *
  * A decision rather than a cache, which is what separates this from
  * src/stats/cache.ts: nothing recomputes it, and losing the file loses something
@@ -11,11 +11,14 @@
  * that matches no album on the phone selects nothing, and is dropped the next
  * time a selection is saved.
  *
- * Null and empty are different answers and the file preserves both. Nobody has
- * chosen yet means every album is in, which is the right default for a backup —
- * a new album should not be silently excluded because it appeared after the
- * choosing. Somebody has chosen nothing means nothing, and must not be quietly
- * turned back into everything.
+ * Nothing is in until it is ticked, and an empty list is the honest starting
+ * state rather than a missing answer. That is a change from what this file said
+ * while the shared albums were only being surveyed, where an unanswered question
+ * defaulted to "all of them" because looking at everything cost nothing. Ticking
+ * an album now means uploading it, and a default that quietly enrolled every
+ * album on the phone — including one joined months from now, by somebody else —
+ * would be a backup nobody asked for. The cost is the honest one: an album
+ * joined later is not backed up until it is ticked.
  */
 
 import { File, Paths } from 'expo-file-system';
@@ -24,15 +27,15 @@ const SELECTION_FILE = new File(Paths.document, 'photobackup-shared-albums.json'
 
 type Stored = { albumIds: string[] };
 
-/** The chosen album ids, or null when no choice has ever been made. */
-export function loadSelection(): string[] | null {
+/** The chosen album ids, and empty when nothing has been chosen. */
+export function loadSelection(): string[] {
   try {
-    if (!SELECTION_FILE.exists) return null;
+    if (!SELECTION_FILE.exists) return [];
     const parsed = JSON.parse(SELECTION_FILE.textSync()) as Partial<Stored>;
-    if (!Array.isArray(parsed?.albumIds)) return null;
+    if (!Array.isArray(parsed?.albumIds)) return [];
     return parsed.albumIds.filter((id): id is string => typeof id === 'string');
   } catch {
-    return null;
+    return [];
   }
 }
 
