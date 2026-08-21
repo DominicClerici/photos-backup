@@ -245,6 +245,63 @@ func (c *Client) Recognize(ctx context.Context, images [][]byte) (Recognitions, 
 	return out, nil
 }
 
+// Judgement is one word of the tag vocabulary, judged.
+//
+// Score is P(junk) rather than a bit, and it is stored: ML_IMAGES.md §9's
+// cleanup is reviewed by a person, and the order to read a thousand verdicts in
+// is "what was the model surest about", because a confident wrong answer is the
+// one worth catching.
+type Judgement struct {
+	Word  string  `json:"word"`
+	Junk  bool    `json:"junk"`
+	Score float32 `json:"score"`
+}
+
+// Judgements is a batch of them, and the model that made them.
+type Judgements struct {
+	Model   string      `json:"model"`
+	Results []Judgement `json:"results"`
+	TookMS  float64     `json:"took_ms"`
+}
+
+// MaxBatch is how many items go in one request to any of the list routes.
+//
+// It mirrors photo-ml's PHOTO_ML_MAX_BATCH default, which every route there is
+// bounded by. Raising it on the service without raising it here costs nothing;
+// the reverse is a 413, which mlclient reports as an ordinary error because it
+// is one — a batch too large is a caller's mistake and not an outage.
+const MaxBatch = 32
+
+// Triage asks whether these words are worth keeping — ML_IMAGES.md §9, the
+// stage before the merge.
+//
+// A claim rather than an answer, in the way Parse is: the Go side writes these
+// verdicts only where nobody has given one, and a person confirms them. See
+// db.PutTriage.
+//
+// Answers come back in the order the words went in, and the count is checked
+// for the reason Describe checks it: a service that answered about thirty-one
+// of thirty-two words would otherwise have its verdicts written against the
+// wrong words from that point on, silently.
+func (c *Client) Triage(ctx context.Context, words []string) (Judgements, error) {
+	var out Judgements
+	if len(words) == 0 {
+		return out, nil
+	}
+	if err := c.post(ctx, "/triage", map[string]any{"words": words}, &out); err != nil {
+		return out, err
+	}
+	if len(out.Results) != len(words) {
+		return out, fmt.Errorf("photo-ml judged %d of %d words", len(out.Results), len(words))
+	}
+	for i, r := range out.Results {
+		if r.Word != words[i] {
+			return out, fmt.Errorf("photo-ml answered about %q where %q was asked", r.Word, words[i])
+		}
+	}
+	return out, nil
+}
+
 // Parse asks the small instruct model what a typed sentence was asking for.
 //
 // The answer is a claim, not a parse. internal/searchquery owns the grammar

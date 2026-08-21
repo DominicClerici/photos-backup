@@ -1,4 +1,4 @@
-"""The HTTP surface: /health, /embed, /describe, /ocr and /parse.
+"""The HTTP surface: /health, /embed, /describe, /ocr, /parse and /triage.
 
 All five of ML_IMAGES.md §6, and the shape the file was written to take. Every
 route borrows its model through the same Residency, so what separates the
@@ -72,6 +72,17 @@ class ImagesRequest(BaseModel):
     compare them."""
 
     images: list[str] = Field(description="base64-encoded image bytes")
+
+
+class TriageRequest(BaseModel):
+    """Words from the tag vocabulary, to be judged useful or not.
+
+    Strings rather than ids: this service knows nothing about the archive, and a
+    tag id would be a fact about a database it has never connected to. photod
+    matches the answers back by position — see db.PutTriage.
+    """
+
+    words: list[str] = Field(description="tag names to judge")
 
 
 class ParseRequest(BaseModel):
@@ -298,6 +309,38 @@ def build(settings: Settings) -> FastAPI:
             results = _guard("ocr", lambda: model.read(images))
         return {
             "model": textrec.MODEL_NAME,
+            "results": results,
+            "took_ms": round((time.perf_counter() - started) * 1000, 1),
+        }
+
+    @app.post("/triage")
+    def triage(req: TriageRequest) -> dict:
+        """Which of these words are worth keeping — ML_IMAGES.md §9, stage one.
+
+        The captioner marking its own homework, and the same weights the
+        /describe route borrows: no second checkpoint, no second entry in the
+        residency table, and no second nine gigabytes competing for the card.
+        See captioner.judge() for why the answer is read off logits instead of
+        generated.
+
+        A claim rather than an answer, in exactly the way /parse is. photod
+        writes these verdicts only where nobody has given one, a person reviews
+        them in two lists, and approving is what turns them into the archive
+        owner's own opinion. See internal/db/tags.go.
+        """
+        require(CAPTION)
+        if not req.words:
+            raise HTTPException(400, "nothing to judge")
+        if len(req.words) > settings.max_batch:
+            raise HTTPException(
+                413, f"{len(req.words)} words in one request; the limit is {settings.max_batch}"
+            )
+
+        started = time.perf_counter()
+        with residency.use(CAPTION) as model:
+            results = _guard("triage", lambda: model.judge(list(req.words)))
+        return {
+            "model": cap.MODEL_NAME,
             "results": results,
             "took_ms": round((time.perf_counter() - started) * 1000, 1),
         }

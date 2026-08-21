@@ -1,6 +1,6 @@
 import { usePermissions } from 'expo-media-library';
 import { StatusBar } from 'expo-status-bar';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -23,12 +23,23 @@ import {
   saveCachedStats,
   type CachedStats,
 } from './src/stats/cache';
-import { readSamples, surveySharedAlbums, type SampleRead } from './src/sharedalbums/survey';
+import type { SharedAsset } from './modules/photo-facts';
+import { fetchSharedAssets } from './src/sharedalbums/fetch';
+import type { FetchRun, SampleRead } from './src/sharedalbums/run';
+import { loadSelection, saveSelection } from './src/sharedalbums/selection';
+import { surveySharedAlbums } from './src/sharedalbums/survey';
 import {
+  assetsOf,
   formatDuration,
+  pickSample,
+  SAMPLE_SIZE,
+  SAMPLE_SIZES,
   STILL_LONG_EDGE_CAP,
+  summarize,
   throughputMbPerSecond,
   VIDEO_SECONDS_CAP,
+  type AlbumSummary,
+  type SharedLibrary,
   type SharedSurvey,
 } from './src/sharedalbums/summary';
 import { formatAge, formatBytes, formatCount, formatLastBackup } from './src/stats/format';
@@ -76,10 +87,13 @@ export default function App() {
   const [pairError, setPairError] = useState<string | null>(null);
   const [galleryCheck, setGalleryCheck] = useState<CheckResult | null>(null);
   const [checkingGallery, setCheckingGallery] = useState(false);
-  const [survey, setSurvey] = useState<SharedSurvey | null>(null);
+  const [library, setLibrary] = useState<SharedLibrary | null>(null);
   const [surveying, setSurveying] = useState(false);
   const [surveyError, setSurveyError] = useState<string | null>(null);
-  const [samples, setSamples] = useState<SampleRead[] | null>(null);
+  /** The albums chosen for import, or null while nobody has chosen any. */
+  const [chosenIds, setChosenIds] = useState<string[] | null>(loadSelection);
+  const [sampleSize, setSampleSize] = useState(SAMPLE_SIZE);
+  const [fetchRun, setFetchRun] = useState<FetchRun | null>(null);
   const [fetchingSamples, setFetchingSamples] = useState(false);
   /** Seeded from the cache so the card has numbers before the first fetch lands. */
   const [stats, setStats] = useState<CachedStats | null>(loadCachedStats);
@@ -92,6 +106,11 @@ export default function App() {
   const serverUrl = useRef<string>(config.serverUrl);
   const deviceToken = useRef<string | null>(null);
   const engine = useRef<SyncEngine | null>(null);
+
+  // A ref rather than state, because the run reads it from inside a closure that
+  // was built when the button was pressed. State captured there is frozen at the
+  // value it had then, which for a stop flag is permanently false.
+  const cancelFetch = useRef(false);
 
   // Built once and kept, for the same reason the transport is: it reads the
   // address and the token per request, so it survives both changing under it.
@@ -262,19 +281,19 @@ export default function App() {
   /**
    * Looks at the iCloud Shared Albums on this phone without touching one.
    *
-   * Nothing here feeds the backup — see src/shared/survey.ts for why it exists
-   * at all. It is here rather than behind a developer flag because the thing it
-   * measures is on this phone and nowhere else, and the answer decides whether
-   * shared albums are worth teaching the queue about.
+   * Nothing here feeds the backup — see src/sharedalbums/survey.ts for why it
+   * exists at all. It is here rather than behind a developer flag because the
+   * thing it measures is on this phone and nowhere else, and the answer decides
+   * whether shared albums are worth teaching the queue about.
    */
   const runSurvey = useCallback(async () => {
     setSurveying(true);
     setSurveyError(null);
     // The old readings describe a library that has just been re-read. Leaving
     // them beside fresh counts would invite reading one against the other.
-    setSamples(null);
+    setFetchRun(null);
     try {
-      setSurvey(await surveySharedAlbums());
+      setLibrary(await surveySharedAlbums());
     } catch (e) {
       setSurveyError(errorText(e));
     } finally {
@@ -282,15 +301,74 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * The albums a fetch would draw from: the chosen ones, or all of them while
+   * nothing has been chosen.
+   *
+   * Null is not the same as empty here. Nobody having chosen means everything is
+   * in, which is the right default for a backup — an album joined next month
+   * should not be excluded by a decision made before it existed. Choosing
+   * nothing means nothing, and is left to mean it.
+   */
+  const chosenAlbums = useMemo(() => {
+    if (!library) return [];
+    if (chosenIds === null) return library.albums;
+    const wanted = new Set(chosenIds);
+    return library.albums.filter((album) => wanted.has(album.localId));
+  }, [library, chosenIds]);
+
+  // Two summaries of the same phone. The first is the picker's rows, which have
+  // to list albums that are not selected in order for them to be selectable; the
+  // second is everything else on screen, which is about what was chosen.
+  const everyAlbum = useMemo(() => (library ? summarize(library.albums) : null), [library]);
+  const chosen = useMemo(() => summarize(chosenAlbums), [chosenAlbums]);
+  const sample = useMemo(
+    () => pickSample(assetsOf(chosenAlbums), sampleSize),
+    [chosenAlbums, sampleSize]
+  );
+
+  const chooseAlbums = useCallback((ids: string[]) => {
+    saveSelection(ids);
+    setChosenIds(ids);
+  }, []);
+
+  const toggleAlbum = useCallback(
+    (localId: string) => {
+      // Starting from every album rather than from nothing, because until the
+      // first tap the selection *is* every album, and a tap meaning "not that
+      // one" must not be read as "only that one".
+      const base = chosenIds ?? library?.albums.map((album) => album.localId) ?? [];
+      chooseAlbums(
+        base.includes(localId) ? base.filter((id) => id !== localId) : [...base, localId]
+      );
+    },
+    [chosenIds, library, chooseAlbums]
+  );
+
+  /**
+   * Fetches the sample from iCloud, reporting itself all the way through.
+   *
+   * The run drives its own pacing and retries — see src/sharedalbums/run.ts.
+   * This owns the two things a screen owns: where the progress goes, and the
+   * flag that stops it.
+   */
   const runSamples = useCallback(async () => {
-    if (!survey || survey.sample.length === 0) return;
+    if (sample.length === 0 || fetchingSamples) return;
+    cancelFetch.current = false;
     setFetchingSamples(true);
+    setFetchRun(null);
     try {
-      setSamples(await readSamples(survey.sample));
+      await fetchSharedAssets(sample, setFetchRun, () => cancelFetch.current);
+    } catch (e) {
+      setSurveyError(errorText(e));
     } finally {
       setFetchingSamples(false);
     }
-  }, [survey]);
+  }, [sample, fetchingSamples]);
+
+  const stopSamples = useCallback(() => {
+    cancelFetch.current = true;
+  }, []);
 
   const start = useCallback(
     async (override = false) => {
@@ -555,13 +633,40 @@ export default function App() {
             </Text>
           )}
 
-          {survey && (
-            <SharedSurveyReport
-              survey={survey}
-              samples={samples}
-              fetching={fetchingSamples}
-              onFetch={() => void runSamples()}
-            />
+          {library && !library.supported && (
+            <Text style={styles.warning}>
+              This dev client has no shared-album enumerator in it. Rebuild it with{' '}
+              <Text style={styles.code}>pnpm ios</Text> and run the survey again.
+            </Text>
+          )}
+
+          {library?.supported && library.albums.length === 0 && (
+            <Text style={styles.muted}>
+              No shared albums on this phone — so there is nothing missing from the backup,
+              and nothing here to decide about. Shared Albums can also be switched off
+              entirely under Settings › Photos, which looks exactly like this.
+            </Text>
+          )}
+
+          {library?.supported && everyAlbum && library.albums.length > 0 && (
+            <>
+              <AlbumPicker
+                albums={everyAlbum.albums}
+                chosen={chosenIds}
+                onToggle={toggleAlbum}
+                onChoose={chooseAlbums}
+              />
+              <SharedSurveyReport survey={chosen} />
+              <FetchPanel
+                sample={sample}
+                size={sampleSize}
+                onSize={setSampleSize}
+                run={fetchRun}
+                fetching={fetchingSamples}
+                onFetch={() => void runSamples()}
+                onStop={stopSamples}
+              />
+            </>
           )}
         </Section>
 
@@ -689,6 +794,68 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 }
 
 /**
+ * Which shared albums are going to be imported.
+ *
+ * Every album is listed whether or not it is chosen, because an unlisted album
+ * cannot be chosen and the point of the screen is choosing. The count beside
+ * each is its own — an asset in two albums is shown under both — which is what
+ * the Photos app shows and is not the number the totals below use; see
+ * summarize().
+ */
+function AlbumPicker({
+  albums,
+  chosen,
+  onToggle,
+  onChoose,
+}: {
+  albums: AlbumSummary[];
+  chosen: string[] | null;
+  onToggle: (localId: string) => void;
+  onChoose: (ids: string[]) => void;
+}) {
+  const isChosen = (localId: string) => chosen === null || chosen.includes(localId);
+  const count = albums.filter((album) => isChosen(album.localId)).length;
+
+  return (
+    <>
+      <View style={styles.subheadingRow}>
+        <Text style={styles.subheadingPlain}>albums to import</Text>
+        <Pressable onPress={() => onChoose(albums.map((album) => album.localId))}>
+          <Text style={styles.linkText}>all</Text>
+        </Pressable>
+        <Pressable onPress={() => onChoose([])}>
+          <Text style={styles.linkText}>none</Text>
+        </Pressable>
+      </View>
+      <Text style={styles.muted}>
+        {count} of {albums.length} chosen
+        {chosen === null && ' — everything, until something is unticked'}
+      </Text>
+
+      {albums.map((album) => (
+        <Pressable
+          key={album.localId}
+          style={styles.albumRow}
+          onPress={() => onToggle(album.localId)}
+        >
+          <Text style={isChosen(album.localId) ? styles.tickOn : styles.tickOff}>
+            {isChosen(album.localId) ? '◉' : '○'}
+          </Text>
+          <View style={styles.grow}>
+            <Text style={styles.checkLabel}>{album.title ?? 'untitled album'}</Text>
+            <Text style={styles.muted}>
+              {formatCount(album.assets)} assets · {formatCount(album.stills)} stills ·{' '}
+              {formatCount(album.videos)} videos
+              {album.live > 0 && ` · ${formatCount(album.live)} live`}
+            </Text>
+          </View>
+        </Pressable>
+      ))}
+    </>
+  );
+}
+
+/**
  * The shared-album survey, read out.
  *
  * Written to answer one question rather than to display a structure: is Apple's
@@ -697,36 +864,19 @@ function Section({ title, children }: { title: string; children: React.ReactNode
  * the documented cap, a full-size resource sitting beside the render — are
  * called out in words rather than left to be spotted in a table.
  *
+ * It describes the chosen albums rather than the phone. Unticking an album has
+ * to change these numbers or the picker above is decoration: the question is not
+ * what iCloud is holding, it is what a backup of the chosen albums would fetch.
+ *
  * The counts are deliberately flat and unformatted where they are small. This is
  * a diagnostic that will be read a handful of times by the person who wrote it
  * and then deleted or promoted; dressing it up would cost more than it is worth.
  */
-function SharedSurveyReport({
-  survey,
-  samples,
-  fetching,
-  onFetch,
-}: {
-  survey: SharedSurvey;
-  samples: SampleRead[] | null;
-  fetching: boolean;
-  onFetch: () => void;
-}) {
-  if (!survey.supported) {
-    return (
-      <Text style={styles.warning}>
-        This dev client has no shared-album enumerator in it. Rebuild it with{' '}
-        <Text style={styles.code}>pnpm ios</Text> and run the survey again.
-      </Text>
-    );
-  }
-
+function SharedSurveyReport({ survey }: { survey: SharedSurvey }) {
   if (survey.albums.length === 0) {
     return (
       <Text style={styles.muted}>
-        No shared albums on this phone — so there is nothing missing from the backup, and
-        nothing here to decide about. Shared Albums can also be switched off entirely under
-        Settings › Photos, which looks exactly like this.
+        No albums chosen, so there is nothing to survey and nothing to fetch.
       </Text>
     );
   }
@@ -784,50 +934,173 @@ function SharedSurveyReport({
         resources — {inventory(survey.resourceTypes)}
       </Text>
       <Text style={styles.muted}>sources — {inventory(survey.sourceTypes)}</Text>
+    </>
+  );
+}
 
-      <Text style={styles.subheading}>albums</Text>
-      {survey.albums.map((album, index) => (
-        <View key={`${album.title ?? 'untitled'}-${index}`} style={styles.failedRow}>
-          <Text style={styles.checkLabel}>{album.title ?? 'untitled album'}</Text>
-          <Text style={styles.muted}>
-            {formatCount(album.assets)} assets · {formatCount(album.stills)} stills ·{' '}
-            {formatCount(album.videos)} videos
-            {album.live > 0 && ` · ${formatCount(album.live)} live`}
-          </Text>
-        </View>
-      ))}
-
-      <Text style={styles.subheading}>fetching one</Text>
+/**
+ * The fetch: how much of it to do, doing it, and what came back.
+ *
+ * The size is a control rather than a constant because the two things worth
+ * learning here need different amounts of it. Three assets show what a shared
+ * photo weighs and how long one takes. Nothing under a few hundred shows what
+ * iCloud does to a phone that asks for hundreds in a row, and that is the
+ * question a backup depends on the answer to.
+ */
+function FetchPanel({
+  sample,
+  size,
+  onSize,
+  run,
+  fetching,
+  onFetch,
+  onStop,
+}: {
+  sample: SharedAsset[];
+  size: number;
+  onSize: (size: number) => void;
+  run: FetchRun | null;
+  fetching: boolean;
+  onFetch: () => void;
+  onStop: () => void;
+}) {
+  return (
+    <>
+      <Text style={styles.subheading}>fetching from iCloud</Text>
       <Text style={styles.muted}>
         A shared asset has no original on the disk, so reading one means asking iCloud for it.
-        This fetches {survey.sample.length} of them over the network, one at a time, and keeps
-        none of the bytes — it reports the size, how long it took, and how it fails.
+        This fetches them one at a time and keeps none of the bytes — it reports the size,
+        how long each took, and how it fails. It slows down when iCloud starts refusing and
+        stops on its own if it keeps doing so.
       </Text>
-      <Pressable
-        style={[styles.button, fetching && styles.buttonDisabled]}
-        onPress={onFetch}
-        disabled={fetching}
-      >
-        <Text style={styles.buttonText}>
-          {fetching ? 'Fetching…' : `Fetch ${survey.sample.length} sample(s) from iCloud`}
-        </Text>
-      </Pressable>
 
-      {samples?.map((sample) => (
-        <SampleRow key={sample.asset.localId} sample={sample} />
+      <View style={styles.row}>
+        {SAMPLE_SIZES.map((option) => (
+          <Pressable
+            key={option}
+            style={[styles.chip, option === size && styles.chipOn]}
+            onPress={() => onSize(option)}
+            disabled={fetching}
+          >
+            <Text style={option === size ? styles.chipTextOn : styles.chipText}>{option}</Text>
+          </Pressable>
+        ))}
+      </View>
+
+      <View style={styles.row}>
+        <Pressable
+          style={[styles.button, styles.grow, (fetching || sample.length === 0) && styles.buttonDisabled]}
+          onPress={onFetch}
+          disabled={fetching || sample.length === 0}
+        >
+          <Text style={styles.buttonText}>
+            {fetching ? 'Fetching…' : `Fetch ${sample.length} from iCloud`}
+          </Text>
+        </Pressable>
+        {fetching && (
+          <Pressable style={styles.button} onPress={onStop}>
+            <Text style={styles.buttonText}>Stop</Text>
+          </Pressable>
+        )}
+      </View>
+
+      {run && <FetchProgress run={run} />}
+      {run && run.results.length > 0 && <ResultRows results={run.results} />}
+    </>
+  );
+}
+
+/** Failures shown at most, before the list stops being a list. */
+const SHOWN_FAILURES = 40;
+
+/** Successes shown, counting back from the most recent. */
+const SHOWN_SUCCESSES = 10;
+
+/**
+ * The results, thinned to what a person would actually read.
+ *
+ * Five hundred rows in a ScrollView that redraws several times a second is a
+ * stutter, and four hundred and ninety of them say the same thing. Failures are
+ * kept whatever their age, because they are the reason this screen exists; the
+ * successes are kept only while they are recent, because their value is showing
+ * that the run is still working and yesterday's does not.
+ */
+function ResultRows({ results }: { results: SampleRead[] }) {
+  const recent = new Set(results.filter((r) => r.error === null).slice(-SHOWN_SUCCESSES));
+  const failures = results.filter((r) => r.error !== null);
+  const kept = new Set(failures.slice(-SHOWN_FAILURES));
+  // Filtered in place rather than concatenated, so the rows stay in the order
+  // they were fetched in and a failure keeps the successes around it.
+  const shown = results.filter((r) => recent.has(r) || kept.has(r));
+
+  return (
+    <>
+      {shown.length < results.length && (
+        <Text style={styles.muted}>
+          showing {shown.length} of {results.length} — every failure, and the last{' '}
+          {SHOWN_SUCCESSES} that worked
+        </Text>
+      )}
+      {shown.map((sampleRead) => (
+        <SampleRow key={sampleRead.asset.localId} sample={sampleRead} />
       ))}
     </>
   );
 }
 
+/**
+ * How far the run has got.
+ *
+ * The bar counts finished assets plus however far into the current one iCloud
+ * says it is, which is the only way it moves at all during a video: one of those
+ * is six seconds on its own, and a bar that advances once every six seconds is a
+ * bar that looks broken. On a build with no progress event in it the fraction is
+ * always zero and the bar advances per asset, which is the honest version of the
+ * same picture.
+ */
+function FetchProgress({ run }: { run: FetchRun }) {
+  const fraction = run.total === 0 ? 0 : (run.done + (run.current?.fraction ?? 0)) / run.total;
+
+  return (
+    <>
+      <View style={styles.progressTrack}>
+        <View style={[styles.progressFill, { width: `${Math.min(100, fraction * 100)}%` }]} />
+      </View>
+      <Text style={styles.muted}>
+        {run.done} of {run.total} · {formatBytes(run.bytes)}
+        {run.failed > 0 && ` · ${run.failed} failed`}
+      </Text>
+
+      {run.current && (
+        <Text style={styles.logLine}>
+          {run.current.asset.filename ?? run.current.asset.localId}
+          {run.current.attempt > 1 && ` · attempt ${run.current.attempt}`}
+          {run.current.bytes > 0 && ` · ${formatBytes(run.current.bytes)}`}
+          {run.current.fraction > 0 && ` · ${Math.round(run.current.fraction * 100)}%`}
+        </Text>
+      )}
+      {/* The gap between two healthy fetches is a fraction of a second, and a
+          line that appears and vanishes at that rate is worse than none. This
+          shows only the waits that are a backing-off rather than a pause. */}
+      {run.waitingMs >= 1_000 && (
+        <Text style={styles.muted}>
+          waiting {(run.waitingMs / 1000).toFixed(1)}s before the next attempt
+        </Text>
+      )}
+      {run.stoppedBecause && <Text style={styles.warning}>{run.stoppedBecause}</Text>}
+    </>
+  );
+}
+
 function SampleRow({ sample }: { sample: SampleRead }) {
-  const { asset, read, error } = sample;
+  const { asset, read, error, attempts } = sample;
   const rate = read ? throughputMbPerSecond(read.bytes, read.elapsedMs) : null;
 
   return (
     <View style={styles.failedRow}>
       <Text style={styles.checkLabel}>
         {error ? '✗' : '✓'} {asset.filename ?? asset.localId}
+        {attempts > 1 && <Text style={styles.muted}> after {attempts} attempts</Text>}
       </Text>
       {read ? (
         <Text style={styles.logLine}>
@@ -1042,6 +1315,52 @@ const styles = StyleSheet.create({
     paddingTop: 8,
     marginTop: 4,
   },
+  // The subheading's rule and padding move onto the row when something sits
+  // beside the heading, so the line is drawn above both rather than through one.
+  subheadingRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#2a2a2a',
+    paddingTop: 8,
+    marginTop: 4,
+  },
+  subheadingPlain: {
+    color: '#666',
+    fontSize: 11,
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+    flex: 1,
+  },
+  linkText: { color: '#8ab4f8', fontSize: 12 },
+  albumRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#2a2a2a',
+    paddingVertical: 6,
+  },
+  tickOn: { color: '#8ab4f8', fontSize: 16 },
+  tickOff: { color: '#555', fontSize: 16 },
+  chip: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+    backgroundColor: '#2a2a2a',
+  },
+  chipOn: { backgroundColor: '#3a4a63' },
+  chipText: { color: '#888', fontSize: 12 },
+  chipTextOn: { color: '#eee', fontSize: 12, fontWeight: '600' },
+  progressTrack: {
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: '#2a2a2a',
+    overflow: 'hidden',
+    marginTop: 8,
+  },
+  progressFill: { height: 6, borderRadius: 3, backgroundColor: '#8ab4f8' },
   countLabel: { color: '#777', fontSize: 11 },
   checkRow: { flexDirection: 'row', gap: 8, alignItems: 'flex-start' },
   checkLabel: { color: '#ddd', fontSize: 13 },

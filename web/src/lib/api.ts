@@ -1296,3 +1296,172 @@ export interface Status {
 export function fetchStatus(signal?: AbortSignal): Promise<Status> {
   return get<Status>("/v1/status", signal);
 }
+
+// The tag cleanup — ML_IMAGES.md §9, and the one part of this archive where
+// what a model wrote is edited rather than displayed.
+//
+// Two passes with a review after each. The words are judged useful or not, then
+// what survives is clustered and the near-identical spellings are folded into
+// one. Neither destroys anything: `junk` and `canonical_id` are read at every
+// point of search, so both take effect everywhere at once and are undone the
+// same way.
+
+/** One word of the vocabulary, with everything the review is decided on. */
+export interface TagWord {
+  id: number;
+  name: string;
+  /** How many photographs carry it. The stakes, and the order both lists read in. */
+  uses: number;
+  junk?: boolean;
+  /** What the captioner thought, 0 to 1. Absent until something has judged it. */
+  score?: number;
+  /** When a model judged it, and when a person did. The gap is the whole point. */
+  triaged_at?: string;
+  judged_at?: string;
+  /** The word this one was folded into. Only on the merged log. */
+  canonical?: string;
+  /** How near this word sits to the head of the proposal it is in. */
+  similarity?: number;
+  /** A few photographs carrying it, as ids — the evidence behind a verdict. */
+  samples?: string[];
+}
+
+/** A group of words that mean one thing, with the one they should become first. */
+export interface TagProposal {
+  canonical: TagWord;
+  members: TagWord[];
+  /** The group's claims added up: how many photographs the merge is worth. */
+  uses: number;
+}
+
+/** The cleanup in nine numbers. Every write answers with a fresh copy. */
+export interface TagCounts {
+  vocabulary: number;
+  claims: number;
+  /** The two review lists. They do not add up to `vocabulary`: a folded word is on neither. */
+  kept: number;
+  junk: number;
+  /** What the analyse pass has left, and what approving is for. */
+  untriaged: number;
+  unreviewed: number;
+  /** Kept words with no vector yet, which is what the clustering is missing. */
+  unembedded: number;
+  folded: number;
+  groups: number;
+  /** How many merges the current vocabulary would propose. Computed, not counted. */
+  suggestions?: number;
+}
+
+export function fetchTagCounts(signal?: AbortSignal): Promise<TagCounts> {
+  return get<TagCounts>("/v1/tags", signal);
+}
+
+export interface TagWordPage {
+  words: TagWord[];
+  /** How many words match, of which this is one page. */
+  total: number;
+}
+
+export function fetchTagWords(
+  options: { junk?: boolean; q?: string; limit?: number; offset?: number } = {},
+  signal?: AbortSignal,
+): Promise<TagWordPage> {
+  const params = new URLSearchParams();
+  if (options.junk) params.set("junk", "1");
+  if (options.q) params.set("q", options.q);
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.offset) params.set("offset", String(options.offset));
+  return get<TagWordPage>(`/v1/tags/words?${params}`, signal);
+}
+
+export interface TagProposals {
+  groups: TagProposal[];
+  similarity: number;
+  /**
+   * Kept words with no vector. It travels with the groups because an empty list
+   * means two different things — everything is merged, or nothing is embedded —
+   * and the page has a different button for each.
+   */
+  unembedded: number;
+}
+
+export function fetchTagProposals(
+  similarity?: number,
+  signal?: AbortSignal,
+): Promise<TagProposals> {
+  const params = new URLSearchParams();
+  if (similarity) params.set("similarity", similarity.toFixed(2));
+  return get<TagProposals>(`/v1/tags/proposals?${params}`, signal);
+}
+
+export function fetchMergedTags(signal?: AbortSignal): Promise<TagProposal[]> {
+  return get<{ groups: TagProposal[] }>("/v1/tags/merged", signal).then((r) => r.groups ?? []);
+}
+
+/**
+ * What a pass did, and where it got to.
+ *
+ * `counts.untriaged` and `counts.unembedded` are the loop conditions: each call
+ * judges or embeds a bounded slice and the page calls again while there is
+ * anything left. A couple of minutes of GPU is too long for one request and far
+ * too short to be worth a background job, so the loop lives in the browser and
+ * every call is resumable.
+ */
+export interface TagPass {
+  triaged?: number;
+  embedded?: number;
+  judged?: number;
+  approved?: number;
+  reindexed?: number;
+  counts: TagCounts;
+}
+
+export function triageTags(): Promise<TagPass> {
+  return send<TagPass>("/v1/tags/triage", {});
+}
+
+export function embedTags(): Promise<TagPass> {
+  return send<TagPass>("/v1/tags/embed", {});
+}
+
+/** Moves words between the two lists, and stamps them as a person's answer. */
+export function judgeTags(ids: number[], junk: boolean): Promise<TagPass> {
+  return send<TagPass>("/v1/tags/judge", { ids, junk });
+}
+
+/** Signs the whole triage off, and rebuilds the search index in the same breath. */
+export function approveTriage(): Promise<TagPass> {
+  return send<TagPass>("/v1/tags/approve", {});
+}
+
+export interface TagMerged {
+  canonical: string;
+  merged: number;
+  rejected?: number;
+  /** How many photographs had their search row rewritten. */
+  reindexed: number;
+}
+
+/**
+ * Folds words into one.
+ *
+ * `rejected` travels with the merge rather than as a second call because it is
+ * one decision: without it the next clustering run proposes exactly the group
+ * that was just corrected.
+ */
+export function mergeTags(
+  canonical: number,
+  members: number[],
+  rejected: number[] = [],
+): Promise<TagMerged> {
+  return send<TagMerged>("/v1/tags/merge", { canonical, members, rejected });
+}
+
+/** Records that a group of words are not one word, so the clustering stops asking. */
+export function dismissTagProposal(ids: number[]): Promise<{ blocked: number }> {
+  return send<{ blocked: number }>("/v1/tags/dismiss", { ids });
+}
+
+export function unmergeTags(ids: number[]): Promise<{ restored: number }> {
+  return send<{ restored: number }>("/v1/tags/unmerge", { ids });
+}

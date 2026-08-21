@@ -230,6 +230,24 @@ func (s *Server) galleryRoutes(mux *http.ServeMux, allow guard) {
 	mux.HandleFunc("POST /v1/merges/{id}/approve", allow(s.handleApproveMerge))
 	mux.HandleFunc("POST /v1/merges/{id}/unapprove", allow(s.handleUnapproveMerge))
 
+	// The tag cleanup's writes — ML_IMAGES.md §9. None of them touches a
+	// photograph, and all of them change what every photograph is findable by,
+	// which is why they are writes: `junk` and `canonical_id` are read at every
+	// point of search, and each of these rewrites the stored tsvectors that
+	// depend on them. That last part is the obligation §11 said would have to be
+	// remembered; it is discharged in the same transaction instead.
+	//
+	// The two passes are bounded slices rather than jobs, and the page calls
+	// them in a loop. See internal/api/tags.go for why a couple of minutes of
+	// GPU that somebody typed is not worth a pool and a reconcile.
+	mux.HandleFunc("POST /v1/tags/triage", allow(s.handleTagTriage))
+	mux.HandleFunc("POST /v1/tags/embed", allow(s.handleTagEmbed))
+	mux.HandleFunc("POST /v1/tags/judge", allow(s.handleJudgeTags))
+	mux.HandleFunc("POST /v1/tags/approve", allow(s.handleApproveTriage))
+	mux.HandleFunc("POST /v1/tags/merge", allow(s.handleMergeTags))
+	mux.HandleFunc("POST /v1/tags/dismiss", allow(s.handleDismissTagProposal))
+	mux.HandleFunc("POST /v1/tags/unmerge", allow(s.handleUnmergeTags))
+
 	// Albums, which until now only an import could make. The membership routes
 	// are POST and DELETE on a sub-resource rather than two verbs on the album
 	// itself, because what they change is what is *in* it — deleting the album
@@ -353,6 +371,15 @@ func (s *Server) readRoutes(mux *http.ServeMux, allow guard) {
 	// then refused to archive, kept so the refusal can be argued with by
 	// watching rather than by arithmetic. See handleJoinPreview.
 	mux.HandleFunc("GET /v1/merges/{id}/preview", allow(s.handleJoinPreview))
+
+	// The tag cleanup's reads — ML_IMAGES.md §9. Archive content in the most
+	// literal sense: a review list is the words a model wrote about these
+	// photographs, with thumbnails of them beside it, so they sit behind the
+	// same guard as the rest of the gallery's reads.
+	mux.HandleFunc("GET /v1/tags", allow(s.handleTagCounts))
+	mux.HandleFunc("GET /v1/tags/words", allow(s.handleTagWords))
+	mux.HandleFunc("GET /v1/tags/proposals", allow(s.handleTagProposals))
+	mux.HandleFunc("GET /v1/tags/merged", allow(s.handleMergedTags))
 
 	mux.HandleFunc("GET /v1/jobs", allow(s.handleJobs))
 	// The status page in one answer: what the library holds, what the drive

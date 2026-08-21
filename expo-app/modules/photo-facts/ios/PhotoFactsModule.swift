@@ -55,10 +55,23 @@
 //   sharedAlbumsAsync         never throws, like the enumerator it sits beside.
 //                             A phone with Shared Albums switched off has none,
 //                             which is an empty list rather than a failure.
-//   fetchSharedResourceAsync  does throw. It is a network read and the survey's
-//                             entire purpose is to find out how it fails, so a
-//                             timeout or a withdrawn album has to arrive as an
-//                             error and not as zero bytes.
+//   fetchSharedResourceAsync  never throws, and reports its failures as data
+//                             instead. It is the odd one out and the reason is
+//                             the caller: a run of these is driven by a loop
+//                             that retries, paces itself and decides when iCloud
+//                             has had enough, and that loop has to be able to
+//                             tell a timeout from a withdrawn album. An
+//                             exception carries whatever the bridge chose to put
+//                             on it; a resolved dictionary carries the NSError
+//                             domain and code exactly as Apple wrote them, plus
+//                             how many bytes had arrived before it gave up.
+//                             Zero bytes is never mistaken for success, because
+//                             `ok` says which of the two it is.
+//
+// It also emits the module's one event, onSharedFetchProgress, while a fetch is
+// in flight. A shared video takes seconds to come down from iCloud and a run of
+// them takes minutes, and a screen showing nothing during that is
+// indistinguishable from a screen showing a hang.
 
 import CoreLocation
 import CryptoKit
@@ -79,9 +92,31 @@ private let hashQueue = DispatchQueue(label: "photofacts.hash", qos: .utility)
 /// against peak memory, and a 1GB video is worth the megabyte.
 private let hashBlockSize = 1024 * 1024
 
+/// The module's one event: how far the shared-album fetch in flight has got.
+private let sharedFetchProgressEvent = "onSharedFetchProgress"
+
+/// How often a fetch in flight is allowed to report itself, in seconds.
+///
+/// PhotoKit calls both of its handlers far more often than a screen can be read
+/// — a video arrives in thousands of chunks — and every report is a crossing of
+/// the bridge and a React render. Six a second is past what the eye resolves and
+/// a small fraction of what PhotoKit offers.
+private let progressReportInterval = 0.15
+
+/// The domain on a failure this module found itself, as opposed to one Apple
+/// reported. Callers classify on domain and code rather than on the message, so
+/// ours has to be as distinguishable as Apple's is.
+private let photoFactsErrorDomain = "PhotoFacts"
+
+/// No photo, video or audio resource on the asset at all. Nothing to fetch, and
+/// nothing a retry would change.
+private let noResourceCode = 404
+
 public class PhotoFactsModule: Module {
   public func definition() -> ModuleDefinition {
     Name("PhotoFacts")
+
+    Events(sharedFetchProgressEvent)
 
     // Resolves with null rather than rejecting when the identifier no longer
     // names anything. A deleted photo and a photo this build is not allowed to
@@ -107,12 +142,19 @@ public class PhotoFactsModule: Module {
 
     // The one call in this module that goes to the network, and the only one
     // allowed to. See fetchResource().
-    AsyncFunction("fetchSharedResourceAsync") { (localId: String, promise: Promise) in
+    //
+    // Weakly, because the closure outlives the call and the module owns the
+    // definition that owns the closure. A fetch still in flight when the module
+    // goes away simply stops reporting itself, which is the correct amount of
+    // fuss to make about progress on a screen that is no longer there.
+    AsyncFunction("fetchSharedResourceAsync") { [weak self] (localId: String, promise: Promise) in
       guard let asset = findAsset(localId) else {
         promise.resolve()
         return
       }
-      fetchResource(of: asset, promise: promise)
+      fetchResource(of: asset, localId: localId, promise: promise) { body in
+        self?.sendEvent(sharedFetchProgressEvent, body)
+      }
     }
 
     AsyncFunction("md5ForFileAsync") { (uri: String, promise: Promise) in
@@ -304,8 +346,51 @@ private func describeShared(_ asset: PHAsset) -> [String: Any?] {
   ]
 }
 
+/// The running totals for one fetch, and the decision about when to report them.
+///
+/// A lock, where the byte handler on its own would have needed none: PhotoKit
+/// delivers data on one queue and download progress on another, and the two
+/// touch the same counters. Each mutation hands back the body to send, or nil
+/// when the last report was too recent to follow.
+private final class FetchProgress {
+  private let lock = NSLock()
+  private let localId: String
+  private var bytes = 0
+  private var fraction = 0.0
+  private var reportedAt = 0.0
+
+  init(localId: String) {
+    self.localId = localId
+  }
+
+  func received(_ count: Int) -> [String: Any?]? {
+    return update { self.bytes += count }
+  }
+
+  func downloaded(_ value: Double) -> [String: Any?]? {
+    return update { self.fraction = value }
+  }
+
+  func count() -> Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return bytes
+  }
+
+  private func update(_ change: () -> Void) -> [String: Any?]? {
+    lock.lock()
+    defer { lock.unlock() }
+    change()
+
+    let now = CFAbsoluteTimeGetCurrent()
+    guard now - reportedAt >= progressReportInterval else { return nil }
+    reportedAt = now
+    return ["localId": localId, "bytes": bytes, "fraction": fraction]
+  }
+}
+
 /// Reads one shared asset's primary resource all the way through, and reports
-/// how big it turned out to be and how long it took.
+/// how big it turned out to be, how long it took, and how it failed if it did.
 ///
 /// This is the one function in the module that goes to the network, and the
 /// header's rule against it stands everywhere else. A library asset has bytes on
@@ -318,40 +403,79 @@ private func describeShared(_ asset: PHAsset) -> [String: Any?] {
 /// elapsed time and the failure modes; writing whole albums' worth of downloads
 /// to disk to learn that would be a backup, which is the thing this is meant to
 /// inform rather than perform.
-private func fetchResource(of asset: PHAsset, promise: Promise) {
+///
+/// It resolves on failure instead of rejecting, which is the opposite of what
+/// md5ForFileAsync does and for a reason that only applies here: the caller runs
+/// these in a loop that retries, paces itself, and stops when iCloud has clearly
+/// had enough. That loop decides on the domain and the code, and neither
+/// survives being turned into an exception intact.
+private func fetchResource(
+  of asset: PHAsset,
+  localId: String,
+  promise: Promise,
+  onProgress: @escaping ([String: Any?]) -> Void
+) {
   let resources = PHAssetResource.assetResources(for: asset)
   guard let resource = primaryResource(from: resources) else {
-    promise.reject("ERR_NO_RESOURCE", "the asset carries no photo, video or audio resource")
+    promise.resolve(fetchFailure(
+      domain: photoFactsErrorDomain,
+      code: noResourceCode,
+      message: "the asset carries no photo, video or audio resource",
+      bytes: 0,
+      elapsedMs: 0
+    ))
     return
   }
 
+  let progress = FetchProgress(localId: localId)
+
   let options = PHAssetResourceRequestOptions()
   options.isNetworkAccessAllowed = true
+  // The fraction and the byte count are not the same measurement and both are
+  // worth having. This one is how much of the download iCloud has done, and it
+  // is the only one that knows the total; the other is how much has actually
+  // been handed over, and it is the only one that moves for an asset already
+  // cached on the phone, where this never fires at all.
+  options.progressHandler = { (fraction: Double) in
+    if let body = progress.downloaded(fraction) { onProgress(body) }
+  }
 
-  var received = 0
   let started = CFAbsoluteTimeGetCurrent()
 
   PHAssetResourceManager.default().requestData(
     for: resource,
     options: options,
     dataReceivedHandler: { data in
-      // PhotoKit delivers these serially on a private queue, one chunk after
-      // another, so the accumulation needs no lock of its own.
-      received += data.count
+      if let body = progress.received(data.count) { onProgress(body) }
     },
     completionHandler: { error in
+      let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - started) * 1000.0).rounded())
+      let received = progress.count()
+
       if let error {
-        promise.reject(error)
+        // Apple's domain and code verbatim. Which of them mean "you are asking
+        // too often" is exactly what nobody here knows yet, so the caller is
+        // given the pair rather than a judgement about it.
+        let ns = error as NSError
+        promise.resolve(fetchFailure(
+          domain: ns.domain,
+          code: ns.code,
+          message: ns.localizedDescription,
+          bytes: received,
+          elapsedMs: elapsedMs
+        ))
         return
       }
+
       // Typed rather than inferred, because two of these are optional strings
       // and a literal left to itself infers [String: Any] — which boxes the
       // absent ones as optionals inside Any and bridges them as something no
       // caller wants. Every other dictionary in this file is coerced by its
       // function's return type; this one has nothing to be coerced by.
       let read: [String: Any?] = [
+        "ok": true,
         "bytes": received,
-        "elapsedMs": Int(((CFAbsoluteTimeGetCurrent() - started) * 1000.0).rounded()),
+        "elapsedMs": elapsedMs,
         "uniformTypeIdentifier": resource.uniformTypeIdentifier,
         "originalFilename": resource.originalFilename,
         "resourceType": resourceTypeName(resource.type)
@@ -359,6 +483,25 @@ private func fetchResource(of asset: PHAsset, promise: Promise) {
       promise.resolve(read)
     }
   )
+}
+
+/// A failed read, in the shape the successful one resolves in. `ok` is what
+/// tells them apart, so that zero bytes is never read as a fetch that worked.
+private func fetchFailure(
+  domain: String,
+  code: Int,
+  message: String,
+  bytes: Int,
+  elapsedMs: Int
+) -> [String: Any?] {
+  return [
+    "ok": false,
+    "domain": domain,
+    "code": code,
+    "message": message,
+    "bytes": bytes,
+    "elapsedMs": elapsedMs
+  ]
 }
 
 /// The resource carrying the asset itself, as opposed to a thumbnail, an

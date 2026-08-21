@@ -142,12 +142,55 @@ export type SharedResourceRead = {
   resourceType: string;
 };
 
+/**
+ * A fetch that did not work, described in the terms the caller has to decide on.
+ *
+ * The domain and the code are Apple's, untranslated, for the same reason every
+ * other enumeration in this module is carried raw: which of them iCloud uses to
+ * say "you are asking too often" is not known here, and a guess dressed up as a
+ * category would be worse than the pair itself. The partial byte count is the
+ * other half of the picture — a read that died after thirty seconds and twelve
+ * megabytes is a different failure from one that died instantly.
+ */
+export type SharedFetchFailure = {
+  /** NSError's domain, or `PhotoFacts` for something the module found itself. */
+  domain: string;
+  code: number;
+  message: string;
+  /** What had arrived before it gave up, and how long it took to get there. */
+  bytes: number;
+  elapsedMs: number;
+};
+
+/** One fetch, either way round. */
+export type SharedFetchResult =
+  | { ok: true; read: SharedResourceRead }
+  | { ok: false; failure: SharedFetchFailure };
+
+/** How far the fetch in flight has got. See onSharedFetchProgress in the Swift. */
+export type SharedFetchProgress = {
+  localId: string;
+  /** Bytes handed over so far. Moves even for an asset already on the phone. */
+  bytes: number;
+  /** iCloud's own 0..1 for the download, and 0 when there is nothing to download. */
+  fraction: number;
+};
+
+/** The flat dictionary the native side resolves, before it is given its shape. */
+type NativeFetchResult =
+  | ({ ok: true } & SharedResourceRead)
+  | ({ ok: false } & SharedFetchFailure);
+
 type PhotoFactsNativeModule = {
   factsForAssetAsync(localId: string): Promise<PhotoKitFacts | null>;
   enumerateAsync(limit: number): Promise<PhotoKitAsset[]>;
   sharedAlbumsAsync(): Promise<SharedAlbum[]>;
-  fetchSharedResourceAsync(localId: string): Promise<SharedResourceRead | null>;
+  fetchSharedResourceAsync(localId: string): Promise<NativeFetchResult | null>;
   md5ForFileAsync(uri: string): Promise<string>;
+  addListener(
+    event: 'onSharedFetchProgress',
+    listener: (progress: SharedFetchProgress) => void
+  ): { remove(): void };
 };
 
 const native = requireOptionalNativeModule<PhotoFactsNativeModule>('PhotoFacts');
@@ -227,19 +270,77 @@ export async function photoKitSharedAlbums(): Promise<SharedAlbum[] | null> {
 /**
  * Reads one shared asset's bytes from iCloud and reports what came back.
  *
- * Rejects rather than resolving null when the read fails, for the same reason
- * md5ForFileAsync does: the survey exists to find out how this fails, so a
- * timeout, a withdrawn album or a resource that is not there has to arrive as an
- * error and never as a successful read of zero bytes.
+ * A failed read resolves as `{ ok: false }` rather than rejecting, which is the
+ * opposite of md5ForFileAsync's rule and is not an inconsistency: a digest is a
+ * claim about bytes and has no failed form, while a fetch is driven by a loop
+ * that has to tell a timeout from a withdrawn album in order to decide whether
+ * to try again. See SharedFetchFailure.
  *
  * Null still means the one thing it means everywhere else in this file: the
  * build cannot. It also resolves null for an identifier that no longer names
  * anything, which is the same answer photoKitFacts gives and for the same
  * reason — a photo the owner has since deleted is not an error worth acting on.
+ *
+ * The fields are copied across one at a time rather than spread, because the
+ * native dictionary is flat and the two halves of the union share `bytes` and
+ * `elapsedMs`. A spread would carry a failure's partial byte count into a
+ * successful read's shape and typecheck perfectly while doing it.
  */
 export async function photoKitReadSharedResource(
   localId: string
-): Promise<SharedResourceRead | null> {
+): Promise<SharedFetchResult | null> {
   if (!carries('fetchSharedResourceAsync')) return null;
-  return (await native!.fetchSharedResourceAsync(localId)) ?? null;
+
+  const result = await native!.fetchSharedResourceAsync(localId);
+  if (!result) return null;
+
+  if (result.ok) {
+    return {
+      ok: true,
+      read: {
+        bytes: result.bytes,
+        elapsedMs: result.elapsedMs,
+        uniformTypeIdentifier: result.uniformTypeIdentifier,
+        originalFilename: result.originalFilename,
+        resourceType: result.resourceType,
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    failure: {
+      domain: result.domain,
+      code: result.code,
+      message: result.message,
+      bytes: result.bytes,
+      elapsedMs: result.elapsedMs,
+    },
+  };
+}
+
+/**
+ * Watches the fetch in flight, and hands back the way to stop watching.
+ *
+ * A build with no event in it returns a no-op unsubscribe rather than throwing,
+ * which is the same bargain the rest of this file strikes: the fetch still runs
+ * on an older dev client, the bar on screen simply does not move until each
+ * asset finishes. Progress is the first thing that should degrade and the last
+ * thing worth failing a run over.
+ *
+ * The try/catch is for the same reason `carries` exists one layer down. A dev
+ * client from before this event was declared has an `addListener` — every Expo
+ * module does — and it is the event name it has never heard of.
+ */
+export function photoKitOnSharedFetchProgress(
+  listener: (progress: SharedFetchProgress) => void
+): () => void {
+  if (!carries('addListener')) return () => {};
+
+  try {
+    const subscription = native!.addListener('onSharedFetchProgress', listener);
+    return () => subscription.remove();
+  } catch {
+    return () => {};
+  }
 }

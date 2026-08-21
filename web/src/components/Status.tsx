@@ -1,9 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Copy, Film, Images, RefreshCw, Server } from "lucide-react";
+import { Copy, Film, Images, RefreshCw, Server, Tags } from "lucide-react";
 
-import { fetchMergeCounts, type MergeCounts, type Status as ServerStatus } from "@/lib/api";
+import {
+  fetchMergeCounts,
+  fetchTagCounts,
+  type MergeCounts,
+  type Status as ServerStatus,
+  type TagCounts,
+} from "@/lib/api";
 import { formatSince } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useStatus } from "@/hooks/useStatus";
@@ -29,6 +35,7 @@ import { StorageCard } from "./StorageCard";
 export function Status() {
   const { status, error, readAt, refresh } = useStatus();
   const merges = useMergeCounts();
+  const tags = useTagCounts();
 
   return (
     <div className="flex h-dvh flex-col">
@@ -84,6 +91,21 @@ export function Status() {
                   </StatusCard>
                 ) : null}
 
+                {/* The vocabulary, and it is the one card here that is a
+                    to-do list rather than a reading. Drawn whenever the
+                    captioner has written anything, because there is always
+                    something to do with three thousand free-form words — see
+                    tagNote for what. */}
+                {tags && tags.vocabulary > 0 ? (
+                  <StatusCard href="/tags" Icon={Tags} title="Tags">
+                    <StatusFigure
+                      value={tags.vocabulary.toLocaleString()}
+                      unit={tags.vocabulary === 1 ? "word" : "words"}
+                      note={tagNote(tags)}
+                    />
+                  </StatusCard>
+                ) : null}
+
                 {merges &&
                 merges.pending_segments + merges.merged_segments + merges.failed_segments >
                   0 ? (
@@ -130,6 +152,34 @@ function joinedNote(merges: MergeCounts) {
     return `${merges.pending_segments.toLocaleString()} still being joined`;
   }
   return "Snapchat clips put back together";
+}
+
+/**
+ * The line under the vocabulary figure: the next thing to do to it.
+ *
+ * One stage at a time, in the order the cleanup actually runs, because a card
+ * that listed all four numbers would be a status report on a job nobody has
+ * started. The words are judged, the verdicts are read, what survives is
+ * compared, and then the merges are accepted — and only the first of those that
+ * is still outstanding is worth a sentence here.
+ */
+function tagNote(tags: TagCounts) {
+  if (tags.untriaged > 0) {
+    return `${tags.untriaged.toLocaleString()} not looked at yet`;
+  }
+  if (tags.unreviewed > 0) {
+    return `${tags.unreviewed.toLocaleString()} verdicts to read`;
+  }
+  if (tags.unembedded > 0) {
+    return `${tags.unembedded.toLocaleString()} still to compare`;
+  }
+  if (tags.suggestions && tags.suggestions > 0) {
+    return `${tags.suggestions.toLocaleString()} ${tags.suggestions === 1 ? "merge" : "merges"} suggested`;
+  }
+  if (tags.junk > 0 || tags.folded > 0) {
+    return `${tags.junk.toLocaleString()} struck out · ${tags.folded.toLocaleString()} merged`;
+  }
+  return "What the captioner has called things";
 }
 
 function LibraryCard({ status }: { status: ServerStatus }) {
@@ -312,6 +362,9 @@ const KIND_LABELS: Record<string, string> = {
   signature: "Duplicate fingerprints",
   merge: "Joining split recordings",
   mlprep: "Preparing images for search",
+  vision: "Reading what photos look like",
+  ocr: "Reading text in photos",
+  describe: "Describing photos in words",
 };
 
 function Loading({ error }: { error: string | null }) {
@@ -339,6 +392,23 @@ function Loading({ error }: { error: string | null }) {
  * Read once. Both numbers move only when a scan runs or somebody resolves a
  * group, neither of which happens while this page is open.
  */
+function useTagCounts(): TagCounts | null {
+  const [counts, setCounts] = useState<TagCounts | null>(null);
+
+  useEffect(() => {
+    const abort = new AbortController();
+    fetchTagCounts(abort.signal)
+      .then(setCounts)
+      .catch(() => {
+        // Same as the merge counts below: the card is conditional anyway, and
+        // whatever is wrong with the server has already been said above.
+      });
+    return () => abort.abort();
+  }, []);
+
+  return counts;
+}
+
 function useMergeCounts(): MergeCounts | null {
   const [counts, setCounts] = useState<MergeCounts | null>(null);
 

@@ -315,10 +315,17 @@ func (s *Store) SearchVocabulary(ctx context.Context) (Vocabulary, error) {
 		return v, fmt.Errorf("read the places in the archive: %w", err)
 	}
 
+	// Junk is subtracted here rather than at the call site, and it is the same
+	// subtraction rebuild_asset_search makes: a word the cleanup has struck out
+	// is not a word this archive can be searched by, so the parser must not
+	// recognise it. Read through the merge first, because a folded word is
+	// searched as its canonical one and it is the canonical one's verdict that
+	// decides. See internal/db/tags.go.
 	tags, err := s.pool.Query(ctx, `
 		select t.name, coalesce(c.name, t.name)
 		from tags t
-		left join tags c on c.id = t.canonical_id`)
+		left join tags c on c.id = t.canonical_id
+		where not coalesce(c.junk, t.junk)`)
 	if err != nil {
 		return v, fmt.Errorf("read the tag vocabulary: %w", err)
 	}
@@ -359,10 +366,10 @@ func text(v *string) string {
 // but how many of the things that could have one do. Eligible is what the
 // timeline shows and mlprep has written renditions for.
 type DescribeCoverage struct {
-	Eligible  int64 `json:"eligible"`
-	Described int64 `json:"described"`
+	Eligible   int64 `json:"eligible"`
+	Described  int64 `json:"described"`
 	Recognised int64 `json:"recognised"`
-	Tags      int64 `json:"tags"`
+	Tags       int64 `json:"tags"`
 	Vocabulary int64 `json:"vocabulary"`
 }
 
@@ -500,12 +507,18 @@ func (s *Store) AssetAnalysis(ctx context.Context, assetID string) (Analysis, er
 	// and db.Search resolve it: asset_tags holds what the model wrote and
 	// canonical_id is read at every point of use, which is what keeps a
 	// mistaken merge undoable.
+	//
+	// And struck out through the triage on the way out too, for the reason the
+	// tags are clickable: a chip here searches the archive, and a word the
+	// cleanup has junked is a word no tsvector still carries — so drawing it
+	// would be offering a link to an empty grid.
 	const tags = `
 		select coalesce(canonical.name, tag.name), tag.name, at.confidence
 		from asset_tags at
 		join tags tag on tag.id = at.tag_id
 		left join tags canonical on canonical.id = tag.canonical_id
 		where at.asset_id = $1::uuid
+		  and not coalesce(canonical.junk, tag.junk)
 		order by at.confidence desc nulls last, tag.name`
 	rows, err := s.pool.Query(ctx, tags, assetID)
 	if err != nil {

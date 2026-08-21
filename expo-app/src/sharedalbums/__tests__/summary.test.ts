@@ -1,5 +1,6 @@
 import type { SharedAlbum, SharedAsset } from '../../../modules/photo-facts';
 import {
+  assetsOf,
   formatDuration,
   pickSample,
   summarize,
@@ -116,13 +117,37 @@ describe('summarize', () => {
     expect(survey.newest).toBe(1_800_000_000_000);
   });
 
-  it('reads an empty phone as empty rather than as unsupported', () => {
+  it('reads an empty phone as empty', () => {
     const survey = summarize([]);
 
-    expect(survey.supported).toBe(true);
     expect(survey.assets).toBe(0);
     expect(survey.still.maxLongEdge).toBeNull();
     expect(survey.oldest).toBeNull();
+  });
+
+  it('carries the album id through, so a row can be ticked', () => {
+    const survey = summarize([album([asset()], 'Iceland')]);
+
+    expect(survey.albums[0].localId).toBe('ph://album-Iceland');
+  });
+
+  it('describes only the albums it is given, which is what unticking one does', () => {
+    const both = [album([asset(), asset()], 'A'), album([asset()], 'B')];
+
+    expect(summarize(both).assets).toBe(3);
+    expect(summarize(both.slice(0, 1)).assets).toBe(2);
+  });
+});
+
+describe('assetsOf', () => {
+  it('returns each asset once, newest first', () => {
+    const shared = asset({ createdAt: 1_700_000_000_000 });
+    const newer = asset({ createdAt: 1_900_000_000_000 });
+    const older = asset({ createdAt: 1_500_000_000_000 });
+
+    const found = assetsOf([album([shared, older], 'A'), album([shared, newer], 'B')]);
+
+    expect(found).toEqual([newer, shared, older]);
   });
 });
 
@@ -150,6 +175,19 @@ describe('pickSample', () => {
     const only = asset({ kind: 'video' });
 
     expect(pickSample([only])).toEqual([only]);
+  });
+
+  it('takes the size it is given, still spread across kinds first', () => {
+    const stills = [asset(), asset(), asset(), asset()];
+    const video = asset({ kind: 'video' });
+
+    const sample = pickSample([...stills, video], 2);
+
+    expect(sample).toEqual([stills[0], video]);
+  });
+
+  it('runs to the end of a short library rather than padding to the size', () => {
+    expect(pickSample([asset(), asset()], 100)).toHaveLength(2);
   });
 });
 

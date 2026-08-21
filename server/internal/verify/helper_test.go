@@ -265,5 +265,5 @@ func truncate(t *testing.T, ctx context.Context, dbURL string) {
 	// reason: a tombstone from an earlier test would let "the rebuild restored
 	// it" pass without the rebuild having done anything.
 	_, _ = conn.Exec(ctx,
-		"truncate table assets, device_assets, jobs, devices, pairing_codes, albums, purged_content, vault_people, vault_secret cascade")
+		"truncate table assets, device_assets, jobs, devices, pairing_codes, albums, tags, purged_content, vault_people, vault_secret cascade")
 }

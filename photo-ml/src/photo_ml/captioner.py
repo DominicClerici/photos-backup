@@ -79,6 +79,40 @@ Rules:
 - No preamble, no explanation, no markdown fence. JSON only."""
 
 
+# The second thing these weights are asked, and it is asked of the words they
+# themselves wrote — ML_IMAGES.md §9's cleanup, one stage before the merge.
+#
+# A free-form vocabulary is about a third rubbish, and the rubbish has a shape:
+# interface text lifted off screenshots ("login", "result", "true", "details"),
+# vague judgements about mood ("casual", "friendly", "collaborative"), and words
+# about photography rather than about the photograph ("photograph", "image",
+# "high quality"). None of them merges into anything, none of them will ever be
+# typed into a search box, and all of them sit in the weight-A half of every
+# tsvector they are attached to.
+#
+# The same model rather than a new one, and that is the whole reason this lives
+# in captioner.py. It is already registered, already on demand, already the nine
+# gigabytes the residency table budgets for; a second 4B checkpoint for a
+# judgement this size would be a second download, a second entry, and a second
+# way for the card to run out of room. Asking the captioner to mark its own
+# homework is also the honest framing: these are its words.
+TRIAGE_SYSTEM = """You are cleaning up the tag vocabulary of a personal photo archive. A vision model looked at each photograph and wrote whatever words it liked, so the list holds both useful words and rubbish.
+
+KEEP a word that names something a person could see in a photograph and would search for: an object, an animal, a place, a scene, an activity, clothing, weather, time of day, a colour, or a kind of picture such as a selfie or a screenshot.
+
+JUNK a word that would never help anyone find a photograph: interface labels read off a screen (login, result, submit, true, user name), vague judgements (nice, casual, interesting, friendly), words about photography itself (photograph, image, high quality, well composed), and anything meaningless on its own.
+
+Answer with one word: KEEP or JUNK."""
+
+# How many words go through one forward pass.
+#
+# Small, and not for throughput. This is prefill only — see judge() — so the
+# batch buys little, while the activation memory it costs comes out of a budget
+# that already has 9GB of these weights in it and has to leave room for NVENC.
+# Eight words is about 40ms.
+TRIAGE_BATCH = 8
+
+
 class Captioner:
     """Loaded weights, and the one thing they are asked."""
 
@@ -141,13 +175,82 @@ class Captioner:
         )
         return [_read(answer) for answer in answers]
 
+    @torch.inference_mode()
+    def judge(self, words: list[str]) -> list[dict]:
+        """Junk or not, for each word, as a probability rather than a sentence.
+
+        Not generated. The obvious implementation asks for a JSON list of the
+        junk words and it does not work: measured against this archive's own
+        vocabulary, a 0.6B invents words that were never in the list and repeats
+        one of them four hundred times, and even a well-behaved model has to be
+        matched back to its input by string comparison — for a task whose whole
+        output is one bit per word.
+
+        So there is no generation at all. One forward pass over "is this word
+        useful", and the answer is read off the logits of the two tokens the
+        model was told to choose between. That is a classifier: it cannot
+        hallucinate a word, cannot skip one, cannot reorder them, and costs
+        prefill only — a couple of minutes over three thousand words rather than
+        the twenty a generated answer would take.
+
+        What comes back is P(junk), which is worth more than the bit it
+        replaces. The review screen reads the list in that order, because a
+        confident wrong verdict is the one worth catching and an uncertain one
+        is usually a word that genuinely could go either way.
+        """
+        keep, junk = self._verdict_tokens()
+        out: list[dict] = []
+        for start in range(0, len(words), TRIAGE_BATCH):
+            chunk = words[start:start + TRIAGE_BATCH]
+            prompts = [
+                self._processor.apply_chat_template(
+                    [
+                        {"role": "system", "content": [{"type": "text", "text": TRIAGE_SYSTEM}]},
+                        {"role": "user", "content": [{"type": "text", "text": f'Word: "{word}"'}]},
+                    ],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                for word in chunk
+            ]
+            # Left padding, for the reason describe() uses it: the answer is
+            # read at the last position, and right padding would read it off a
+            # pad token.
+            inputs = self._processor(
+                text=prompts, padding=True, padding_side="left", return_tensors="pt"
+            ).to(self.device)
+
+            # logits_to_keep=1 is not a micro-optimisation. Without it the
+            # head is run over every position of every prompt, which for a
+            # 150k vocabulary at bf16 is half a gigabyte of logits per batch —
+            # allocated on a card that is already holding nine gigabytes of
+            # these weights, and thrown away undecoded except for one row.
+            logits = self._model(**inputs, logits_to_keep=1).logits[:, -1, :]
+            scores = torch.softmax(logits[:, [keep, junk]].float(), dim=-1)[:, 1]
+            for word, score in zip(chunk, scores.tolist()):
+                out.append({"word": word, "junk": score >= 0.5, "score": round(score, 4)})
+        return out
+
+    def _verdict_tokens(self) -> tuple[int, int]:
+        """The first token of each answer, which is all that is looked at.
+
+        Asserted rather than assumed: a tokenizer that gave both words the same
+        first token would make every score exactly 0.5, which reads as a model
+        with no opinion instead of as a bug in this line.
+        """
+        tokenizer = self._processor.tokenizer
+        keep = tokenizer.encode("KEEP", add_special_tokens=False)[0]
+        junk = tokenizer.encode("JUNK", add_special_tokens=False)[0]
+        if keep == junk:
+            raise RuntimeError("KEEP and JUNK share a first token in this tokenizer")
+        return keep, junk
+
 
 # A JSON object anywhere in the answer. A model told "JSON only" complies about
 # nineteen times in twenty and wraps it in a markdown fence the twentieth, and
 # refusing that answer would throw away a perfectly good caption over three
 # backticks.
 _OBJECT = re.compile(r"\{.*\}", re.DOTALL)
-
 
 def _read(answer: str) -> dict:
     """Turn whatever the model said into a caption and some tags.

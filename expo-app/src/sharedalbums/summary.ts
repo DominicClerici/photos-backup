@@ -17,6 +17,10 @@
  * phone already owns the original of. Everything found here is going to be
  * uploaded and the server will decide what is a duplicate of what, so a
  * heuristic answer here would be a second opinion nobody consults.
+ *
+ * Every function takes the albums to describe rather than reading a selection of
+ * its own, so the same code answers both questions the screen asks: what is on
+ * this phone, and what is in the albums that have been chosen out of it.
  */
 
 import type { SharedAlbum, SharedAsset } from '../../modules/photo-facts';
@@ -33,10 +37,22 @@ export const STILL_LONG_EDGE_CAP = 2048;
 export const VIDEO_LONG_EDGE_CAP = 1280;
 export const VIDEO_SECONDS_CAP = 15 * 60;
 
-/** How many assets the byte-fetch step will try. */
+/** How many assets the byte-fetch step tries unless it is told otherwise. */
 export const SAMPLE_SIZE = 3;
 
+/**
+ * The sizes the screen offers.
+ *
+ * Three is enough to see what a shared asset weighs and how long one takes.
+ * It is nowhere near enough to find out what iCloud does to somebody who asks
+ * for hundreds in a row, which is the other thing worth knowing before a backup
+ * is built on this, and the only way to learn it is to ask for hundreds.
+ */
+export const SAMPLE_SIZES = [3, 25, 100, 500];
+
 export type AlbumSummary = {
+  /** PHAssetCollection's identifier: what a chosen album is remembered by. */
+  localId: string;
   /** PhotoKit's own title, and null where an album has none. */
   title: string | null;
   assets: number;
@@ -64,9 +80,20 @@ export type EdgeSummary = {
   overCap: number;
 };
 
-export type SharedSurvey = {
-  /** False when this dev client has no shared-album enumerator in it. */
+/**
+ * What the phone answered, before anything has been chosen out of it.
+ *
+ * `supported` belongs here and not on the summary below, because it is a fact
+ * about the binary rather than about any set of albums: a dev client with no
+ * enumerator in it and a phone with Shared Albums switched off both produce no
+ * albums, and only this tells them apart.
+ */
+export type SharedLibrary = {
   supported: boolean;
+  albums: SharedAlbum[];
+};
+
+export type SharedSurvey = {
   albums: AlbumSummary[];
   /** Deduplicated across albums: an asset in three of them counts once here. */
   assets: number;
@@ -86,13 +113,10 @@ export type SharedSurvey = {
   resourceTypes: Record<string, number>;
   /** How many assets carry each PHAsset source type. */
   sourceTypes: Record<string, number>;
-  /** The assets the byte fetch will try, and why these ones — see pickSample. */
-  sample: SharedAsset[];
 };
 
-export function emptySurvey(supported: boolean): SharedSurvey {
+export function emptySurvey(): SharedSurvey {
   return {
-    supported,
     albums: [],
     assets: 0,
     stills: 0,
@@ -107,7 +131,6 @@ export function emptySurvey(supported: boolean): SharedSurvey {
     longVideos: 0,
     resourceTypes: {},
     sourceTypes: {},
-    sample: [],
   };
 }
 
@@ -121,9 +144,10 @@ export function emptySurvey(supported: boolean): SharedSurvey {
  * to be worked out from a discrepancy.
  */
 export function summarize(albums: SharedAlbum[]): SharedSurvey {
-  const survey = emptySurvey(true);
+  const survey = emptySurvey();
 
   survey.albums = albums.map((album) => ({
+    localId: album.localId,
     title: album.title,
     assets: album.assets.length,
     stills: album.assets.filter((asset) => asset.kind === 'still').length,
@@ -133,18 +157,14 @@ export function summarize(albums: SharedAlbum[]): SharedSurvey {
     newest: extreme(album.assets, Math.max),
   }));
 
-  const seen = new Map<string, SharedAsset>();
   const memberships = new Map<string, number>();
   for (const album of albums) {
     for (const asset of album.assets) {
-      seen.set(asset.localId, asset);
       memberships.set(asset.localId, (memberships.get(asset.localId) ?? 0) + 1);
     }
   }
 
-  // Newest capture first, matching every other listing in this app, and the
-  // order the sample is drawn in.
-  const assets = [...seen.values()].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+  const assets = assetsOf(albums);
 
   survey.assets = assets.length;
   survey.stills = assets.filter((asset) => asset.kind === 'still').length;
@@ -176,8 +196,22 @@ export function summarize(albums: SharedAlbum[]): SharedSurvey {
     }
   }
 
-  survey.sample = pickSample(assets);
   return survey;
+}
+
+/**
+ * Every asset in these albums, once each, newest capture first.
+ *
+ * Deduplicated because an asset in three albums is one thing to fetch, and
+ * sorted because every other listing in this app is and the sample is drawn off
+ * the front of it.
+ */
+export function assetsOf(albums: SharedAlbum[]): SharedAsset[] {
+  const seen = new Map<string, SharedAsset>();
+  for (const album of albums) {
+    for (const asset of album.assets) seen.set(asset.localId, asset);
+  }
+  return [...seen.values()].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
 }
 
 /**
@@ -192,12 +226,21 @@ export function summarize(albums: SharedAlbum[]): SharedSurvey {
  *
  * `assets` is expected newest first, and the sample inherits that: the newest
  * shared asset is the one most likely to still be there to fetch.
+ *
+ * The spread across kinds happens whatever the size, so the small sample and the
+ * large one are answering the same question with different confidence rather
+ * than being two different tests.
  */
-export function pickSample(assets: SharedAsset[]): SharedAsset[] {
+export function pickSample(assets: SharedAsset[], size: number = SAMPLE_SIZE): SharedAsset[] {
   const picked: SharedAsset[] = [];
+  const already = new Set<string>();
+  const keep = (asset: SharedAsset) => {
+    picked.push(asset);
+    already.add(asset.localId);
+  };
   const take = (match: (asset: SharedAsset) => boolean) => {
-    const found = assets.find((asset) => match(asset) && !picked.includes(asset));
-    if (found) picked.push(found);
+    const found = assets.find((asset) => match(asset) && !already.has(asset.localId));
+    if (found) keep(found);
   };
 
   take((asset) => asset.kind === 'still' && !asset.isLive);
@@ -205,11 +248,11 @@ export function pickSample(assets: SharedAsset[]): SharedAsset[] {
   take((asset) => asset.kind === 'video');
 
   for (const asset of assets) {
-    if (picked.length >= SAMPLE_SIZE) break;
-    if (!picked.includes(asset)) picked.push(asset);
+    if (picked.length >= size) break;
+    if (!already.has(asset.localId)) keep(asset);
   }
 
-  return picked.slice(0, SAMPLE_SIZE);
+  return picked.slice(0, Math.max(0, size));
 }
 
 /**
