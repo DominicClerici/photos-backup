@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from . import ocr
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -44,10 +46,18 @@ class Settings:
 
     # How many images the captioner may put through one forward pass, across
     # however many requests happened to arrive together. See batching.py: this
-    # is the difference between seven hours and two and a half over the whole
-    # library, and it is bounded by VRAM rather than by throughput — 8 images
-    # peaks at about 10.1GB, 16 at 11.2GB, and the card also has the encoder,
-    # the query parser and a desktop session on it.
+    # is worth hours over the whole library, and it is bounded by VRAM rather
+    # than by throughput — the card also has the encoder, the query parser and a
+    # desktop session on it.
+    #
+    # 4 rather than the 8 this used to be, and captioner.MAX_PIXELS is why: at
+    # 1024*1024 a batch of 8 does not fit. Measured with the resident models in
+    # place, 8 images peak past the card and 4 peak at 12.98GB, leaving 0.71GB —
+    # which is the margin NVENC needs and the whole reason residency.py exists.
+    # The throughput this gives up is small, because a batch amortises reading
+    # the weights during decode and 907 vision tokens per image make the pass
+    # prefill-bound instead: 1.21s an image here against 1.12s at a batch of 8,
+    # measured with the parser evicted to make room for one.
     describe_batch: int
 
     # How long the collector waits for company before running a batch. Small,
@@ -82,6 +92,20 @@ class Settings:
     # every result it reads.
     caption_model: str
 
+    # Which PP-OCR weights the text recogniser loads, and where it runs them.
+    #
+    # "medium" because it is what measured best: PP-OCRv5 server read *less*
+    # text than v6 small did and took three times as long, so this is not a
+    # bigger-is-better dial and the top of it is not the answer. See ocr.py.
+    #
+    # The device follows `device` when it is left alone, which is the setting
+    # anybody changing this actually means. It is separable because the two
+    # models on the card have different appetites — a machine that wants the
+    # captioner on the GPU and the recogniser off it, while something else is
+    # transcoding, can say so without moving both.
+    ocr_model_type: str
+    ocr_device: str
+
     # Where transformers caches weights. Set explicitly so the systemd unit can
     # give the service one writable directory and no home directory at all.
     cache_dir: str | None
@@ -95,10 +119,13 @@ def from_env() -> Settings:
         idle_seconds=_positive_float(os.environ.get("PHOTO_ML_IDLE_SECONDS"), 300.0),
         sweep_seconds=_positive_float(os.environ.get("PHOTO_ML_SWEEP_SECONDS"), 15.0),
         max_batch=_positive_int(os.environ.get("PHOTO_ML_MAX_BATCH"), 32),
-        describe_batch=_positive_int(os.environ.get("PHOTO_ML_DESCRIBE_BATCH"), 8),
+        describe_batch=_positive_int(os.environ.get("PHOTO_ML_DESCRIBE_BATCH"), 4),
         batch_window=_positive_float(os.environ.get("PHOTO_ML_BATCH_WINDOW_MS"), 30.0) / 1000,
         models=_models(os.environ.get("PHOTO_ML_MODELS")),
         caption_model=os.environ.get("PHOTO_ML_CAPTION_MODEL", ""),
+        ocr_model_type=os.environ.get("PHOTO_ML_OCR_MODEL_TYPE", "").strip().lower()
+        or ocr.DEFAULT_MODEL_TYPE,
+        ocr_device=os.environ.get("PHOTO_ML_OCR_DEVICE", "").strip().lower() or "",
         cache_dir=os.environ.get("PHOTO_ML_CACHE_DIR") or None,
     )
 

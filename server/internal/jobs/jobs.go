@@ -124,6 +124,10 @@ type Job struct {
 	Kind     Kind
 	AssetID  string
 	Attempts int
+	// FollowOn is false when whoever queued this wanted its output and not the
+	// work that usually follows it. Only the bulk re-render sets it; see
+	// RequeueMLPrep and migration 0021.
+	FollowOn bool
 }
 
 // Execer is the slice of pgx that both a pool and a transaction satisfy. It
@@ -312,11 +316,11 @@ func (q *Queue) claim(ctx context.Context, kinds []Kind, workerID string, ordere
 			for update skip locked
 			limit 1
 		)
-		returning id, kind, asset_id::text, attempts`
+		returning id, kind, asset_id::text, attempts, follow_on`
 
 	var j Job
 	err := q.pool.QueryRow(ctx, claim, names, workerID).
-		Scan(&j.ID, &j.Kind, &j.AssetID, &j.Attempts)
+		Scan(&j.ID, &j.Kind, &j.AssetID, &j.Attempts, &j.FollowOn)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Job{}, ErrNoJob
 	}
@@ -423,6 +427,62 @@ func ReconcileMLPrep(ctx context.Context, q Execer) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
+// RequeueMLPrep re-renders the whole library, and is what a changed MLEdge or a
+// changed rendition format is.
+//
+// ReconcileMLPrep deliberately cannot do this: its predicate is "has no mlprep
+// row", because the evidence this job ran is a file on disk rather than a row
+// and there is no version to compare against. That is the right default — it
+// means a restart never silently re-decodes 73GB of originals — and it is
+// exactly why the other half has to be typed. `photobackup ml renditions`.
+//
+// What it does not do is queue any of the three passes that read the renditions,
+// and follow_on = false is how it says so. Re-rendering is an hour of CPU;
+// re-captioning is four hours of GPU, and it should not arrive as a side effect
+// of asking for the first. Each pass is asked for by name — `ml backfill --kind
+// ocr` for the recogniser, a delete from asset_embeddings and a restart for the
+// encoder.
+//
+// That containment used to be left to Enqueue's do-nothing-on-conflict, on the
+// reasoning that an asset already embedded, read and captioned would keep its
+// rows and so keep its results. The hole in it was the asset that had never been
+// captioned at all: no row to conflict with, so the re-render created one, and
+// a bounded captioning backfill means most of the archive is in that state. An
+// hour of CPU quietly queued four hours of GPU after all — and worse than
+// merely queued, because the describe jobs arrived interleaved with the ocr
+// jobs rather than behind them, which is the ordering app.py's captioner
+// eviction assumes. See migration 0021.
+//
+// Pending rows are adopted rather than skipped, and that is the second half of
+// the same fix. This guard read `state = 'failed' or state = 'done'` — which
+// left an already-pending mlprep row exactly as it was, follow_on included. A
+// re-render is eleven hours of CPU that somebody will interrupt, and the obvious
+// thing to do afterwards is type the command again; if that second run cannot
+// reach the rows the first one left pending, most of the archive keeps whatever
+// intent it was queued with and the containment above applies to the minority.
+// The cost is an upload whose renditions were owed at the moment somebody typed
+// this, which loses its automatic caption and is picked up by the `ml backfill`
+// that follows a re-render anyway. Running rows are still left alone: that is a
+// worker mid-decode, and the lease sweep owns it.
+func RequeueMLPrep(ctx context.Context, q Execer) (int64, error) {
+	const upsert = `
+		insert into jobs (kind, asset_id, follow_on)
+		select 'mlprep', a.id, false
+		from assets a
+		where a.vault = '' and a.deleted_at is null and not a.is_overlay
+		  and a.live_parent_local_id = '' and a.live_parent_asset_id is null
+		on conflict (asset_id, kind) do update
+		    set state = 'pending', run_after = now(), attempts = 0,
+		        locked_at = null, locked_by = null, last_error = null,
+		        follow_on = false, updated_at = now()
+		    where jobs.state <> 'running'`
+	tag, err := q.Exec(ctx, upsert)
+	if err != nil {
+		return 0, fmt.Errorf("requeue mlprep jobs: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // ReconcileVision queues an embedding pass for everything that has renditions
 // and no vector from the named model.
 //
@@ -470,8 +530,9 @@ func ReconcileVision(ctx context.Context, q Execer, model string) (int64, error)
 // Unbounded asks QueueWords for every asset that is owed work.
 const Unbounded = -1
 
-// QueueWords queues the captioner or the text recogniser over assets nothing has
-// described yet, newest first, and bounded.
+// QueueWords queues the captioner or the text recogniser, newest first, and
+// bounded. By default over assets nothing has described yet; with force, over
+// every asset in scope whether it has been described or not.
 //
 // It is a command rather than a reconcile, and that is the difference between
 // this and ReconcileVision. Embedding the library is fifteen minutes and is a
@@ -489,9 +550,29 @@ const Unbounded = -1
 // Newest first, because a bounded run is a sample and the most recent
 // photographs are the ones somebody is about to search for.
 //
-// The conflict clause requeues what already ran, so a captioner swap is a delete
-// from asset_descriptions and this command — never a migration.
-func QueueWords(ctx context.Context, q Execer, kind Kind, model string, stills, videos int) (int64, error) {
+// The conflict clause requeues what already ran, so a captioner swap is this
+// command and never a migration.
+//
+// force is what makes that true for a changed *recipe* rather than a changed
+// model — a raised captioner.MAX_PIXELS, a rewritten prompt, better OCR
+// weights under the same name. Without it those are invisible here: the filter
+// this drops asks whether a row exists, not whether the row is any good, so
+// re-running the pass over a library that already has captions queues exactly
+// nothing.
+//
+// It does not delete anything first, and that is the point rather than an
+// omission. PutDescription and PutOCR both upsert, putTags clears and rewrites
+// the set, and each write refreshes its own asset_search row — so a forced pass
+// replaces each photograph's words in one transaction, as it reaches it. The
+// obvious alternative is a delete followed by this command, and it is worse in
+// the way that matters: it would leave the library with no captions at all for
+// however many hours the pass takes, and a search box that has quietly lost its
+// index is a worse failure than one whose answers are a few hours stale.
+//
+// What it costs is that this is now a command that can spend a whole night of
+// GPU on work nobody needed, so the caller says --force out loud and mlcmd
+// prints what it is about to redo.
+func QueueWords(ctx context.Context, q Execer, kind Kind, model string, stills, videos int, force bool) (int64, error) {
 	var written string
 	switch kind {
 	case KindDescribe:
@@ -517,7 +598,7 @@ func QueueWords(ctx context.Context, q Execer, kind Kind, model string, stills, 
 			join jobs prep on prep.asset_id = a.id
 			     and prep.kind = 'mlprep' and prep.state = 'done'
 			where a.vault = '' and a.deleted_at is null
-			  and not exists (` + written + `)
+			  and (not exists (` + written + `) or $5)
 		)
 		insert into jobs (kind, asset_id)
 		select $2, id from candidates
@@ -527,7 +608,7 @@ func QueueWords(ctx context.Context, q Execer, kind Kind, model string, stills, 
 		    set state = 'pending', run_after = now(), attempts = 0, last_error = null
 		    where jobs.state = 'failed' or jobs.state = 'done'`
 
-	tag, err := q.Exec(ctx, insert, model, string(kind), stills, videos)
+	tag, err := q.Exec(ctx, insert, model, string(kind), stills, videos, force)
 	if err != nil {
 		return 0, fmt.Errorf("queue %s jobs: %w", kind, err)
 	}
@@ -621,6 +702,45 @@ func (q *Queue) Counts(ctx context.Context) ([]Count, error) {
 		counts = append(counts, c)
 	}
 	return counts, rows.Err()
+}
+
+// Quiet reports whether the named kinds have nothing left to do and have not
+// finished anything within the last `within`.
+//
+// The question a pool asks before taking work that must not run beside those
+// kinds. Two conditions rather than one, and the second is the whole point: an
+// empty queue is not a quiet one when an upload lands every two seconds. The
+// pending check alone would let a caption start in the gap between two
+// photographs arriving, which is exactly the interleaving that has to be
+// avoided — see worker.visionHold and photo_ml/residency.py.
+//
+// A `within` of zero asks only the first question: is there unfinished work of
+// these kinds right now.
+//
+// Failed rows are deliberately not counted. They are parked, nothing will claim
+// them, and letting a permanently broken job hold off another pass forever would
+// be the wrong kind of caution.
+func (q *Queue) Quiet(ctx context.Context, kinds []Kind, within time.Duration) (bool, error) {
+	names := make([]string, len(kinds))
+	for i, k := range kinds {
+		names[i] = string(k)
+	}
+
+	const query = `
+		select not exists (
+		    select 1 from jobs
+		    where kind = any($1::text[]) and state in ('pending', 'running')
+		) and not exists (
+		    select 1 from jobs
+		    where kind = any($1::text[]) and state = 'done'
+		      and updated_at > now() - make_interval(secs => $2)
+		)`
+
+	var quiet bool
+	if err := q.pool.QueryRow(ctx, query, names, within.Seconds()).Scan(&quiet); err != nil {
+		return false, fmt.Errorf("ask whether %v are quiet: %w", kinds, err)
+	}
+	return quiet, nil
 }
 
 // Failed lists jobs that gave up, newest first, with the error that stopped

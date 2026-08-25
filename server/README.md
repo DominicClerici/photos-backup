@@ -403,7 +403,7 @@ Five kinds of job, in four separately sized pools:
 | `playback` | H.264/AAC MP4 capped at 1080p, `+faststart` | `TRANSCODE_CONCURRENCY` |
 | `merge` | concatenates the pieces of a split Snapchat recording into one archived original | `TRANSCODE_CONCURRENCY` |
 | `signature` | decodes an original into the hashes the duplicate scan compares | `SIGNATURE_CONCURRENCY` |
-| `mlprep` | writes the uncropped 512px renditions a vision model reads | `PREP_CONCURRENCY` |
+| `mlprep` | writes the uncropped 1536px renditions the ML passes read | `PREP_CONCURRENCY` |
 | `vision` | posts those renditions to photo-ml and stores the vectors | `VISION_CONCURRENCY` |
 
 The pools are split so a handful of 4K transcodes cannot claim every slot and
@@ -452,7 +452,7 @@ Stored on disk: `<sha>.thumb.webp`, and `<sha>.mp4` for video. The 2048px
 preview is rendered per request and never stored; the browser's cache does the
 caching a derivative file would.
 
-`mlprep` adds `<sha>.ml.webp` — the whole photograph, **uncropped**, 512px on
+`mlprep` adds `<sha>.ml.webp` — the whole photograph, **uncropped**, 1536px on
 its longest edge — and `<sha>.ml.0.webp` through `.ml.5.webp` for a video, six
 frames spread across its running time. Uncropped is the entire point of the
 file: `.thumb512.webp` is a square centre crop, which is right for a grid of
@@ -740,7 +740,7 @@ draining through the same pool:
 | kind | model | cost over the library | what it writes |
 |---|---|---|---|
 | `vision` | `siglip2-so400m-patch14-384` | 16 min | `asset_embeddings`, one row per frame |
-| `ocr` | `rapidocr` (ONNX, CPU) | ~30 min | `asset_ocr` |
+| `ocr` | `rapidocr-v6-medium` (torch, GPU) | ~50 min | `asset_ocr` |
 | `describe` | `qwen3-vl-4b-instruct` | 3–7 h | `asset_descriptions`, `tags`, `asset_tags` |
 
 Three kinds rather than one, and the reason is the third column. Re-embedding
@@ -774,12 +774,28 @@ photobackup ml status                              how far the passes have got
 photobackup ml backfill                            the whole library
 photobackup ml backfill --stills 1000 --videos 20  a sample, newest first
 photobackup ml backfill --kind ocr                 one pass at a time
+photobackup ml backfill --force                    redo what already has words
 photobackup ml reindex                             rebuild the tsvector
 ```
 
 Because it is typed, it can be bounded — which is what makes a thousand
 photographs and twenty clips an evening's worth of vocabulary to build a search
 page against, rather than a choice between nothing and everything.
+
+`--force` is the one to be deliberate about. Without it a backfill asks which
+assets have no words and queues those, so a changed *recipe* under an unchanged
+model name — a raised `captioner.MAX_PIXELS`, a rewritten prompt, better OCR
+weights — queues nothing at all, because everything already has a caption. With
+it, every asset in scope is queued again.
+
+It deletes nothing to do that, and that is deliberate. `PutDescription` and
+`PutOCR` upsert, `putTags` clears and rewrites the set, and each write rebuilds
+its own `asset_search` row — so each photograph's words are replaced in one
+transaction as the pass reaches it. The alternative, a `delete` and an ordinary
+backfill, would leave the library with no captions for the hours the pass takes;
+search that answers with stale words beats search that has quietly lost its
+index. It also means `ml status` barely moves during a forced run, since it
+counts assets that *have* words: watch the queue instead.
 
 ### Reading it back for one photograph
 
@@ -1537,7 +1553,8 @@ photobackup reindex [--adopt-orphans]   rebuild the database from manifest.jsonl
 photobackup geocode [--all]             name the places photographs were taken
 photobackup ml status                   how far the captioning passes have got
 photobackup ml backfill [--kind K]      queue them; --stills N --videos N bounds
-  [--stills N] [--videos N]             a sample, newest first
+  [--stills N] [--videos N] [--force]   a sample, newest first; --force redoes
+                                        what already has words
 photobackup ml reindex                  rebuild the full-text index
 photobackup import --from DIR [--from…] ingest a Google Photos export
 photobackup import-snapchat --from DIR  ingest a Snapchat export, one half at a

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dominicclerici/photos-backup/server/internal/db"
+	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 )
 
@@ -33,6 +34,8 @@ func runML(ctx context.Context, args []string) (int, error) {
 	switch args[0] {
 	case "backfill":
 		return runMLBackfill(ctx, args[1:])
+	case "renditions":
+		return runMLRenditions(ctx, args[1:])
 	case "status":
 		return runMLStatus(ctx, args[1:])
 	case "reindex":
@@ -50,7 +53,11 @@ const mlUsage = `photobackup ml — what a photograph is of, in words
 
   ml status                            how far the passes have got
   ml backfill [--kind ocr|describe]    queue the captioner and the text
-    [--stills N] [--videos N]          recogniser over what has none
+    [--stills N] [--videos N]          recogniser over what has none;
+    [--force]                          --force redoes what already has words
+  ml renditions                        re-render every ML rendition, after a
+                                       change to derivstore.MLEdge. Renders
+                                       only: queues no pass that reads them
   ml reindex                           rebuild the full-text index from the
                                        captions, tags, filenames and places
 
@@ -60,11 +67,65 @@ then captions, because the first is twenty minutes and the second is four hours.
 Watch it with 'ml status' or the status page.
 `
 
+// runMLRenditions re-renders what the models read.
+//
+// The one backfill here that is not about a model at all: it decodes originals
+// and writes WebPs on the CPU, in the prep pool, with photo-ml not in the
+// picture. It is typed for the reason ReconcileMLPrep explains — the evidence
+// this job ran is a file on disk rather than a row, so a changed MLEdge is
+// invisible to a restart and has to be asked for.
+//
+// It queues only the rendering, and migration 0021 is what makes that true
+// rather than nearly true: the mlprep job normally queues the three passes that
+// read its output when it finishes, which is right for a photograph arriving
+// from a phone and wrong for seventeen thousand of them arriving at the rate a
+// CPU can render. Re-captioning the library is four hours of GPU and should
+// never be the side effect of asking for an hour of CPU. The last lines say
+// which command asks for each of them.
+func runMLRenditions(ctx context.Context, args []string) (int, error) {
+	fs := flag.NewFlagSet("ml renditions", flag.ExitOnError)
+	dryRun := fs.Bool("dry-run", false, "say how many would be queued without queueing them")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage, nil
+	}
+
+	a, err := open(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	defer a.close()
+
+	if *dryRun {
+		fmt.Printf("would re-render every ML rendition at %dpx on its longest edge\n", derivstore.MLEdge)
+		fmt.Println("\nnothing was queued (--dry-run)")
+		return exitOK, nil
+	}
+
+	n, err := jobs.RequeueMLPrep(ctx, a.deps.Store.Pool())
+	if err != nil {
+		return fail(err)
+	}
+	fmt.Printf("mlprep   queued %d assets at %dpx\n", n, derivstore.MLEdge)
+
+	fmt.Println()
+	fmt.Println("The prep pool drains these on the CPU — about an hour over this library —")
+	fmt.Println("and needs no GPU and no photo-ml at all. Nothing that reads the renditions is")
+	fmt.Println("queued by this: not the encoder, not the recogniser, not the captioner, and")
+	fmt.Println("not for the assets that have never had any of the three. Ask for those by")
+	fmt.Println("name, once this has finished:")
+	fmt.Println()
+	fmt.Println("  photobackup ml backfill --kind ocr --force     read the text again, at the new size")
+	fmt.Println("  photobackup ml backfill --kind describe --force   and then the captions")
+	fmt.Println("  photobackup ml status                         how far it has got")
+	return exitOK, nil
+}
+
 func runMLBackfill(ctx context.Context, args []string) (int, error) {
 	fs := flag.NewFlagSet("ml backfill", flag.ExitOnError)
 	kind := fs.String("kind", "all", "which pass to queue: ocr, describe, or all")
 	stills := fs.Int("stills", jobs.Unbounded, "how many photographs, newest first; -1 for every one")
 	videos := fs.Int("videos", jobs.Unbounded, "how many videos, newest first; -1 for every one")
+	force := fs.Bool("force", false, "redo assets that already have words, not just the ones that have none")
 	dryRun := fs.Bool("dry-run", false, "say what would be queued without queueing it")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage, nil
@@ -92,8 +153,14 @@ func runMLBackfill(ctx context.Context, args []string) (int, error) {
 	}
 
 	if *dryRun {
-		fmt.Printf("%s over at most %s and %s of the %d assets with renditions\n",
-			names(kinds), count(*stills, "photographs"), count(*videos, "videos"), before.Eligible)
+		fmt.Printf("%s over at most %s and %s of the %d assets with renditions%s\n",
+			names(kinds), count(*stills, "photographs"), count(*videos, "videos"),
+			before.Eligible, forcing(*force))
+		if *force {
+			fmt.Printf("\nof those, %d already have a caption and %d already have text read;\n",
+				before.Described, before.Recognised)
+			fmt.Println("--force is what redoes them, and their existing words stand until each is rewritten")
+		}
 		fmt.Println("\nnothing was queued (--dry-run)")
 		return exitOK, nil
 	}
@@ -103,7 +170,7 @@ func runMLBackfill(ctx context.Context, args []string) (int, error) {
 		if k == jobs.KindOCR {
 			model = db.OCRModel
 		}
-		n, err := jobs.QueueWords(ctx, a.deps.Store.Pool(), k, model, *stills, *videos)
+		n, err := jobs.QueueWords(ctx, a.deps.Store.Pool(), k, model, *stills, *videos, *force)
 		if err != nil {
 			return fail(err)
 		}
@@ -115,6 +182,15 @@ func runMLBackfill(ctx context.Context, args []string) (int, error) {
 	fmt.Println("captions — and only while photo-ml is answering. Nothing else is affected:")
 	fmt.Println("backups still commit, the gallery still draws, and every other pool is idle")
 	fmt.Println("of this work entirely.")
+	if *force {
+		fmt.Println()
+		fmt.Println("Nothing was deleted to do this. Each asset's words are replaced in one")
+		fmt.Println("transaction as the pass reaches it, so search keeps answering throughout —")
+		fmt.Println("out of date for as long as the pass takes, never empty.")
+		fmt.Println()
+		fmt.Println("'ml status' counts assets that have words, so a forced run barely moves it.")
+		fmt.Println("The queue is what to watch: the status page, or the pending count.")
+	}
 	fmt.Println()
 	fmt.Println("  photobackup ml status        how far it has got")
 	return exitOK, nil
@@ -253,6 +329,15 @@ func count(n int, what string) string {
 		return "every one of the " + what
 	}
 	return fmt.Sprintf("%d %s", n, what)
+}
+
+// forcing says which of the two things --force changes, in the one clause the
+// dry run has room for.
+func forcing(force bool) string {
+	if force {
+		return ", including the ones that already have words"
+	}
+	return ", skipping the ones that already have words"
 }
 
 func line(label string, done, of int64, model string) {

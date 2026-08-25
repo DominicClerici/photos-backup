@@ -161,6 +161,28 @@ func (s *Store) Search(ctx context.Context, req SearchRequest) ([]SearchResult, 
 			if _, err := tx.Exec(ctx, `set local hnsw.max_scan_tuples = 100000`); err != nil {
 				return fmt.Errorf("configure the vector index: %w", err)
 			}
+			// The width of the graph walk, and the counter-intuitive one: this
+			// is both more accurate and faster than pgvector's default of 40.
+			//
+			// Accuracy is the obvious half. Measured against an exhaustive scan
+			// over bench/queries.json, the index rebuilt by migration 0020
+			// returns 0.94 of the true top ten at 40 and 0.99 at 200.
+			//
+			// The speed is the half worth writing down, because it looks
+			// backwards. `candidateDepth` asks for 400 rows and iterative_scan
+			// above will keep resuming the walk until it has them, so a narrow
+			// first pass does not save work — it buys a scan that has to be
+			// restarted, repeatedly, each resumption re-entering the graph from
+			// the top. A first pass wide enough to nearly answer the question
+			// costs one walk instead of several: 6-12ms here against 12-16ms at
+			// 40, measured on this archive.
+			//
+			// Below candidateDepth on purpose. 200 is where recall stops moving;
+			// paying 400 to match the LIMIT exactly buys nothing measurable and
+			// this is a setting every search pays.
+			if _, err := tx.Exec(ctx, `set local hnsw.ef_search = 200`); err != nil {
+				return fmt.Errorf("configure the vector index: %w", err)
+			}
 		}
 		rows, err := tx.Query(ctx, searchSQL(req.Filter, narrow), args...)
 		if err != nil {

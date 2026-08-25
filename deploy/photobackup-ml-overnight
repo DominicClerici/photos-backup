@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# The overnight pass, waited on rather than watched.
+#
+# After `photobackup ml renditions` the archive is re-rendering on the CPU for
+# about an hour, and the two passes that read those renditions are worth
+# nothing until it finishes: `ml backfill` scopes itself to assets whose mlprep
+# job is done, so queueing early queues a fraction of the library. This waits
+# for the render, forces the text recogniser over everything, waits for that,
+# then forces the captioner — the four-hour one — last.
+#
+# It reads `ml status` and nothing else, so it is safe to kill at any point:
+# the queue is the state, and re-running picks up where this left off.
+#
+#   tmux new -s ml 'deploy/photobackup-ml-overnight'
+#
+# tmux because the wrapper's systemd-run --pty wants a terminal, and because
+# sudo's credential cache is refreshed by the polling rather than by you.
+set -euo pipefail
+
+ADMIN=${ADMIN:-photobackup-admin}
+INTERVAL=${INTERVAL:-30}   # seconds between polls
+STABLE=${STABLE:-6}        # unchanged polls before the render counts as finished
+
+snapshot=
+
+log() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+# poll takes one reading. The wrapper runs photobackup under a pty, so every
+# line arrives with a carriage return on it.
+poll() {
+	snapshot=$("$ADMIN" ml status | tr -d '\r')
+}
+
+eligible() { printf '%s\n' "$snapshot" | awk 'NR==1{print $1+0}'; }
+
+# outstanding counts the jobs of a kind that have not finished. Anything not
+# pending or running is settled, failures included — a failed job is never
+# coming back on its own, and waiting for it would wait forever.
+outstanding() {
+	printf '%s\n' "$snapshot" |
+		awk -v k="$1" '$1==k && ($2=="pending" || $2=="running"){n+=$3} END{print n+0}'
+}
+
+state_count() {
+	printf '%s\n' "$snapshot" |
+		awk -v k="$1" -v s="$2" '$1==k && $2==s{n+=$3} END{print n+0}'
+}
+
+# wait_render waits for mlprep, which `ml status` does not print: it shows the
+# three passes in front of the GPU and not the CPU pass feeding them. So the
+# signal is indirect — the in-scope count is exactly "assets whose mlprep is
+# done", and a finished mlprep enqueues a vision job, so the render is over
+# when that count has stopped climbing and the embeddings behind it have
+# drained. Both, because either alone has a quiet moment in the middle.
+wait_render() {
+	local last=-1 stable=0 n v
+	while :; do
+		poll
+		n=$(eligible)
+		v=$(outstanding vision)
+		if [ "$n" -eq "$last" ] && [ "$v" -eq 0 ] && [ "$n" -gt 0 ]; then
+			stable=$((stable + 1))
+		else
+			stable=0
+		fi
+		last=$n
+		log "renditions: $n in scope, $v embeddings outstanding, settled $stable/$STABLE"
+		[ "$stable" -ge "$STABLE" ] && break
+		sleep "$INTERVAL"
+	done
+	log "renditions done: $last assets in scope"
+}
+
+wait_kind() {
+	local kind=$1 n f
+	while :; do
+		poll
+		n=$(outstanding "$kind")
+		f=$(state_count "$kind" failed)
+		log "$kind: $n outstanding${f:+, $f failed}"
+		[ "$n" -eq 0 ] && break
+		sleep "$INTERVAL"
+	done
+	if [ "$f" -gt 0 ]; then
+		log "$kind finished with $f failed — photobackup verify, or the status page"
+	fi
+	log "$kind done"
+}
+
+log "waiting for the ML renditions to finish rendering"
+wait_render
+
+log "queueing the text recogniser over everything"
+"$ADMIN" ml backfill --kind ocr --force
+wait_kind ocr
+
+log "queueing the captioner over everything — this is the four-hour one"
+"$ADMIN" ml backfill --kind describe --force
+wait_kind describe
+
+log "both passes finished"
+"$ADMIN" ml status

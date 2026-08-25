@@ -22,9 +22,13 @@ import (
 // Changing either string is a model swap, and a model swap is a data operation:
 //
 //	delete from asset_descriptions where model = 'qwen3-vl-4b-instruct';
+//	delete from asset_ocr          where model = 'rapidocr';
 //
 // then `photobackup ml backfill`, which finds every asset the new name has said
-// nothing about. Never a migration and never a truncate, and the old and the new
+// nothing about. The delete is optional and separable — the rows under the old
+// name cost a few megabytes and are the only copy of what the previous model
+// said, so the honest order is backfill first, read both, and drop the old one
+// once the new one has proved itself. Never a migration and never a truncate, and the old and the new
 // can sit in the tables together while somebody reads both.
 //
 // rebuild_asset_search takes them as arguments for exactly that reason. The one
@@ -32,7 +36,7 @@ import (
 // where both tables were empty and the value could not have mattered.
 var (
 	CaptionModel = captionModelFromEnv()
-	OCRModel     = "rapidocr"
+	OCRModel     = ocrModelFromEnv()
 )
 
 // captionModelFromEnv reads PHOTOD_CAPTION_MODEL, and is the Go half of
@@ -57,16 +61,45 @@ var (
 // delete and a requeue rather than a migration; it is also why the two halves
 // disagreeing is worth noticing, and worker.checkModel is what notices.
 func captionModelFromEnv() string {
-	const fallback = "qwen3-vl-4b-instruct"
-	name := strings.TrimSpace(os.Getenv("PHOTOD_CAPTION_MODEL"))
+	return modelFromEnv("PHOTOD_CAPTION_MODEL", "qwen3-vl-4b-instruct")
+}
+
+// ocrModelFromEnv reads PHOTOD_OCR_MODEL, and is the Go half of photo-ml's
+// PHOTO_ML_OCR_MODEL_TYPE.
+//
+// This was the constant "rapidocr", named for the family on purpose: rapidocr
+// picked its own checkpoints per release, and the thing this archive could
+// reason about was "the text recogniser" rather than a version string that
+// changed on `uv sync`. Choosing the weights is what ended that. PP-OCRv6 small
+// and PP-OCRv6 medium do not read the same text — small returns nothing at all
+// from a line of receipt text that medium reads perfectly — so which one wrote a
+// row is a fact about the row, and the family name would now be hiding it.
+//
+// Naming the generation is also what makes the upgrade a data operation rather
+// than a truncate. `ml backfill --kind ocr` skips assets that already have a row
+// under the *current* name, so a name that has changed means every asset is owed
+// work, the old rows stay readable beside the new ones, and nothing is destroyed
+// by a pass somebody started and stopped halfway.
+func ocrModelFromEnv() string {
+	return modelFromEnv("PHOTOD_OCR_MODEL", "rapidocr-v6-medium")
+}
+
+// modelFromEnv reads one model name, validated rather than trusted.
+//
+// The validation is not defensive habit: search.go pastes these strings into a
+// query literal, because the column is compared against a constant there and a
+// bound parameter would cost the planner its estimate. A name that cannot
+// contain a quote is what makes that paste safe.
+func modelFromEnv(key, fallback string) string {
+	name := strings.TrimSpace(os.Getenv(key))
 	if name == "" {
 		return fallback
 	}
 	for _, r := range name {
 		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '.' && r != '_' {
 			fmt.Fprintf(os.Stderr,
-				"PHOTOD_CAPTION_MODEL %q has a character a model name may not have; using %s\n",
-				name, fallback)
+				"%s %q has a character a model name may not have; using %s\n",
+				key, name, fallback)
 			return fallback
 		}
 	}

@@ -63,7 +63,7 @@ func matchFacets(toks []token, q *Query) {
 	// internal/db's closed list — an unknown one is refused rather than ignored
 	// there, so these have to stay in step with it.
 	for _, c := range []struct {
-		key      string
+		key       string
 		spellings [][]string
 	}{
 		{"screenshots", [][]string{{"screenshot"}, {"screenshots"}, {"screen", "shot"}, {"screen", "shots"}}},

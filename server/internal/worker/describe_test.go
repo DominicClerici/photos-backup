@@ -2,8 +2,10 @@ package worker
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dominicclerici/photos-backup/server/internal/db"
 	"github.com/dominicclerici/photos-backup/server/internal/jobs"
@@ -292,4 +294,141 @@ func lengths(batches [][]string) []int {
 		out[i] = len(b)
 	}
 	return out
+}
+
+// The flag that makes a changed recipe requeueable.
+//
+// QueueWords asks whether a row exists, not whether it is any good, so a raised
+// captioner.MAX_PIXELS or a rewritten prompt is invisible to an ordinary
+// backfill: everything already has a caption, so nothing is owed and nothing is
+// queued. --force is what says "the words are stale, not missing".
+func TestBackfillSkipsDescribedAssetsUnlessForced(t *testing.T) {
+	ml := newFakeML(t)
+	ml.captions = []string{"a golden retriever on a beach"}
+	h := newHarness(t).withML(ml.URL)
+	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
+
+	h.claimAndRun(t, jobs.KindMetadata)
+	h.claimAndRun(t, jobs.KindMLPrep)
+	h.claimAndRun(t, jobs.KindDescribe)
+
+	pool := h.store.Pool()
+	queued, err := jobs.QueueWords(context.Background(), pool,
+		jobs.KindDescribe, db.CaptionModel, jobs.Unbounded, jobs.Unbounded, false)
+	if err != nil {
+		t.Fatalf("queue without force: %v", err)
+	}
+	if queued != 0 {
+		t.Errorf("queued %d assets that already have a caption, want 0", queued)
+	}
+
+	forced, err := jobs.QueueWords(context.Background(), pool,
+		jobs.KindDescribe, db.CaptionModel, jobs.Unbounded, jobs.Unbounded, true)
+	if err != nil {
+		t.Fatalf("queue with force: %v", err)
+	}
+	if forced != 1 {
+		t.Fatalf("forced run queued %d assets, want the 1 that is already described", forced)
+	}
+	if state := h.jobState(t, asset.ID, jobs.KindDescribe); state != string(jobs.StatePending) {
+		t.Errorf("describe job state = %q, want it back to pending", state)
+	}
+
+	// The old caption stands until the pass reaches this asset again — the
+	// whole reason --force queues rather than deleting. A library mid-backfill
+	// answers searches with words that are stale, never with none.
+	if got := h.caption(t, asset.ID); got != "a golden retriever on a beach" {
+		t.Errorf("caption = %q, want the old one still standing after queueing", got)
+	}
+
+	ml.captions = []string{"a dog running on sand"}
+	h.claimAndRun(t, jobs.KindDescribe)
+	if got := h.caption(t, asset.ID); got != "a dog running on sand" {
+		t.Errorf("caption after the forced pass = %q, want it replaced", got)
+	}
+	if !h.searchable(t, asset.ID, "sand") {
+		t.Error("the replacement caption did not reach the full-text index")
+	}
+	if h.searchable(t, asset.ID, "retriever") {
+		t.Error("the old caption is still in the index; the tsvector was not rebuilt")
+	}
+}
+
+// The gate that keeps the captioner off a card the recogniser is still using.
+//
+// The failure it prevents is not a slow queue, it is a full one: an upload every
+// two seconds keeps the recogniser loaded and the describe queue claimable at
+// the same time, both models end up resident, and 15.51GB does not hold them.
+func TestTheCaptionerWaitsForTheCheapPassesToGoQuiet(t *testing.T) {
+	h := newHarness(t).withML(newFakeML(t).URL)
+	h.DescribeQuiet = 2 * time.Minute
+	ctx := context.Background()
+
+	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
+	h.claimAndRun(t, jobs.KindMetadata)
+	h.claimAndRun(t, jobs.KindMLPrep)
+
+	// An ocr job is pending: text recognition is still owed, so no caption yet.
+	if held := h.visionHold(ctx); !slices.Contains(held, jobs.KindDescribe) {
+		t.Error("with an ocr job pending, the captioner must be held back")
+	}
+
+	h.claimAndRun(t, jobs.KindVision)
+	h.claimAndRun(t, jobs.KindOCR)
+
+	// The queue is empty now, and that is still not the question. Another
+	// photograph is two seconds away.
+	if held := h.visionHold(ctx); !slices.Contains(held, jobs.KindDescribe) {
+		t.Error("an empty ocr queue is not a quiet one; the captioner must still wait")
+	}
+
+	// Two minutes later, with nothing new having arrived.
+	if _, err := h.store.Pool().Exec(ctx,
+		`update jobs set updated_at = now() - interval '10 minutes'
+		 where asset_id = $1::uuid and kind in ('vision', 'ocr')`, asset.ID); err != nil {
+		t.Fatalf("age the cheap passes: %v", err)
+	}
+	if held := h.visionHold(ctx); len(held) != 0 {
+		t.Errorf("after the quiet period the captioner may load; held = %v", held)
+	}
+
+	// And nothing else was ever held: the photograph is searchable by its text
+	// and by what it looks like the whole time it is waiting for a caption.
+	if state := h.jobStateOrNone(t, asset.ID, jobs.KindOCR); state != string(jobs.StateDone) {
+		t.Errorf("ocr state = %q, want done — only the caption waits", state)
+	}
+}
+
+// The one fact photo-ml cannot work out for itself, and the reason the ocr
+// request carries it: whether anything is waiting to be captioned decides
+// whether the recogniser may send an idle captioner off the card.
+func TestTheOCRRequestSaysWhetherAnyCaptioningIsOutstanding(t *testing.T) {
+	ml := newFakeML(t)
+	h := newHarness(t).withML(ml.URL)
+	ctx := context.Background()
+
+	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
+	h.claimAndRun(t, jobs.KindMetadata)
+	h.claimAndRun(t, jobs.KindMLPrep)
+	h.claimAndRun(t, jobs.KindVision)
+
+	// A describe job is pending for this very asset, so the captioner has work
+	// and evicting it to read one photograph would be the bad trade.
+	h.claimAndRun(t, jobs.KindOCR)
+	if len(ml.mayRelease) != 1 || ml.mayRelease[0] {
+		t.Errorf("mayRelease = %v, want [false] while a describe job is pending", ml.mayRelease)
+	}
+
+	// Drain the captioning work and read the text again. Now there is nothing
+	// the captioner is holding the card for.
+	h.claimAndRun(t, jobs.KindDescribe)
+	if _, err := jobs.QueueWords(ctx, h.store.Pool(), jobs.KindOCR, db.OCRModel, -1, -1, true); err != nil {
+		t.Fatalf("requeue ocr: %v", err)
+	}
+	h.claimAndRun(t, jobs.KindOCR)
+
+	if len(ml.mayRelease) != 2 || !ml.mayRelease[1] {
+		t.Errorf("mayRelease = %v, want the second true once nothing is queued to describe", ml.mayRelease)
+	}
+	_ = asset
 }

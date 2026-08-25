@@ -1,0 +1,55 @@
+{
+  "note": "Search phrases for embed_bench.py, grounded in what this archive holds. The places behind them are the library's own: Bloomington, Moraga and the East Bay, Stinson Beach, Breckenridge and Tahoe, Shasta, the Owens Valley, New York. A query nothing matches is not wasted - it measures what a system does with an honest miss - but a set made entirely of those would measure nothing else.",
+  "queries": [
+    {"id": "beach",        "text": "a beach",                              "kind": "scene"},
+    {"id": "snowy-mtn",    "text": "snow covered mountains",               "kind": "scene"},
+    {"id": "skyline",      "text": "a city skyline at night",              "kind": "scene"},
+    {"id": "trail",        "text": "a hiking trail in the woods",          "kind": "scene"},
+    {"id": "desert",       "text": "a desert landscape",                   "kind": "scene"},
+    {"id": "sunset-water", "text": "a sunset over the ocean",              "kind": "scene"},
+    {"id": "restaurant",   "text": "inside a restaurant",                  "kind": "scene"},
+    {"id": "campus",       "text": "a college campus",                     "kind": "scene"},
+    {"id": "pool",         "text": "a swimming pool",                      "kind": "scene"},
+    {"id": "parking",      "text": "a parking lot",                        "kind": "scene"},
+
+    {"id": "dog",          "text": "a dog",                                "kind": "object"},
+    {"id": "cat",          "text": "a cat",                                "kind": "object"},
+    {"id": "car",          "text": "a car",                                "kind": "object"},
+    {"id": "bike",         "text": "a bicycle",                            "kind": "object"},
+    {"id": "xmas-tree",    "text": "a christmas tree",                     "kind": "object"},
+    {"id": "cake",         "text": "a birthday cake",                      "kind": "object"},
+    {"id": "food",         "text": "a plate of food",                      "kind": "object"},
+    {"id": "beer",         "text": "a glass of beer",                      "kind": "object"},
+    {"id": "laptop",       "text": "a laptop screen",                      "kind": "object"},
+    {"id": "flowers",      "text": "flowers",                              "kind": "object"},
+
+    {"id": "skiing",       "text": "skiing",                               "kind": "activity"},
+    {"id": "dancing",      "text": "people dancing",                       "kind": "activity"},
+    {"id": "guitar",       "text": "someone playing guitar",               "kind": "activity"},
+    {"id": "bar",          "text": "a group of friends at a bar",          "kind": "activity"},
+    {"id": "basketball",   "text": "people playing basketball",            "kind": "activity"},
+    {"id": "lake-swim",    "text": "swimming in a lake",                   "kind": "activity"},
+    {"id": "concert",      "text": "a concert crowd",                      "kind": "activity"},
+    {"id": "cooking",      "text": "someone cooking",                      "kind": "activity"},
+
+    {"id": "text-convo",   "text": "a screenshot of a text conversation",  "kind": "text"},
+    {"id": "handwriting",  "text": "a handwritten note",                   "kind": "text"},
+    {"id": "receipt",      "text": "a receipt",                            "kind": "text"},
+    {"id": "whiteboard",   "text": "a whiteboard covered in writing",      "kind": "text"},
+    {"id": "road-sign",    "text": "a road sign",                          "kind": "text"},
+    {"id": "menu",         "text": "a restaurant menu",                    "kind": "text"},
+
+    {"id": "selfie",       "text": "a selfie",                             "kind": "people"},
+    {"id": "group-photo",  "text": "a group photo",                        "kind": "people"},
+    {"id": "baby",         "text": "a baby",                               "kind": "people"},
+    {"id": "sunglasses",   "text": "someone wearing sunglasses",           "kind": "people"},
+
+    {"id": "rain",         "text": "a rainy day",                          "kind": "vibe"},
+    {"id": "fog",          "text": "fog",                                  "kind": "vibe"},
+    {"id": "fireworks",    "text": "fireworks",                            "kind": "vibe"},
+    {"id": "campfire",     "text": "a campfire at night",                  "kind": "vibe"},
+    {"id": "neon",         "text": "neon lights",                          "kind": "vibe"},
+    {"id": "messy-room",   "text": "a messy room",                         "kind": "vibe"},
+    {"id": "empty-road",   "text": "an empty road",                        "kind": "vibe"}
+  ]
+}

@@ -265,4 +265,3 @@ func (v Vocabulary) matchPlace(claimed string) *Place {
 	}
 	return nil
 }
-

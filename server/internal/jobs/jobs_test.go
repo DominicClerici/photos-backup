@@ -325,3 +325,105 @@ func TestRequeueRunsAFinishedJobAgain(t *testing.T) {
 		t.Errorf("attempts = %d after requeue, want the counter reset to 1", again.Attempts)
 	}
 }
+
+// Quiet is the predicate the vision pool asks before it lets the captioner onto
+// the card. The distinction it exists to draw is empty versus quiet: a queue
+// with nothing in it right now is not a queue that has stopped, and the gap
+// between two uploads is long enough to claim a describe job in.
+func TestQuietDistinguishesAnEmptyQueueFromAStoppedOne(t *testing.T) {
+	q, store := testQueue(t)
+	clearJobs(t, store)
+	ctx := context.Background()
+	cheap := []jobs.Kind{jobs.KindVision, jobs.KindOCR}
+
+	quiet, err := q.Quiet(ctx, cheap, time.Minute)
+	if err != nil {
+		t.Fatalf("quiet on an empty queue: %v", err)
+	}
+	if !quiet {
+		t.Error("an empty queue with no recent work is quiet")
+	}
+
+	assetID := newAsset(t, store)
+	if err := jobs.Enqueue(ctx, store.Pool(), jobs.KindOCR, assetID); err != nil {
+		t.Fatalf("enqueue ocr: %v", err)
+	}
+
+	if quiet, err = q.Quiet(ctx, cheap, time.Minute); err != nil {
+		t.Fatalf("quiet: %v", err)
+	}
+	if quiet {
+		t.Error("a pending ocr job is not quiet")
+	}
+
+	job, err := q.Claim(ctx, []jobs.Kind{jobs.KindOCR}, "worker-1")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if quiet, err = q.Quiet(ctx, cheap, time.Minute); err != nil {
+		t.Fatalf("quiet: %v", err)
+	}
+	if quiet {
+		t.Error("a running ocr job is not quiet")
+	}
+
+	if err := q.Complete(ctx, job.ID); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	// Done, and this is the whole point: the queue is empty and it is still not
+	// quiet, because another photograph is very likely two seconds away.
+	if quiet, err = q.Quiet(ctx, cheap, time.Minute); err != nil {
+		t.Fatalf("quiet: %v", err)
+	}
+	if quiet {
+		t.Error("a job that finished a moment ago is empty but not quiet")
+	}
+
+	// A window of zero asks only whether anything is unfinished, which is the
+	// question the ocr path asks about the captioner.
+	if quiet, err = q.Quiet(ctx, cheap, 0); err != nil {
+		t.Fatalf("quiet: %v", err)
+	}
+	if !quiet {
+		t.Error("with no window, a finished job does not count against quiet")
+	}
+
+	// Age it past the window rather than sleeping through one.
+	if _, err := store.Pool().Exec(ctx,
+		`update jobs set updated_at = now() - interval '10 minutes' where id = $1`, job.ID); err != nil {
+		t.Fatalf("age the job: %v", err)
+	}
+	if quiet, err = q.Quiet(ctx, cheap, time.Minute); err != nil {
+		t.Fatalf("quiet: %v", err)
+	}
+	if !quiet {
+		t.Error("nothing pending and nothing finished inside the window is quiet")
+	}
+}
+
+// A job nothing will ever claim must not hold the captioner off the card
+// forever. Failed rows are parked, not pending.
+func TestQuietIgnoresFailedJobs(t *testing.T) {
+	q, store := testQueue(t)
+	clearJobs(t, store)
+	ctx := context.Background()
+
+	assetID := newAsset(t, store)
+	if err := jobs.Enqueue(ctx, store.Pool(), jobs.KindOCR, assetID); err != nil {
+		t.Fatalf("enqueue ocr: %v", err)
+	}
+	if _, err := store.Pool().Exec(ctx,
+		`update jobs set state = 'failed', updated_at = now() - interval '10 minutes'
+		 where asset_id = $1::uuid and kind = 'ocr'`, assetID); err != nil {
+		t.Fatalf("park the job: %v", err)
+	}
+
+	quiet, err := q.Quiet(ctx, []jobs.Kind{jobs.KindVision, jobs.KindOCR}, time.Minute)
+	if err != nil {
+		t.Fatalf("quiet: %v", err)
+	}
+	if !quiet {
+		t.Error("a failed job is parked; it must not hold the captioner off forever")
+	}
+}

@@ -22,7 +22,8 @@ import (
 // Queued at the end of the metadata job rather than beside it, for the reason
 // the signature is: a video cannot be sampled without knowing how long it is,
 // and that number is written by the job in front of this one.
-func (r *Runner) runMLPrep(ctx context.Context, assetID string) error {
+func (r *Runner) runMLPrep(ctx context.Context, job jobs.Job) error {
+	assetID := job.AssetID
 	asset, err := r.Store.Asset(ctx, assetID)
 	if err != nil {
 		return err
@@ -78,7 +79,14 @@ func (r *Runner) runMLPrep(ctx context.Context, assetID string) error {
 	// does not have; setting ML_URL and restarting is what turns the library
 	// into queued work, in one place, through jobs.ReconcileVision and
 	// `photobackup ml backfill`.
-	if r.ML == nil {
+	//
+	// And only for a job that was queued as an arrival. `ml renditions` re-runs
+	// this over the whole archive to get the renditions themselves, and queueing
+	// seventeen thousand describe jobs behind an hour of CPU is the surprise this
+	// paragraph is otherwise congratulating itself on avoiding. It says so in the
+	// job row rather than here, because the difference is in who asked and why —
+	// see jobs.RequeueMLPrep and migration 0021.
+	if r.ML == nil || !job.FollowOn {
 		return nil
 	}
 	for _, kind := range []jobs.Kind{jobs.KindVision, jobs.KindOCR, jobs.KindDescribe} {

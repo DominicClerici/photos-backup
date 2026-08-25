@@ -95,7 +95,11 @@ class Spec:
 # first, on this library" — is the one item of that plan still unstruck, and the
 # schema was built for it: `model` is in the primary key of asset_descriptions,
 # so two captioners coexist in the tables and a bench is a delete and a requeue
-# rather than a migration. This is the other half of that, and it is what makes
+# rather than a migration. Changing what one of them *does* under an unchanged
+# name — the MAX_PIXELS below, the prompt — is the case the primary key cannot
+# see, and `photobackup ml backfill --force` is that half: it requeues without
+# deleting, because the write path already replaces a photograph's words in
+# place. This is the other half of that, and it is what makes
 # choosing one an env var instead of an edit.
 CAPTIONERS: dict[str, Spec] = {
     spec.name: spec
@@ -136,12 +140,39 @@ def spec_for(name: str | None) -> Spec:
         log.warning("unknown captioner %r; falling back to %s", name, DEFAULT_CAPTIONER)
     return CAPTIONERS[DEFAULT_CAPTIONER]
 
-# The ML renditions are 512px on their longest edge (derivstore.MLEdge), so
-# capping the processor here costs nothing and bounds the vision tokens: a
-# photograph that somehow arrives larger is scaled down rather than turned into
-# a thousand-token forward pass that takes four times as long for a caption
-# nobody can tell apart.
-MAX_PIXELS = 512 * 512
+# What bounds the vision tokens: the processor scales any photograph down to
+# this many pixels, so this number and not derivstore.MLEdge is what the
+# captioner actually looks at. Roughly max_pixels/1024 tokens — 235 at the old
+# 512*512, 907 here, both measured over this archive's own renditions.
+#
+# This was 512*512 and the sentence that used to be here said the larger
+# renditions cost this pass nothing, which was true and was the wrong thing to
+# be measuring. 96% of renditions carry more pixels than that budget, so what it
+# bought was a downscale on nearly every photograph in the library. Benched
+# across 512-1536 on 33 renditions, what the extra pixels are worth:
+#
+#   - Vague nouns per caption fall 0.55 -> 0.45, and only from here up: at 640
+#     and 768 the number is flat or slightly worse, so the settings between the
+#     two are churn without a gain. "holding an object" becomes "holding a
+#     phone"; a bowl of onions at the edge of the frame gets seen at all.
+#   - Two confabulations went away. A browser home screen read as "a digital
+#     clock" at 512, and a screenshot of ASCII art as "a photo library indexing
+#     interface" — a caption that is both searchable and wrong, which is worse
+#     than a vague one and is the argument that decided this.
+#
+# It is not free and the cost is not only time. 907 tokens against 235 is the
+# whole of it: the describe pass roughly doubles, and the forward pass no longer
+# fits at eight images, which is why settings.describe_batch is 4. Junk tags
+# also rise from 10% to 14% by the triage pass's own reckoning, because a model
+# that can suddenly read a credit card starts writing "valid thru" — the tags
+# are rotated rather than strictly improved, and it is the caption that got
+# better.
+#
+# 1024 rather than more because the next step costs a second batch halving for
+# no measured gain: 1280 is 10.2 hours over the library against 7.9, and past it
+# the curve flattens anyway — a portrait rendition is 1152x1536, so it reaches
+# its own native size before the budget binds.
+MAX_PIXELS = 1024 * 1024
 MIN_PIXELS = 224 * 224
 
 # Long enough for a sentence and a dozen words, short enough that a model that

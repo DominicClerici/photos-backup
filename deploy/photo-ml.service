@@ -48,6 +48,21 @@ Environment=XDG_CACHE_HOME=/var/lib/photo-ml/cache
 # Without somewhere to put them it either recompiles on every start or fails.
 Environment=TRITON_CACHE_DIR=/var/lib/photo-ml/triton
 
+# Which PP-OCR weights read the text, and where they run.
+#
+# medium because it is what measured best rather than because it is large:
+# PP-OCRv5 server read *less* text than v6 small and took three times as long.
+# Left at the default it follows PHOTO_ML_DEVICE onto the card, which is worth
+# roughly 0.8 hours over this library against 3.2 on the CPU, for 127MB of
+# weights and about 1.2GB transient while a detection runs.
+#
+# Set PHOTO_ML_OCR_DEVICE=cpu to take it off the card — the same text comes back
+# either way, four times slower. Worth doing only if something else needs the
+# VRAM during the recognition pass; the captioner does not, because the vision
+# pool drains every ocr job before it claims a describe job.
+#Environment=PHOTO_ML_OCR_MODEL_TYPE=medium
+#Environment=PHOTO_ML_OCR_DEVICE=cpu
+
 # Unloading a model has to survive a stop as well: a service killed mid-forward
 # pass leaves VRAM held until the process actually exits, and NVENC is waiting
 # for it.

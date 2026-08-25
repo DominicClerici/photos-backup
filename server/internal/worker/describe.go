@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/dominicclerici/photos-backup/server/internal/db"
+	"github.com/dominicclerici/photos-backup/server/internal/jobs"
 	"github.com/dominicclerici/photos-backup/server/internal/mlclient"
 )
 
@@ -76,7 +77,18 @@ func (r *Runner) runOCR(ctx context.Context, assetID string) error {
 		return nil
 	}
 
-	result, err := r.ML.Recognize(ctx, images)
+	// Whether the captioner may be sent away to make room for this. Only when
+	// nothing is waiting to be captioned: reading the text in one photograph is
+	// not worth a ten-gigabyte reload if a describe job is due behind it. An
+	// error here is not worth failing the read over — assume there is captioning
+	// work, which is the answer that changes nothing.
+	idle, err := r.Queue.Quiet(ctx, []jobs.Kind{jobs.KindDescribe}, 0)
+	if err != nil {
+		r.log().Warn("ask whether any captioning work is outstanding", "error", err)
+		idle = false
+	}
+
+	result, err := r.ML.Recognize(ctx, images, idle)
 	if err != nil {
 		return err
 	}

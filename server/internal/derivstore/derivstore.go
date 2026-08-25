@@ -46,7 +46,9 @@ const (
 	// the sweep in photod are what stop it outliving one.
 	JoinPreview = ".join.mp4"
 	// MLStill is what a vision model reads: the whole photograph, uncropped, at
-	// MLEdge on its longest side.
+	// MLEdge on its longest side. One file for all three passes — the encoder,
+	// the captioner and the text recogniser — because MLEdge is sized for the
+	// hungriest of them and the other two cap their own input anyway.
 	//
 	// Uncropped is the entire point, and it is why this is a fourth rendition
 	// rather than a reuse of .thumb512.webp. That file is a square centre crop,
@@ -63,12 +65,44 @@ const (
 
 // MLEdge bounds the ML rendition's longest side.
 //
-// 512 because that is comfortably above what the encoders in question actually
-// see — a SigLIP-class model resizes its input to 384 or 448 — and because the
-// renditions are the thing a model swap re-reads. Storing them larger than any
-// candidate needs buys nothing; storing them smaller would mean the next model
-// cannot be tried without decoding 73GB of HEIC again.
-const MLEdge = 512
+// This was 512, on the reasoning that it was comfortably above what the
+// encoders in question actually see — a SigLIP-class model resizes its input to
+// 384 or 448 — so storing them larger than any candidate needs bought nothing.
+// The first half of that is still true and the conclusion was wrong, because a
+// text recogniser is a candidate and it is the one model here that wants every
+// pixel of the frame it can get. Measured against known text on a 4032x3024
+// photograph, the share of the frame a line of text occupies against whether it
+// could be read at all:
+//
+//	text height   512    1536      what a line that size is
+//	2.1% frame   1.00    1.00      a road sign, a shopfront, a headline
+//	1.2% frame   0.42    1.00      a receipt held at arm's length
+//	0.9% frame   0.00    1.00      body text in a screenshot, a menu
+//
+// Those bottom two rows are receipts, menus, whiteboards, book pages and the
+// body of every dense screenshot — the photographs where recognised text is the
+// only thing that could ever make them findable, because no caption will
+// contain a confirmation number.
+//
+// 1536 rather than more because the recogniser's own preprocessing caps its
+// input at a 2000px side, so anything past that is bytes nobody reads.
+//
+// It costs the encoder nothing, which is the fact that made one rendition
+// possible instead of two: SigLIP hard-resizes to 384x384 and cannot tell.
+//
+// The captioner is a different story now and this comment used to have it
+// backwards. It said the captioner's cost was flat above a 768px rendition
+// because its processor capped the pixel budget at 512*512 — true of the cap,
+// and the wrong conclusion, because it made a virtue of downscaling 96% of the
+// library back down again. That cap is 1024*1024 as of the bench in photo_ml's
+// captioner.py, so these renditions are now read at something nearer their own
+// size: 907 image tokens against 235, a describe pass that roughly doubles, and
+// captions that stop calling a phone "an object" and a home screen "a clock".
+//
+// Changing this is a deliberate requeue — `photobackup ml renditions` — for the
+// reason jobs.ReconcileMLPrep gives: the evidence this job ran is a file on
+// disk rather than a row, so nothing notices a size change by itself.
+const MLEdge = 1536
 
 // MLFrameCount is how many frames are taken from a video.
 //
@@ -266,8 +300,8 @@ func Suffixes() []string {
 		out = append(out, ThumbSuffix(size), LiveSuffix(size))
 	}
 	// The ML renditions belong here for both of the reasons this list exists.
-	// Purging a photograph has to take them — they are a description of it, at
-	// 512px, and leaving them behind would be leaving the picture behind. And
+	// Purging a photograph has to take them — they are a legible copy of it, at
+	// MLEdge, and leaving them behind would be leaving the picture behind. And
 	// hiding one has to seal them: a rendition of a photograph in the vault
 	// cannot stay readable on the SSD.
 	out = append(out, MLStill)

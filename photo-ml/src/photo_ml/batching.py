@@ -1,13 +1,23 @@
 """Turning several one-photograph requests into one forward pass.
 
-The captioner is memory-bandwidth bound: 8.8GB of weights have to be read for
-every token it generates, whether that token is for one image or for twelve.
-Measured on the RTX 5060 Ti, over the archive's own renditions:
+The captioner is memory-bandwidth bound while it decodes: 8.8GB of weights have
+to be read for every token it generates, whether that token is for one image or
+for twelve. Measured on the RTX 5060 Ti, over the archive's own renditions, back
+when captioner.MAX_PIXELS was 512*512 and an image cost 235 vision tokens:
 
     batch  1    1.47 s/image     7.3 h for the library
     batch  4    0.78 s/image     3.9 h
     batch  8    0.48 s/image     2.4 h
     batch 16    0.38 s/image     1.9 h   (11.2GB, too close to the edge)
+
+That table is why this module exists and it is no longer the operating point.
+MAX_PIXELS is 1024*1024 now, an image costs 907 vision tokens, and both halves
+of the trade moved: a batch of 8 no longer fits beside the resident models, and
+the batch of 4 that does buys much less than the table above suggests — 1.21
+s/image against 1.12 at a batch of 8, measured with the parser evicted to make
+room for one. The reason is that prefill is compute-bound where decode is
+bandwidth-bound, and at 907 tokens an image the pass is mostly prefill. Batching
+still pays against a batch of 1; it no longer pays much per doubling.
 
 Threads do not help — four concurrent single-image calls take exactly four times
 as long as one, because they serialise on the same kernels. Only a real batch

@@ -28,9 +28,13 @@ func dimensions(t *testing.T, path string) (width, height int) {
 	return width, height
 }
 
-// The point of the rendition, in one assertion: 3024x4032 comes out 384x512 and
-// not 512x512. A square is a crop, and a crop is a machine deciding in advance
-// what the photograph was about.
+// The point of the rendition, in one assertion: a 3024x4032 photograph comes out
+// three-quarters as wide as it is tall, and not square. A square is a crop, and
+// a crop is a machine deciding in advance what the photograph was about.
+//
+// Written against derivstore.MLEdge rather than the number it happens to be, so
+// that changing the rendition size stays a one-constant change. It was 512 and
+// is 1536; what must not change is the aspect ratio.
 func TestMLPrepRendersTheWholeFrameUncropped(t *testing.T) {
 	h := newHarness(t)
 	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
@@ -51,8 +55,9 @@ func TestMLPrepRendersTheWholeFrameUncropped(t *testing.T) {
 	if hgt != derivstore.MLEdge {
 		t.Errorf("height = %d, want %d on the longest edge", hgt, derivstore.MLEdge)
 	}
-	if w != 384 {
-		t.Errorf("width = %d, want 384 — a 3024x4032 photograph fitted to 512 on its longest edge", w)
+	if want := derivstore.MLEdge * 3 / 4; w != want {
+		t.Errorf("width = %d, want %d — a 3024x4032 photograph fitted to %d on its longest edge",
+			w, want, derivstore.MLEdge)
 	}
 	if w == hgt {
 		t.Error("the rendition is square, so it was cropped")
@@ -190,5 +195,103 @@ func TestTheMLRenditionsAreInTheSuffixContract(t *testing.T) {
 		if !strings.Contains(have, suffix+" ") && !strings.HasSuffix(have, suffix) {
 			t.Errorf("%s is not in derivstore.Suffixes(), so a purge would leave it behind", suffix)
 		}
+	}
+}
+
+// The regression that migration 0021 is about: `ml renditions` re-renders the
+// archive and must queue nothing that reads the renditions.
+//
+// The first mlprep is an arrival and queues all three passes, which is the
+// feature. The second is RequeueMLPrep's, and the assertion that matters is on
+// describe: an hour of CPU must not turn into four hours of GPU, and it did,
+// because most of the archive had no describe row for do-nothing-on-conflict to
+// protect.
+func TestReRenderingQueuesNoWorkThatReadsTheRenditions(t *testing.T) {
+	h := newHarness(t).withML(newFakeML(t).URL)
+	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
+
+	h.claimAndRun(t, jobs.KindMetadata)
+	h.claimAndRun(t, jobs.KindMLPrep)
+
+	for _, kind := range []jobs.Kind{jobs.KindVision, jobs.KindOCR, jobs.KindDescribe} {
+		if state := h.jobStateOrNone(t, asset.ID, kind); state != string(jobs.StatePending) {
+			t.Fatalf("after the arrival, %s job state = %q, want pending", kind, state)
+		}
+	}
+
+	// Drain them, so that what the re-render does next is visible: a row left
+	// pending would be indistinguishable from one this requeued.
+	for _, kind := range []jobs.Kind{jobs.KindVision, jobs.KindOCR, jobs.KindDescribe} {
+		h.claimAndRun(t, kind)
+	}
+
+	if _, err := jobs.RequeueMLPrep(context.Background(), h.store.Pool()); err != nil {
+		t.Fatalf("requeue mlprep: %v", err)
+	}
+	h.claimAndRun(t, jobs.KindMLPrep)
+
+	for _, kind := range []jobs.Kind{jobs.KindVision, jobs.KindOCR, jobs.KindDescribe} {
+		if state := h.jobStateOrNone(t, asset.ID, kind); state != string(jobs.StateDone) {
+			t.Errorf("after the re-render, %s job state = %q, want it left done", kind, state)
+		}
+	}
+}
+
+// The other half of the same bit: an asset that has never been through any ML
+// pass gets no describe job out of a re-render either. This is the case that
+// actually bit, and the one do-nothing-on-conflict could not catch — there was
+// no row to conflict with.
+func TestReRenderingQueuesNothingForAnAssetThatHasNeverBeenDescribed(t *testing.T) {
+	h := newHarness(t).withML(newFakeML(t).URL)
+	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
+
+	h.claimAndRun(t, jobs.KindMetadata)
+
+	// Take the arrival's mlprep out of the way unrun, leaving an asset with
+	// renditions owed and no ML rows at all — which is every asset the bounded
+	// captioning backfill never reached.
+	if _, err := h.store.Pool().Exec(context.Background(),
+		`delete from jobs where asset_id = $1::uuid and kind = 'mlprep'`, asset.ID); err != nil {
+		t.Fatalf("clear the arrival's mlprep: %v", err)
+	}
+
+	if _, err := jobs.RequeueMLPrep(context.Background(), h.store.Pool()); err != nil {
+		t.Fatalf("requeue mlprep: %v", err)
+	}
+	h.claimAndRun(t, jobs.KindMLPrep)
+
+	if state := h.jobStateOrNone(t, asset.ID, jobs.KindDescribe); state != "" {
+		t.Errorf("the re-render queued a describe job (state %q) for an asset that had none", state)
+	}
+	if state := h.jobStateOrNone(t, asset.ID, jobs.KindOCR); state != "" {
+		t.Errorf("the re-render queued an ocr job (state %q) for an asset that had none", state)
+	}
+}
+
+// A re-render is hours of CPU and somebody will interrupt it. Typing the command
+// again has to reach the rows the first run left pending, or most of the archive
+// keeps the intent it was queued with — which on the run that prompted all this
+// would have been 11,555 of 17,916 assets still queueing a captioner.
+func TestReRenderingAdoptsTheRowsAnInterruptedOneLeftPending(t *testing.T) {
+	h := newHarness(t).withML(newFakeML(t).URL)
+	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
+	ctx := context.Background()
+
+	h.claimAndRun(t, jobs.KindMetadata)
+
+	// The arrival's mlprep, still owed: this is the state an interrupted
+	// re-render leaves behind, and the state the old conflict guard could not
+	// reach.
+	if state := h.jobStateOrNone(t, asset.ID, jobs.KindMLPrep); state != string(jobs.StatePending) {
+		t.Fatalf("mlprep job state = %q, want pending", state)
+	}
+
+	if _, err := jobs.RequeueMLPrep(ctx, h.store.Pool()); err != nil {
+		t.Fatalf("requeue mlprep: %v", err)
+	}
+	h.claimAndRun(t, jobs.KindMLPrep)
+
+	if state := h.jobStateOrNone(t, asset.ID, jobs.KindDescribe); state != "" {
+		t.Errorf("the re-render queued a describe job (state %q) for a row it found pending", state)
 	}
 }

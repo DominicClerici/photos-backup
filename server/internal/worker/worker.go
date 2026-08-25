@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"time"
 
@@ -120,6 +121,9 @@ type Runner struct {
 	// upgraded has a vision pool that is idle rather than one turning sixty
 	// thousand assets into failures. See mlAvailable.
 	VisionWorkers int
+	// DescribeQuiet is how long the vision and ocr queues must have been quiet
+	// before a describe job is claimed. See visionHold. Two minutes by default.
+	DescribeQuiet time.Duration
 
 	// PollInterval is the floor on how often an idle worker looks for work.
 	// Uploads nudge the pools directly, so this only matters for work that
@@ -162,6 +166,7 @@ func New(deps Deps) *Runner {
 		SignatureWorkers:  1,
 		PrepWorkers:       2,
 		VisionWorkers:     1,
+		DescribeQuiet:     120 * time.Second,
 		PollInterval:      5 * time.Second,
 		SweepInterval:     time.Minute,
 		HeartbeatInterval: jobs.DefaultLease / 3,
@@ -218,6 +223,7 @@ func (r *Runner) Start(ctx context.Context) {
 				kinds:   []jobs.Kind{jobs.KindVision, jobs.KindOCR, jobs.KindDescribe},
 				gate:    r.mlAvailable,
 				ordered: true,
+				hold:    r.visionHold,
 			})
 		}
 	}
@@ -266,6 +272,30 @@ type pool struct {
 	// jobs.ClaimInOrder for why exactly one pool wants that and the others must
 	// not have it.
 	ordered bool
+	// hold is asked before every claim and names kinds this worker must not take
+	// yet, however much of them the queue is holding.
+	//
+	// Distinct from gate, which is about the pool being able to work at all.
+	// This is about one kind not being due yet — the queue has the work, the
+	// service is up, and taking it now would put two models on a card that fits
+	// one. Only the ML pool has one, and it holds exactly one kind: see
+	// visionHold.
+	hold func(context.Context) []jobs.Kind
+}
+
+// runnable subtracts what hold is withholding, preserving the priority order of
+// what is left.
+func runnable(kinds, held []jobs.Kind) []jobs.Kind {
+	if len(held) == 0 {
+		return kinds
+	}
+	out := make([]jobs.Kind, 0, len(kinds))
+	for _, k := range kinds {
+		if !slices.Contains(held, k) {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 func (r *Runner) spawn(ctx context.Context, p pool) {
@@ -305,7 +335,20 @@ func (r *Runner) loop(ctx context.Context, p pool, nudge <-chan struct{}) {
 			continue
 		}
 
-		job, err := claim(ctx, kinds, id)
+		claimable := kinds
+		if p.hold != nil {
+			claimable = runnable(kinds, p.hold(ctx))
+		}
+		if len(claimable) == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			continue
+		}
+
+		job, err := claim(ctx, claimable, id)
 		switch {
 		case errors.Is(err, jobs.ErrNoJob):
 			// Idle: wait to be told, or look again on the next tick.
@@ -422,7 +465,7 @@ func (r *Runner) run(ctx context.Context, job jobs.Job) (err error) {
 	case jobs.KindSignature:
 		return r.runSignature(ctx, job.AssetID)
 	case jobs.KindMLPrep:
-		return r.runMLPrep(ctx, job.AssetID)
+		return r.runMLPrep(ctx, job)
 	case jobs.KindVision, jobs.KindOCR, jobs.KindDescribe:
 		if r.ML == nil {
 			return errors.New("no photo-ml configured; set ML_URL or this work has nothing to run on")
@@ -1056,6 +1099,51 @@ func (r *Runner) prepWorkers() int {
 		return 1
 	}
 	return r.PrepWorkers
+}
+
+// visionHold keeps the captioner off the card while the cheap passes are still
+// arriving.
+//
+// jobs.ClaimInOrder already says every ocr job goes before any describe job, and
+// photo_ml/residency.py is built on that: the captioner evicts the recogniser on
+// the way in and never the other way round, because evicting ten gigabytes to
+// read the text in one photograph costs more than the read is worth. Both are
+// correct about a queue that is not moving. Neither is correct about a queue
+// being filled while it drains.
+//
+// An upload every two seconds is such a queue, and the GPU is fast enough to
+// keep up with it, which is what makes this counter-intuitive: the ocr queue is
+// empty almost all the time, so a describe job is claimable almost all the time,
+// so the captioner loads — and then stays, because a describe job every two
+// seconds means its idle timer never reaches PHOTO_ML_IDLE_SECONDS. The next ocr
+// job loads the recogniser beside it, evicting nothing, and the card holds both.
+// That is 14.67GB of a 15.51GB card, and it is where the 503s came from.
+//
+// So the pool waits for quiet rather than for empty. Nothing else is delayed:
+// vision and ocr are claimed the moment they are queued, and a photograph is
+// searchable by its text and by what it looks like within seconds of arriving.
+// Only the caption waits, and only for as long as photographs are still landing.
+func (r *Runner) visionHold(ctx context.Context) []jobs.Kind {
+	quiet, err := r.Queue.Quiet(ctx, []jobs.Kind{jobs.KindVision, jobs.KindOCR}, r.describeQuiet())
+	if err != nil {
+		if ctx.Err() == nil {
+			r.log().Error("ask whether the cheap ML passes are quiet", "error", err)
+		}
+		// Hold the captioner rather than release it. The failure this is
+		// protecting against costs a pass; the failure it causes costs a delay.
+		return []jobs.Kind{jobs.KindDescribe}
+	}
+	if quiet {
+		return nil
+	}
+	return []jobs.Kind{jobs.KindDescribe}
+}
+
+func (r *Runner) describeQuiet() time.Duration {
+	if r.DescribeQuiet <= 0 {
+		return 120 * time.Second
+	}
+	return r.DescribeQuiet
 }
 
 func (r *Runner) visionWorkers() int {

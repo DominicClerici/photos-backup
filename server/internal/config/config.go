@@ -98,10 +98,22 @@ type Config struct {
 	// batch can only form if several requests are in flight, and this is what
 	// puts them there. See photo-ml/src/photo_ml/batching.py.
 	//
-	// Raising it to 8 during a backfill fills the batch and roughly halves the
-	// wall clock again, bounded by PHOTO_ML_DESCRIBE_BATCH and by VRAM rather
-	// than by anything on this side.
+	// 4 is also exactly one describe batch, so raising it no longer speeds that
+	// pass up: PHOTO_ML_DESCRIBE_BATCH is 4 — a batch of 8 does not fit at the
+	// captioner's pixel budget — and the card is the limit, not anything on
+	// this side.
 	VisionConcurrency int
+	// DescribeQuietSeconds is how long the embedding and text-recognition
+	// queues must have been quiet before the captioner is allowed onto the
+	// card. See worker.visionHold: the two cheap passes and the expensive one
+	// cannot share a 16GB card, and an empty queue is not the same question as
+	// a quiet one when a phone is uploading a photograph every two seconds.
+	//
+	// Two minutes because it is comfortably longer than a burst of uploads is
+	// spaced and comfortably shorter than anybody's patience for a caption.
+	// Nothing else waits on it: a new photograph is searchable by its text and
+	// by what it looks like within seconds either way.
+	DescribeQuietSeconds int
 	// PreviewConcurrency caps simultaneous on-demand preview conversions, so a
 	// fast scroll cannot fork an ImageMagick per request.
 	PreviewConcurrency int
@@ -189,6 +201,7 @@ func FromEnv() Config {
 		TranscodeConcurrency: positive(os.Getenv("TRANSCODE_CONCURRENCY"), 1),
 		PrepConcurrency:      positive(os.Getenv("PREP_CONCURRENCY"), 2),
 		VisionConcurrency:    positive(os.Getenv("VISION_CONCURRENCY"), 4),
+		DescribeQuietSeconds: positive(os.Getenv("DESCRIBE_QUIET_SECONDS"), 120),
 		PreviewConcurrency:   positive(os.Getenv("PREVIEW_CONCURRENCY"), 4),
 		WorkerDisabled:       truthy(os.Getenv("WORKER_DISABLED")),
 

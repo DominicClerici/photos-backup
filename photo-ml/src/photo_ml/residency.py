@@ -29,6 +29,14 @@ reference returns the blocks to torch's caching allocator, which keeps them
 reserved against the driver: `nvidia-smi` goes on showing 6GB held and NVENC
 goes on failing to allocate. `empty_cache()` is what actually gives it back, and
 giving it back is the whole point of the role.
+
+A model may also declare what it cannot share the card with. The captioner and
+the text recogniser are both on it now, and at their peaks they do not both
+fit — so the captioner evicts the recogniser on the way in. In an ordinary
+backfill this never fires, because jobs.ClaimInOrder has already drained every
+ocr job before the first describe job is claimed; it is there for the stray new
+upload that interleaves the two, where the alternative is an allocation failure
+five minutes into a four-hour pass.
 """
 
 from __future__ import annotations
@@ -58,6 +66,9 @@ class Entry:
     name: str
     role: Role
     load: Callable[[], Any]
+    # Keys this model may not be on the card beside. Applied on the way in, and
+    # deliberately one-directional: see _evict_for.
+    evicts: tuple[str, ...] = ()
 
     model: Any | None = None
     loaded_at: float | None = None
@@ -80,9 +91,16 @@ class Residency:
         self._stop = threading.Event()
         self._reaper: threading.Thread | None = None
 
-    def register(self, key: str, name: str, role: Role, load: Callable[[], Any]) -> None:
+    def register(
+        self,
+        key: str,
+        name: str,
+        role: Role,
+        load: Callable[[], Any],
+        evicts: tuple[str, ...] = (),
+    ) -> None:
         with self._mu:
-            self._entries[key] = Entry(name=name, role=role, load=load)
+            self._entries[key] = Entry(name=name, role=role, load=load, evicts=evicts)
 
     def start(self) -> None:
         """Warm the resident models and begin reaping the on-demand ones.
@@ -139,6 +157,7 @@ class Residency:
         with entry.lock:
             if entry.model is not None:
                 return entry.model
+            self._evict_for(entry)
             started = time.monotonic()
             try:
                 entry.model = entry.load()
@@ -150,6 +169,82 @@ class Residency:
             entry.last_used = entry.loaded_at
             log.info("loaded %s in %.1fs", entry.name, entry.loaded_at - started)
             return entry.model
+
+    def _evict_for(self, entry: Entry) -> None:
+        """Unload what this model may not share the card with.
+
+        One-directional by construction — the captioner evicts the recogniser
+        and never the other way round — and that is what makes reaching for a
+        second entry's lock in here safe: with no cycle there is nothing to
+        deadlock on. It is also the right direction on its own terms. Evicting
+        ten gigabytes of captioner to read the text in one photograph, and then
+        loading it again, costs far more than the read is worth.
+
+        A model somebody is mid-forward-pass on is left alone, for the reason
+        the reaper leaves it alone: unloading weights another thread is using is
+        a segfault rather than an error. Loading beside it may then run the card
+        out of memory, and that is the failure to prefer — photo-ml answers 503,
+        mlclient puts the job down without spending an attempt on it, and the
+        next claim finds a card with room on it.
+        """
+        for key in entry.evicts:
+            other = self._entries.get(key)
+            if other is None:
+                continue
+            with other.lock:
+                if other.model is None:
+                    continue
+                if other.in_use > 0:
+                    log.warning(
+                        "%s wants the card and %s is on it, but it is in use; loading beside it",
+                        entry.name, other.name,
+                    )
+                    continue
+                held = other.model
+                other.model = None
+                other.loaded_at = None
+            _drop(held)
+            log.info("unloaded %s to make room for %s", other.name, entry.name)
+
+    def release(self, key: str) -> bool:
+        """Hand one on-demand model's card back now, if nobody is using it.
+
+        The reaper with the clock taken out, and it exists because the clock was
+        asking the wrong question. `_idle` is a guess at "nothing will want this
+        again soon" made by a service that has never seen a queue; photod knows
+        the answer exactly, and for the captioner the difference is five minutes
+        of a nearly full card every time a caption pass drains.
+
+        The other half of what `_evict_for` will not do. That is one-directional
+        on purpose — evicting ten gigabytes of captioner to read the text in one
+        photograph costs far more than the read is worth — and the case it
+        therefore cannot serve is the one where the captioner has no work left at
+        all, where the reload it is protecting is never going to happen. So the
+        direction is not reversed; the decision is moved to the only process that
+        can make it. See mlclient.Recognize.
+
+        Nothing here can thrash against `_evict_for`. A caption that is due keeps
+        photod from saying the queue is empty, and photod holds the captioner off
+        the card entirely until the cheap passes have been quiet for two minutes
+        — see worker.visionHold. By the time either of those lets the captioner
+        load, this has long since stopped being called.
+
+        In use means left alone, for the reason the reaper leaves it alone:
+        unloading weights another thread is mid-forward-pass on is a segfault
+        rather than an error. Returns whether anything was actually unloaded.
+        """
+        entry = self._entries.get(key)
+        if entry is None or entry.role is Role.RESIDENT:
+            return False
+        with entry.lock:
+            if entry.model is None or entry.in_use > 0:
+                return False
+            held = entry.model
+            entry.model = None
+            entry.loaded_at = None
+        _drop(held)
+        log.info("unloaded %s; nothing is queued that needs it", entry.name)
+        return True
 
     def _reap_loop(self) -> None:
         while not self._stop.wait(self._sweep):
@@ -167,11 +262,7 @@ class Residency:
             held = entry.model
             entry.model = None
             entry.loaded_at = None
-        unload = getattr(held, "unload", None)
-        if callable(unload):
-            unload()
-        del held
-        _release_vram()
+        _drop(held)
         log.info("unloaded %s after %.0fs idle", entry.name, self._idle)
 
     def report(self) -> list[dict[str, Any]]:
@@ -205,6 +296,15 @@ class Residency:
             for entry in self._entries.values()
             if entry.role is Role.RESIDENT
         )
+
+
+def _drop(held: Any) -> None:
+    """Let go of one model's weights and hand the card back."""
+    unload = getattr(held, "unload", None)
+    if callable(unload):
+        unload()
+    del held
+    _release_vram()
 
 
 def _release_vram() -> None:

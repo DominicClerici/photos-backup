@@ -233,9 +233,16 @@ func (c *Client) Describe(ctx context.Context, images [][]byte) (Descriptions, e
 }
 
 // Recognize asks what a set of frames says.
-func (c *Client) Recognize(ctx context.Context, images [][]byte) (Recognitions, error) {
+//
+// describeQueueEmpty is a fact about this side that photo-ml cannot know and
+// needs: whether there is any captioning work outstanding. It decides whether
+// the recogniser may take the card back from an idle captioner, which is the
+// one direction residency.py will not evict in on its own — see its _evict_for.
+// A fact rather than an instruction, because which model may displace which is
+// photo-ml's policy and this service has never seen the queue.
+func (c *Client) Recognize(ctx context.Context, images [][]byte, describeQueueEmpty bool) (Recognitions, error) {
 	var out Recognitions
-	body := map[string]any{"images": encode(images)}
+	body := map[string]any{"images": encode(images), "describe_queue_empty": describeQueueEmpty}
 	if err := c.post(ctx, "/ocr", body, &out); err != nil {
 		return out, err
 	}

@@ -74,6 +74,24 @@ class ImagesRequest(BaseModel):
     images: list[str] = Field(description="base64-encoded image bytes")
 
 
+class OCRRequest(ImagesRequest):
+    """Frames to read, and one fact about the caller's queue.
+
+    photod knows whether anything is waiting to be captioned and this service
+    cannot: it holds no state, opens no files and has never seen the database.
+    So the fact travels with the request, and what to do about it stays here.
+    See residency.release.
+
+    False by default, which is the answer that changes nothing — an older photod,
+    or any caller that does not know, leaves the card exactly as it found it.
+    """
+
+    describe_queue_empty: bool = Field(
+        default=False,
+        description="true when the caller has no captioning work outstanding",
+    )
+
+
 class TriageRequest(BaseModel):
     """Words from the tag vocabulary, to be judged useful or not.
 
@@ -115,6 +133,13 @@ def build(settings: Settings) -> FastAPI:
     # entry must all agree, and the only way to be sure they do is for there to
     # be one object.
     caption = cap.spec_for(settings.caption_model)
+    # The recogniser follows the encoder onto the card unless it was told
+    # otherwise. Resolved here for the reason `caption` is: /health, the route
+    # that reports it and the residency entry must all be describing the same
+    # object, and the way to be sure of that is for there to be one.
+    ocr_device = settings.ocr_device
+    if ocr_device in ("", "auto"):
+        ocr_device = str(device)
 
     def register(key: str, **kwargs) -> None:
         """Register a model unless this instance was told not to hold it."""
@@ -146,16 +171,25 @@ def build(settings: Settings) -> FastAPI:
         # allocate is not.
         role=Role.ON_DEMAND,
         load=lambda: cap.Captioner(device, dtype, settings.cache_dir, caption),
+        # Ten gigabytes of captioner and a recogniser mid-detection do not both
+        # fit beside the encoder, the parser and a desktop session. In a
+        # backfill they never meet — jobs.ClaimInOrder drains every ocr job
+        # before the first describe job is claimed — so this fires only for the
+        # upload that arrives mid-pass and jumps both queues. One-directional:
+        # see residency._evict_for for why the recogniser does not evict this.
+        evicts=(OCR,),
     )
     register(
         OCR,
-        name=textrec.MODEL_NAME,
-        # On demand as well, though it costs the card nothing — it runs on the
-        # CPU. Half a gigabyte of host memory and an ONNX session are still
-        # worth handing back on a machine whose main job is holding
-        # photographs.
+        name=textrec.model_name(settings.ocr_model_type),
+        # On demand, and cheap in both directions: 127MB of weights that load in
+        # about a second. What makes it worth handing back anyway is the 1.2GB a
+        # detection transiently allocates on a 1536px frame, which torch's
+        # caching allocator goes on reserving against the driver until something
+        # calls empty_cache() — the exact failure residency.py's docstring was
+        # written about, and the one NVENC notices first.
         role=Role.ON_DEMAND,
-        load=textrec.Recognizer,
+        load=lambda: textrec.Recognizer(ocr_device, settings.ocr_model_type),
     )
     register(
         PARSE,
@@ -300,7 +334,7 @@ def build(settings: Settings) -> FastAPI:
         }
 
     @app.post("/ocr")
-    def ocr(req: ImagesRequest) -> dict:
+    def ocr(req: OCRRequest) -> dict:
         """What each photograph says.
 
         An empty answer is a result, not a failure: most photographs contain no
@@ -310,10 +344,18 @@ def build(settings: Settings) -> FastAPI:
         require(OCR)
         started = time.perf_counter()
         images = _images(req, settings)
+        # Before the weights and before the detection, because both want the
+        # card. A detection on a 1536px frame transiently allocates 1.2GB, and
+        # the captioner sitting idle beside it is what makes that the allocation
+        # that fails. Only when the caller says nothing is waiting to be
+        # captioned; see residency.release for why it is asked this way round.
+        if req.describe_queue_empty:
+            residency.release(CAPTION)
         with residency.use(OCR) as model:
             results = _guard("ocr", lambda: model.read(images))
+            name = model.name
         return {
-            "model": textrec.MODEL_NAME,
+            "model": name,
             "results": results,
             "took_ms": round((time.perf_counter() - started) * 1000, 1),
         }

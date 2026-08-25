@@ -240,6 +240,7 @@ func run(log *slog.Logger) error {
 		workers.SignatureWorkers = cfg.SignatureConcurrency
 		workers.PrepWorkers = cfg.PrepConcurrency
 		workers.VisionWorkers = cfg.VisionConcurrency
+		workers.DescribeQuiet = time.Duration(cfg.DescribeQuietSeconds) * time.Second
 
 		workers.Start(ctx)
 		defer workers.Wait()

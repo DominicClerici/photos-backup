@@ -115,6 +115,14 @@ So the Go worker writes a new derivative — the **ML rendition**: the full fram
 uncropped, longest edge 512, WebP. For video, several of them sampled across the
 clip.
 
+*(1536 now, not 512, and the correction is worth reading as a warning about this
+whole section's reasoning rather than as a number. 512 was chosen because it was
+"comfortably above what the encoders in question actually see" — true of the
+encoder, true of the captioner, and false of the text recogniser, which is the
+one model here that wants every pixel of the frame. Sizing a durable artefact to
+exactly what today's models need is what turned a rendition into a ceiling. See
+derivstore.MLEdge for the measurement and §10 for what it cost to fix.)*
+
 ```
 <sha>.ml.webp             the still, uncropped
 <sha>.ml.0.webp … .5      six frames spread across a video
@@ -139,7 +147,9 @@ What this buys:
   re-decoding 73 GB of HEIC and H.265. The difference is minutes against hours,
   and it is what makes trying a second model a decision rather than a project.
 
-Cost: roughly 4 GB of renditions on a disk with 768 GB free.
+Cost: roughly 4 GB of renditions on a disk with 768 GB free. *(0.6 GB as
+measured at 512px, and about 3.5 GB at 1536 — still nothing against 768 free,
+which is what made raising it a decision rather than a trade.)*
 
 ---
 
@@ -337,8 +347,8 @@ about 1.4 GB.
 |---|---|---|---|
 | vision encoder, SigLIP-2 so400m fp16 | 1.8 GB | **2.3 GB** | resident |
 | query parser | 4B at 4-bit, 3 GB | **Qwen3-0.6B bf16, 1.2 GB** | resident |
-| captioner | 7–8B at 4-bit, 6 GB | **Qwen3-VL-4B bf16, 9.1–10.1 GB** | on demand |
-| OCR (ONNX) | 0.5 GB | **CPU, no VRAM at all** | on demand |
+| captioner | 7–8B at 4-bit, 6 GB | **Qwen3-VL-4B bf16, 9.1–13.0 GB** | on demand |
+| OCR, rapidocr PP-OCRv6 medium | 0.5 GB | **127 MB, 1.2 GB peak** | on demand |
 
 *(Two of those moved and both for the same reason: the card is Blackwell, and
 the AWQ/GPTQ kernels are the part of that ecosystem most likely to be missing an
@@ -354,8 +364,46 @@ it is worth writing down that the Go grammar is doing essentially all of the
 work, and that `PHOTO_ML_PARSER_MODEL` is there for the day the card is not also
 holding a captioner.*
 
-*OCR on the CPU was a straight win nobody planned: the pass costs the card
-nothing and can run while the captioner is loaded.)*
+*OCR was on the CPU and is now on the card, which reverses what this table said
+and is the better trade for a reason the original had backwards. The pass was
+never running beside the captioner: jobs.ClaimInOrder drains every ocr job before
+the first describe job is claimed, precisely so the two do not thrash the card
+past each other. So "costs the card nothing" was true and worth nothing — the GPU
+sat idle for the whole recognition pass. On it, through rapidocr's torch backend,
+the same weights read the same text four times faster: 0.8 hours over the library
+against 3.2. The weights are 127MB; the 1.2GB is transient activation while a
+detection runs on a 1536px frame, one at a time, and residency's eviction is what
+keeps it from meeting the captioner's peak when a new upload interleaves the two
+passes.*
+
+*(That last sentence hid a load-bearing assumption, and it cost two hours of a
+backfill to find. "ClaimInOrder drains every ocr job before the first describe
+job is claimed" is a statement about a **fixed** queue. `ml renditions` made it a
+queue refilled from underneath for an hour: every mlprep job it ran queued an ocr
+job and a describe job as it finished, so the ocr queue never emptied and the two
+kinds interleaved for the whole pass rather than at one upload. The captioner
+loaded, evicted the recogniser, and a second later a fresh ocr job loaded the
+recogniser back beside it — eviction is one-directional, by the same reasoning.
+14.67GB committed on a 15.51GB card, and then: /describe answering 503 on every
+request, ocr.py catching the allocation failure and returning `{"text": ""}` so
+that 3,500 photographs were recorded as read and empty, and ffmpeg's CUDA
+hwaccel unable to create a context at all, which marked another 656 videos
+sampled-and-unsearchable. The GPU sat at 32°C throughout. Every counter on `ml
+status` went up.*
+
+*The fix is that the re-render no longer queues the passes that read its output —
+`jobs.follow_on`, migration 0021 — which restores the fixed queue the eviction
+assumes. Worth stating plainly, because it is the general form: the residency
+design is correct **given** an ordering guarantee, and the ordering guarantee is
+a property of how work is queued, not of the queue. Anything that streams ML work
+in over hours breaks it again.)*
+
+*torch rather than onnxruntime-gpu is this section's own lesson applied twice.
+The card is Blackwell; the kernels most likely to be missing an architecture this
+new are exactly the ones a second inference runtime would bring. torch cu128 is
+already here and already proven by the captioner, so this cost no new
+dependency — and it falls back to the CPU with a log line if the build ever
+stops working.)*
 
 The two heavy ones load when a `vision` job arrives and unload once the queue
 has been dry for a few minutes.
@@ -650,8 +698,8 @@ the tsvectors it invalidates, inside its own transaction. See below.)*
 | geocode | 11,045 fixes against an in-memory k-d tree | seconds — measured |
 | mlprep | decode 17,792 originals, sample the videos | ~1 h — measured |
 | embed | 31,422 renditions through the vision encoder | **16m04s — measured** |
-| ocr | 31,422 renditions, on the CPU | ~30 min |
-| describe | ~23,400 images through the VLM | **2.4–7.3 h, and it depends** |
+| ocr | ~23,400 renditions, on the card | **~50 min at 1536px** |
+| describe | ~23,400 images through the VLM | **~5 h at 1024², measured as a ratio** |
 
 *(The embed row is now a measurement rather than an estimate, and the estimate
 was wrong in the useful direction. 61,000 renditions assumed six frames from
@@ -667,10 +715,22 @@ applies reaching the far end of the pipe intact rather than turning into 80
 photographs marked permanently broken — and it is the case jobs.ReconcileVision
 notes it will re-offer on every restart, at a claim and a stat each.)*
 
-*The describe row is a range rather than a number because it is the one figure
-in this table that is a choice. The captioner is memory-bandwidth bound — 8.8GB
-of weights read per generated token, whether that token is for one image or
-twelve — so, measured on this card over these renditions:*
+*(The ocr row moved twice and both numbers in it were wrong. It was never 31,422
+renditions: the recogniser gets describeFrames of a video, three rather than six,
+so the pass is about 23,400 images. And ~30 min was measured at a rendition size
+that could not read a receipt. At 1536px with PP-OCRv6 medium it is 3.2 hours on
+the CPU and about 50 minutes on the card, which is the row above. Raising MLEdge
+also means one `photobackup ml renditions` — an hour of CPU, once — before any of
+it, and that command exists because ReconcileMLPrep deliberately cannot notice a
+size change: the evidence mlprep ran is a file on disk rather than a row. That
+hour is now an hour and nothing else: the command renders, and queues no pass
+that reads what it rendered. See migration 0021.)*
+
+*The describe row is the one figure in this table that is a choice, and it was
+made twice. The captioner is memory-bandwidth bound while it decodes — 8.8GB of
+weights read per generated token, whether that token is for one image or
+twelve — so, measured on this card over these renditions at the original
+`MAX_PIXELS` of 512²:*
 
 | batch | per image | over the library | peak VRAM |
 |---|---|---|---|
@@ -678,6 +738,42 @@ twelve — so, measured on this card over these renditions:*
 | 4 | 0.78 s | 3.9 h | 9.6 GB |
 | 8 | 0.48 s | 2.4 h | 10.1 GB |
 | 16 | 0.38 s | 1.9 h | 11.2 GB |
+
+*That was the whole trade until `MAX_PIXELS` was benched rather than assumed.
+The cap was doing more than it looked: 96% of renditions carry more pixels than
+512², so the processor was downscaling nearly the whole library back to a size
+`MLEdge` had just been raised past. Swept from 512² to 1536² over 33 renditions,
+with the resident models in place and the largest batch that fits at each:*
+
+| `MAX_PIXELS` | tokens | batch | per image | over the library | peak | headroom |
+|---|---|---|---|---|---|---|
+| 512² | 235 | 8 | 0.58 s | 3.8 h | 12.75 GB | 1.03 GB |
+| 768² | 529 | 8 | 0.82 s | 5.3 h | 13.43 GB | 0.21 GB |
+| **1024²** | **907** | **4** | **1.21 s** | **7.9 h** | **12.98 GB** | **0.71 GB** |
+| 1280² | 1146 | 4 | 1.57 s | 10.2 h | 13.55 GB | 0.32 GB |
+| 1536² | 1191 | 2 | 1.64 s | 10.7 h | 12.66 GB | 0.60 GB |
+
+*(That 3.8 h baseline against the 2.4 h above is the bench corpus, which skews to
+tall portrait renditions — 242 tokens against the library's 234. The ratios are
+the measurement; scaled onto the 2.4 h, 1024² is the ~5 h the table now says.)*
+
+*1024² is where the captions actually improve and 768² is not — vague nouns per
+caption fall 0.55 → 0.45 only from 1024² up, and at 640² and 768² the number is
+flat or slightly worse, so the settings between the two are churn. What decided
+it was not the extra detail but two confabulations going away: a browser home
+screen read as "a digital clock" at 512², and a screenshot of ASCII art as "a
+photo library indexing interface" — a caption that is searchable and wrong,
+which is worse than a vague one. It is not free in either direction. The pass
+roughly doubles, a batch of 8 stops fitting, and junk tags rise from 10% to 14%
+by §9's own triage pass, because a model that can suddenly read a credit card
+starts writing "valid thru". The tags are rotated rather than improved; the
+caption is what got better.*
+
+*Batching also stopped paying what it used to, which is why dropping to 4 costs
+so little: prefill is compute-bound where decode is bandwidth-bound, and at 907
+tokens an image the pass is mostly prefill. A batch of 8 at 1024², with the
+parser evicted to make room, is 1.12 s an image against 4's 1.21 — nine
+hundredths of a second for a gigabyte and the parser.*
 
 *Threads buy nothing: four concurrent single-image calls take exactly four times
 as long as one, because they serialise on the same kernels. Only a real batch
@@ -742,12 +838,14 @@ lifecycle in §6 is the mechanism; the number to watch after step 5 is whether
 NVENC transcodes ever fail to allocate during a backfill. If they do, the
 vision pool needs a pause on transcode pressure rather than a bigger card.
 
-*(Still the number to watch, and now with an actual budget behind it: 2.3GB of
-encoder and 1.2 of parser resident, 10.1 more while the captioner is loaded, and
-1.4 for the desktop — about 15 of 16.3 at the peak of a captioning pass. The
-first lever if NVENC starts failing is `PHOTO_ML_DESCRIBE_BATCH`, 8 → 4, which
-gives back half a gigabyte and costs about ninety minutes over the library. The
-second is the pause this paragraph asks for, and it is still not built.)*
+*(Still the number to watch, and the budget behind it got tighter when
+`captioner.MAX_PIXELS` went to 1024²: 3.25GB of encoder and parser resident,
+12.98GB at the peak of a describe batch of 4, about 1.1 for the desktop — which
+leaves 0.71GB of a 15.51GB card, and that 0.71 is what NVENC allocates against.
+The first lever if NVENC starts failing is `PHOTO_ML_DESCRIBE_BATCH`, 4 → 2,
+which gives back about a third of a gigabyte; it used to be 8 → 4 and half a
+gigabyte, so this lever has less left in it than it did. The second is the pause
+this paragraph asks for, and it is still not built.)*
 
 **Nothing rebuilds the tsvector by itself.** `asset_search` is written by the
 describe and OCR jobs, and by nothing else — so a tag merge, a re-geocode, or a

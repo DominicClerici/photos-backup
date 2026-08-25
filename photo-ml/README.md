@@ -186,7 +186,7 @@ All optional; every one falls back to its default rather than refusing to start.
 | `PHOTO_ML_IDLE_SECONDS` | `300` — how long an on-demand model may sit unused before its VRAM goes back |
 | `PHOTO_ML_MAX_BATCH` | `32`. The worker sends 1 image for a photograph and 3 or 6 for a video, so this bounds mistakes rather than tuning anything. |
 | `PHOTO_ML_MODELS` | which models this instance loads; every one by default. `PHOTO_ML_MODELS=caption` is how a second instance shares the card with the first — see below. |
-| `PHOTO_ML_DESCRIBE_BATCH` | `8` — how many images the captioner may put through one forward pass. Bounded by VRAM, not by throughput. See [Batching](#batching-the-captioner). |
+| `PHOTO_ML_DESCRIBE_BATCH` | `4` — how many images the captioner may put through one forward pass. Bounded by VRAM, not by throughput: 8 does not fit at `MAX_PIXELS = 1024*1024`. See [Batching](#batching-the-captioner). |
 | `PHOTO_ML_BATCH_WINDOW_MS` | `30` — how long the collector waits for company before running a batch |
 | `PHOTO_ML_PARSER_MODEL` | `Qwen/Qwen3-0.6B`. Swappable; see [The query parser](#the-query-parser). |
 | `PHOTO_ML_CACHE_DIR` | where transformers keeps weights. Set explicitly by the unit, which gives the service one writable directory and no home. |
@@ -197,8 +197,8 @@ All optional; every one falls back to its default rather than refusing to start.
 |---|---|---|---|---|
 | `vision` | `google/siglip2-so400m-patch14-384` | `siglip2-so400m-patch14-384` | 2.3GB | resident |
 | `parse` | `Qwen/Qwen3-0.6B` | — | 1.2GB | resident |
-| `caption` | `Qwen/Qwen3-VL-4B-Instruct` | `qwen3-vl-4b-instruct` | 9.1–10.1GB | on demand |
-| `ocr` | rapidocr (PP-OCR, ONNX) | `rapidocr` | none — CPU | on demand |
+| `caption` | `Qwen/Qwen3-VL-4B-Instruct` | `qwen3-vl-4b-instruct` | 9.1–13.0GB | on demand |
+| `ocr` | rapidocr (PP-OCRv6 medium, torch) | `rapidocr-v6-medium` | 127MB, 1.2GB peak | on demand |
 
 Checkpoint and stored name are deliberately two strings. The row records what
 produced a caption or a vector and will outlive whatever the weights were called
@@ -206,10 +206,14 @@ on whichever mirror they came from, so the identity is ours: `db.VisionModel`,
 `db.CaptionModel` and `db.OCRModel` hold the same constants on the Go side, and
 migration `0017_vision.sql` names the encoder in the HNSW index's predicate.
 
-That table is also a VRAM budget. 2.3 + 1.2 resident, 10.1 more while the
-captioner is loaded, 1.4 for the desktop session — about 15 of 16.3GB at the
-peak of a backfill, which is why the captioner is on demand, why the parser is
-0.6B, and why `PHOTO_ML_DESCRIBE_BATCH` stops at 8 rather than 16.
+That table is also a VRAM budget, and it is nearly full. 3.25GB resident for
+the encoder and the parser together, 12.98GB at the peak of a describe batch,
+about 1.1GB for the desktop session — which leaves 0.71GB of a 15.51GB card.
+That is why the captioner is on demand, why the parser is 0.6B, and why
+`PHOTO_ML_DESCRIBE_BATCH` is 4: at `captioner.MAX_PIXELS = 1024*1024` a batch of
+8 does not fit at all, measured, with the resident models in place. The 0.71GB
+is not slack — it is what NVENC allocates against while the archive transcodes,
+and the failure this budget exists to prevent.
 
 ### The encoder
 
@@ -304,9 +308,48 @@ signs them off. See server/README.md § Cleaning up the vocabulary.
 
 ### The text recogniser
 
-rapidocr on ONNX Runtime, on the **CPU**. Which means the OCR pass costs the card
-nothing and finishes while the captioner is still on its first thousand
-photographs, and it is why the two are separate job kinds on the Go side.
+rapidocr's PP-OCRv6 **medium** weights, on the card through its torch backend.
+
+Both halves of that were measured, and both came out against what the first
+version of this assumed.
+
+**Bigger is not the axis.** PP-OCRv5 *server* read less text than v6 small did
+and took three times as long. medium is the one that wins; the top of the range
+is not the answer, which is why `PHOTO_ML_OCR_MODEL_TYPE` exists and why it is
+not set to `server`.
+
+**The rendition was the real limit.** At the old `derivstore.MLEdge` of 512px a
+line of receipt text is about five pixels tall, and rapidocr upsamples that back
+to a 736px short side before it looks — interpolation, adding no information.
+Scored against known text on a 4032x3024 photograph:
+
+| text height | 512px | 1536px | a line that size is |
+|---|---|---|---|
+| 2.1% of frame | 1.00 | 1.00 | a road sign, a shopfront, a headline |
+| 1.2% of frame | 0.42 | 1.00 | a receipt held at arm's length |
+| 0.9% of frame | 0.00 | 1.00 | body text in a screenshot, a menu |
+
+MLEdge is 1536 now. The rows reading 0.00 are the photographs where recognised
+text is the only thing that could ever have made them findable.
+
+**The card is free during this pass, so it uses it.** `jobs.ClaimInOrder` drains
+every `ocr` job before the first `describe` job is claimed — deliberately, so the
+captioner and the recogniser do not thrash the card past each other — which
+leaves the recogniser a GPU holding nothing but the encoder and the parser. On it
+the same weights read the same text four times faster: 0.12s an image against
+0.49s, a 0.8 hour pass against 3.2. Set `PHOTO_ML_OCR_DEVICE=cpu` to give it
+back; the text is identical either way.
+
+torch rather than onnxruntime-gpu because this card is Blackwell, and §6's lesson
+about quantisation kernels applies just as well to inference ones: torch cu128 is
+already installed and already proven here by the captioner, so putting the
+recogniser on the GPU installs nothing new. If the build fails anyway it falls
+back to the CPU with a log line rather than refusing to start.
+
+One forward pass runs at a time whatever `VISION_CONCURRENCY` is. Four concurrent
+calls serialise on the same kernels and buy nothing — the finding §10 records for
+the captioner — while costing four copies of the 1.2GB a detection allocates on a
+1536px frame, on a card that has to keep leaving room for NVENC.
 
 A dedicated recogniser rather than asking the VLM to read the words: a model
 asked what a blurry sign says will tell you something plausible, and this one
@@ -337,9 +380,10 @@ on one that is.
 
 ## Batching the captioner
 
-The captioner is memory-bandwidth bound: 8.8GB of weights are read for every
-token it generates, whether that token is for one image or twelve. Measured on
-the RTX 5060 Ti over this archive's own renditions:
+The captioner is memory-bandwidth bound *while it decodes*: 8.8GB of weights are
+read for every token it generates, whether that token is for one image or
+twelve. Measured on the RTX 5060 Ti over this archive's own renditions, back
+when `captioner.MAX_PIXELS` was `512*512` and an image cost 235 vision tokens:
 
 | batch | per image | over the library | peak VRAM |
 |---|---|---|---|
@@ -347,6 +391,22 @@ the RTX 5060 Ti over this archive's own renditions:
 | 4 | 0.78 s | 3.9 h | 9.6GB |
 | 8 | 0.48 s | 2.4 h | 10.1GB |
 | 16 | 0.38 s | 1.9 h | 11.2GB |
+
+That table is why this mechanism exists and it is no longer the operating point.
+`MAX_PIXELS` is `1024*1024`, an image costs 907 vision tokens, and both halves of
+the trade moved. A batch of 8 no longer fits beside the resident models, and the
+batch of 4 that does buys much less than the table suggests — measured at the new
+size, with the resident models in place:
+
+| batch | per image | over the library | peak VRAM | headroom |
+|---|---|---|---|---|
+| 4 | 1.21 s | 7.9 h | 12.98GB | 0.71GB |
+| 8 | 1.12 s | 7.3 h | 13.24GB | 0.48GB — and only with the parser evicted |
+
+Prefill is compute-bound where decode is bandwidth-bound, and at 907 tokens an
+image the pass is mostly prefill. Batching still pays handsomely against a batch
+of 1; it no longer pays much per doubling, which is what makes 4 an easy default
+rather than a sacrifice.
 
 Threads do not help — four concurrent single-image calls take exactly four times
 as long as one, because they serialise on the same kernels. Only a real batch
@@ -361,8 +421,9 @@ enqueues and waits, the collector takes the first thing it sees, waits 30ms for
 company, and runs whatever turned up as one call.
 
 Which means `VISION_CONCURRENCY` on the photod side is now a throughput knob
-rather than a no-op. It defaults to 4; raising it to 8 during an overnight run
-fills the batch and roughly halves the wall clock again.
+rather than a no-op. It defaults to 4, which now exactly fills a
+describe batch; raising it further no longer helps this pass, for the reason the
+second table gives.
 
 ## Running two instances
 

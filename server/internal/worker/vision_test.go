@@ -32,6 +32,10 @@ type fakeML struct {
 	// which model was handed what.
 	described  [][]string
 	recognised [][]string
+	// mayRelease records, per ocr request, whether photod said it had no
+	// captioning work outstanding — the fact that decides whether the recogniser
+	// may take the card back from an idle captioner. See residency.release.
+	mayRelease []bool
 	// captions and text are what the fake answers with, per image index, so a
 	// test can assert that three frames of a clip come back as one asset's
 	// worth of words.
@@ -96,10 +100,12 @@ func newFakeML(t *testing.T) *fakeML {
 	})
 	mux.HandleFunc("POST /ocr", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Images []string `json:"images"`
+			Images             []string `json:"images"`
+			DescribeQueueEmpty bool     `json:"describe_queue_empty"`
 		}
 		json.NewDecoder(r.Body).Decode(&req)
 		f.recognised = append(f.recognised, req.Images)
+		f.mayRelease = append(f.mayRelease, req.DescribeQueueEmpty)
 
 		results := make([]map[string]any, len(req.Images))
 		for i := range results {

@@ -252,8 +252,11 @@ which keeps them reserved against the driver, and `nvidia-smi` goes on showing
 
 ML_IMAGES.md §11 names the number to watch: **whether NVENC transcodes ever fail
 to allocate during a backfill.** If they do, the answer is a lower
-`PHOTO_ML_DESCRIBE_BATCH` (8 → 4 gives back half a gigabyte) or pausing the
-vision pool, not a bigger card.
+`PHOTO_ML_DESCRIBE_BATCH` (4 → 2 gives back about a third of a gigabyte) or
+pausing the vision pool, not a bigger card. The batch is already 4 rather than
+8, because a batch of 8 does not fit at `captioner.MAX_PIXELS = 1024*1024` — so
+this lever has less left in it than it used to, and the pause is the likelier
+answer.
 
 ### Changing the model
 
@@ -271,6 +274,14 @@ recogniser are the same operation against their own tables, followed by
 delete from asset_descriptions where model = 'qwen3-vl-4b-instruct';
 delete from asset_ocr          where model = 'rapidocr';
 ```
+
+Those two deletes are for retiring a model *name*, which is the case where the
+old rows are genuinely rubbish and should stop being searchable at once. If the
+name is staying and only the recipe changed — a raised `captioner.MAX_PIXELS`, a
+new prompt — use `photobackup ml backfill --force` instead and delete nothing:
+it queues every asset again and each one's words are replaced in place as the
+pass reaches it, so search is stale for a few hours rather than empty for
+them.
 
 Each is independent of the other two, which is the whole reason they are three
 job kinds: an encoder bench is fifteen minutes and must not drag four hours of
