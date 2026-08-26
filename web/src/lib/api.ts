@@ -1474,3 +1474,155 @@ export function dismissTagProposal(ids: number[]): Promise<{ blocked: number }> 
 export function unmergeTags(ids: number[]): Promise<{ restored: number }> {
   return send<{ restored: number }>("/v1/tags/unmerge", { ids });
 }
+
+// Uploading from the browser. The one write in this file that creates a
+// photograph rather than moving one, and the only one that does not go through
+// `send` — see uploadAsset for why.
+
+/**
+ * Where the archive already holds some content. The same words photod answers
+ * with, and `where` is never a vault *bucket*: see db.LookupContent.
+ */
+export type ContentWhere = "library" | "trash" | "vault" | "purged";
+
+export interface KnownContent {
+  sha256: string;
+  where: ContentWhere;
+  /** Absent for a vault or purged match, which name no row anybody may read. */
+  id?: string;
+  filename?: string;
+}
+
+/**
+ * Asks which of these digests the archive already has, in the order asked.
+ *
+ * This is what makes a duplicate a row on the upload page rather than the
+ * result of sending one. The browser has read every byte to compute these
+ * anyway — it had to, to be able to declare one — so the check is free where
+ * the transfer it saves is not.
+ */
+export async function checkContent(
+  sha256: string[],
+  signal?: AbortSignal,
+): Promise<KnownContent[]> {
+  const res = await fetch(`${API_BASE}/v1/gallery/uploads/check`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sha256 }),
+    signal,
+  });
+  if (!res.ok) throw new ApiError(res.status, await errorText(res));
+  const body = (await res.json()) as { known: KnownContent[] };
+  return body.known ?? [];
+}
+
+export interface Uploaded {
+  id: string;
+  sha256: string;
+  /** The archive already held these bytes, so nothing was added. */
+  duplicate: boolean;
+}
+
+export interface UploadOptions {
+  /** The digest, declared so photod can hold the transfer to it. */
+  sha256?: string;
+  /** Bytes acknowledged so far, for the row's own bar. */
+  onProgress?: (sent: number) => void;
+  signal?: AbortSignal;
+}
+
+/**
+ * Sends one original.
+ *
+ * XMLHttpRequest, alone in this file, and for the one thing it still does that
+ * `fetch` does not: report how much of a request body has gone out. A duplex
+ * fetch would need a `ReadableStream` body, which rules out HTTP/1.1 — the
+ * protocol the Next rewrite in front of photod speaks — and would still be
+ * measuring what the page has handed to the browser rather than what has
+ * reached the server.
+ *
+ * The file is the body, raw. There is no multipart wrapper because there is
+ * exactly one file and nothing else to say: everything about it that photod
+ * needs is a header, and the alternative is a boundary-encoded copy of a
+ * gigabyte to save nothing.
+ */
+export function uploadAsset(file: File, options: UploadOptions = {}): Promise<Uploaded> {
+  const { sha256, onProgress, signal } = options;
+
+  return new Promise<Uploaded>((resolve, reject) => {
+    const req = new XMLHttpRequest();
+    req.open("POST", `${API_BASE}/v1/gallery/assets`);
+    req.responseType = "text";
+
+    req.setRequestHeader("Content-Type", "application/octet-stream");
+    req.setRequestHeader("X-Photo-Filename", headerSafe(file.name));
+    req.setRequestHeader("X-Photo-Size", String(file.size));
+    if (sha256) req.setRequestHeader("X-Photo-Sha256", sha256);
+    if (file.lastModified) {
+      // A browser has no capture time; the file's own date is the best guess at
+      // where a screenshot belongs on the timeline, and photod prefers whatever
+      // EXIF says over it for everything that has any.
+      const when = new Date(file.lastModified).toISOString();
+      req.setRequestHeader("X-Photo-Captured-At", when);
+      req.setRequestHeader("X-Photo-Modified-At", when);
+    }
+
+    const abort = () => req.abort();
+    signal?.addEventListener("abort", abort);
+    const done = () => signal?.removeEventListener("abort", abort);
+
+    req.upload.onprogress = (ev) => onProgress?.(ev.loaded);
+
+    req.onload = () => {
+      done();
+      if (req.status >= 200 && req.status < 300) {
+        try {
+          resolve(JSON.parse(req.responseText) as Uploaded);
+        } catch {
+          reject(new ApiError(req.status, "the server's answer was not JSON"));
+        }
+        return;
+      }
+      reject(new ApiError(req.status, uploadErrorText(req)));
+    };
+    // No status and no body, so there is nothing to report but the fact.
+    req.onerror = () => {
+      done();
+      reject(new ApiError(0, "the connection to the server failed"));
+    };
+    req.onabort = () => {
+      done();
+      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+
+    req.send(file);
+  });
+}
+
+/** photod's own message, when it sent one. */
+function uploadErrorText(req: XMLHttpRequest): string {
+  try {
+    const body = JSON.parse(req.responseText) as { error?: string };
+    if (body.error) return body.error;
+  } catch {
+    // Same reasoning as errorText: a non-JSON body means something other than
+    // photod answered, and the status is the only honest detail left.
+  }
+  return `${req.status} ${req.statusText}`;
+}
+
+/**
+ * A filename that can travel in a header.
+ *
+ * Header values are bytes, not text, and a photograph called `Ångström.heic`
+ * or one carrying a stray newline would either throw on setRequestHeader or —
+ * worse — be silently mangled into something the archive then stores under.
+ * Percent-encoding is not what photod decodes, so this does the honest thing
+ * instead: it keeps what is unambiguous and replaces the rest, so the stored
+ * name is legible and no longer pretends to be exact.
+ */
+function headerSafe(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  const cleaned = name.replace(/[^\x20-\x7e]/g, "_").trim();
+  return cleaned === "" ? "upload" : cleaned;
+}

@@ -201,6 +201,21 @@ func (s *Server) PlaintextHandler() http.Handler {
 // the gallery password and gets a cookie these routes accept. This listener did
 // not change: it is loopback, and it is open.
 func (s *Server) galleryRoutes(mux *http.ServeMux, allow guard) {
+	// The browser's upload, which is the one write in this table that creates a
+	// photograph rather than moving one. It is here and not beside POST
+	// /v1/assets for the reason everything here is: it carries no device token,
+	// so it is not a credential this listener could leak, and it is the gallery
+	// acting on the archive from a browser on this machine.
+	//
+	// It does widen the exposure, and in a direction none of the rest of this
+	// table does: everything below can destroy what is in the archive, and this
+	// can put something in it. That is the smaller of the two — an unwanted
+	// upload is one trash click away and the trash is undoable for a year —
+	// but it is a widening, and it is one more reason PLAINTEXT_ADDR stays on
+	// loopback. See internal/api/galleryupload.go.
+	mux.HandleFunc("POST /v1/gallery/assets", allow(s.handleGalleryUpload))
+	mux.HandleFunc("POST /v1/gallery/uploads/check", allow(s.handleGalleryCheck))
+
 	mux.HandleFunc("POST /v1/trash", allow(s.handleTrash))
 	mux.HandleFunc("POST /v1/trash/restore", allow(s.handleRestore))
 	// Not DELETE /v1/trash: a purge names a selection, and a selection is a

@@ -161,3 +161,77 @@ func TestPutStoresBlobAtFanoutPath(t *testing.T) {
 		t.Errorf("Created = false, want true for a first write")
 	}
 }
+
+// A client declares whichever digest it can produce, and every one it declares
+// is checked. The phone has an md5 and the browser gallery has a sha256; the
+// store does not care which, and cares very much that what arrives matches.
+
+func TestPutAcceptsASHA256Instead(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	content := []byte("what the browser sends")
+	sha, _ := digests(content)
+
+	res, err := s.Put(bytes.NewReader(content), ".jpg", Expected{
+		SHA256: sha,
+		Size:   int64(len(content)),
+	})
+	if err != nil {
+		t.Fatalf("Put with only a sha256: %v", err)
+	}
+	if res.SHA256 != sha || !res.Created {
+		t.Errorf("Put stored %+v, want a fresh blob under %s", res, sha)
+	}
+}
+
+func TestPutRejectsSHA256Mismatch(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	content := []byte("bytes that arrive corrupted")
+
+	_, err := s.Put(bytes.NewReader(content), ".jpg", Expected{
+		SHA256: "0000000000000000000000000000000000000000000000000000000000000000",
+		Size:   int64(len(content)),
+	})
+	if !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("Put error = %v, want ErrChecksumMismatch", err)
+	}
+	if files := blobTreeFiles(t, root); len(files) != 0 {
+		t.Errorf("rejected upload left files behind: %v", files)
+	}
+}
+
+// Declaring both is not an either/or: a client that gets one of them wrong is
+// wrong, whichever one it is.
+func TestPutChecksEveryDeclaredDigest(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	content := []byte("half-right")
+	sha, _ := digests(content)
+
+	_, err := s.Put(bytes.NewReader(content), ".jpg", Expected{
+		SHA256: sha,
+		MD5:    "00000000000000000000000000000000",
+		Size:   int64(len(content)),
+	})
+	if !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("Put error = %v, want ErrChecksumMismatch", err)
+	}
+}
+
+// Declaring neither leaves the length as the whole of the check, which is what
+// catches the failure a digest cannot tell apart from a different file: a body
+// that was cut short.
+func TestPutWithNoDigestStillChecksLength(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	content := []byte("no digest declared")
+
+	if _, err := s.Put(bytes.NewReader(content), ".jpg", Expected{Size: int64(len(content))}); err != nil {
+		t.Fatalf("Put with no digest: %v", err)
+	}
+	_, err := s.Put(bytes.NewReader(content), ".jpg", Expected{Size: int64(len(content)) + 1})
+	if !errors.Is(err, ErrSizeMismatch) {
+		t.Fatalf("Put error = %v, want ErrSizeMismatch", err)
+	}
+}

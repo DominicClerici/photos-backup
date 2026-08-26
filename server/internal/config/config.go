@@ -47,10 +47,17 @@ type Config struct {
 	// TLSDisabled serves the API in the clear on ListenAddr, tokens and all.
 	// Development only, and photod says so loudly at startup.
 	TLSDisabled bool
-	// PlaintextAddr is a second, unencrypted listener carrying only the
-	// gallery's read endpoints and /health — no pairing, no upload path. It is
-	// how the Next app and a browser on this machine reach photod without having
-	// to trust a private CA. Empty disables it.
+	// PlaintextAddr is a second, unencrypted listener carrying the gallery's
+	// own endpoints and /health, and no endpoint that takes a device token —
+	// no pairing, and not the phone's upload path. It is how the Next app and a
+	// browser on this machine reach photod without having to trust a private
+	// CA. Empty disables it.
+	//
+	// "The gallery's own endpoints" is more than the reads and has been since
+	// the trash: the browser deletes, hides, files into albums, and since the
+	// upload page also archives a photograph it was handed. None of that
+	// carries a credential, all of it is available to anyone who can reach this
+	// address, and that is why the address is a loopback one.
 	PlaintextAddr string
 
 	// MDNSInstance is the advertised service name. Empty means "derive it from

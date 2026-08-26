@@ -324,8 +324,8 @@ func (h *harness) getWith(t *testing.T, path string, headers map[string]string) 
 	return resp
 }
 
-// plaintext starts the read-only listener the browser gallery uses, so a test
-// can assert what is readable without a token.
+// plaintext starts the unauthenticated listener the browser gallery uses, so a
+// test can assert what it can reach without a token.
 func (h *harness) plaintext(t *testing.T) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(h.srv.PlaintextHandler())

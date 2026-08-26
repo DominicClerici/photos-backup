@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Activity, Ellipsis, Images, Library, Search } from "lucide-react";
+import { Activity, CloudUpload, Images, Library, Search } from "lucide-react";
 
 import { openPalette, usePaletteOpen } from "@/hooks/usePalette";
 import { cn } from "@/lib/utils";
@@ -15,7 +15,7 @@ const TABS: { href: string; label: string; Icon: typeof Images }[] = [
   { href: "/", label: "Gallery", Icon: Images },
   { href: "/collections", label: "Collections", Icon: Library },
   { href: "/status", label: "Status", Icon: Activity },
-  { href: "/other", label: "Other", Icon: Ellipsis },
+  { href: "/upload", label: "Upload", Icon: CloudUpload },
 ];
 
 /** Where the highlight sits, in pixels along the row. */

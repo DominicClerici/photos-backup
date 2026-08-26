@@ -1289,7 +1289,13 @@ house to open the gallery at all. The plaintext listener is what the development
 gallery talks to, it asks for nothing, and it is bound to loopback; widening
 `PLAINTEXT_ADDR` is still the whole risk. A device token cannot cross it —
 pairing and every authenticated route are absent from its routing table — so
-widening it exposes photographs but never a credential. Closing this properly is
+widening it exposes photographs but never a credential. What it exposes has
+grown by one kind since: the browser upload page puts a new photograph into the
+archive over that listener, which is the first write there that creates rather
+than moves. It is the smaller half of the exposure the trash already opened —
+an unwanted upload is one click from Recently Deleted, where it is recoverable
+for a year — and it is one more thing that only stays contained because the
+address is a loopback one. Closing this properly is
 the open design question the gate's removal reopened, and whatever answers it
 still has to put the app and the media on one origin: a cookie is the only
 credential a browser will attach to an `<img>`. Putting the gallery on the

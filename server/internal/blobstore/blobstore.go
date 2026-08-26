@@ -14,17 +14,45 @@ import (
 )
 
 var (
-	// ErrChecksumMismatch means the bytes that arrived do not match the digest
+	// ErrChecksumMismatch means the bytes that arrived do not match a digest
 	// the client declared, so the upload is discarded rather than committed.
-	ErrChecksumMismatch = errors.New("blobstore: declared md5 does not match received bytes")
+	ErrChecksumMismatch = errors.New("blobstore: declared digest does not match received bytes")
 	// ErrSizeMismatch means the body was shorter or longer than declared.
 	ErrSizeMismatch = errors.New("blobstore: declared size does not match received bytes")
 )
 
-// Expected carries the digest and length the client declared for an upload.
+// Expected carries the digests and length the client declared for an upload.
+//
+// Both digests are optional and neither is required to be the same one; a
+// client declares whichever it can produce, and every one it declares is
+// checked. The phone sends an md5, because that is what it has already computed
+// to ask sync/check whether the bytes are needed at all. The browser gallery
+// sends a sha256, because a page served over plain http on a LAN address has no
+// window.crypto.subtle and md5 is not in it even when it does — so the digest
+// it can produce is the archive's own, computed in script over the file it is
+// about to send.
+//
+// Size is not optional in the same way. It is declared by every caller and is
+// what catches a body that was cut short, which is the failure a digest cannot
+// distinguish from a file that was simply different.
 type Expected struct {
-	MD5  string
-	Size int64
+	MD5    string
+	SHA256 string
+	Size   int64
+}
+
+// verify holds a stored blob to what its uploader said it would be.
+func (e Expected) verify(res Result) error {
+	if res.Size != e.Size {
+		return fmt.Errorf("%w: declared %d, received %d", ErrSizeMismatch, e.Size, res.Size)
+	}
+	if e.MD5 != "" && !strings.EqualFold(res.MD5, e.MD5) {
+		return fmt.Errorf("%w: declared md5 %s, received %s", ErrChecksumMismatch, e.MD5, res.MD5)
+	}
+	if e.SHA256 != "" && !strings.EqualFold(res.SHA256, e.SHA256) {
+		return fmt.Errorf("%w: declared sha256 %s, received %s", ErrChecksumMismatch, e.SHA256, res.SHA256)
+	}
+	return nil
 }
 
 // Result describes a blob after it has been committed to the store.
@@ -97,11 +125,8 @@ func (s *Store) Put(r io.Reader, ext string, expect Expected) (Result, error) {
 		Size:   size,
 	}
 
-	if res.Size != expect.Size {
-		return Result{}, fmt.Errorf("%w: declared %d, received %d", ErrSizeMismatch, expect.Size, res.Size)
-	}
-	if !strings.EqualFold(res.MD5, expect.MD5) {
-		return Result{}, fmt.Errorf("%w: declared %s, received %s", ErrChecksumMismatch, expect.MD5, res.MD5)
+	if err := expect.verify(res); err != nil {
+		return Result{}, err
 	}
 
 	if err := tmp.Sync(); err != nil {
@@ -162,11 +187,8 @@ func (s *Store) Adopt(path, ext string, expect Expected) (Result, error) {
 		MD5:    hex.EncodeToString(md5Sum.Sum(nil)),
 		Size:   size,
 	}
-	if res.Size != expect.Size {
-		return Result{}, fmt.Errorf("%w: declared %d, received %d", ErrSizeMismatch, expect.Size, res.Size)
-	}
-	if !strings.EqualFold(res.MD5, expect.MD5) {
-		return Result{}, fmt.Errorf("%w: declared %s, received %s", ErrChecksumMismatch, expect.MD5, res.MD5)
+	if err := expect.verify(res); err != nil {
+		return Result{}, err
 	}
 
 	dst := s.Path(res.SHA256, ext)

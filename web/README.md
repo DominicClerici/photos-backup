@@ -22,7 +22,8 @@ itself, and puts the gallery's read endpoints on a second plaintext listener at
 `:8787` needs the CA: every `/api/*` request fails its certificate check, and `<img>` tags
 pointed at `https://…:8787` show broken images in any browser that has not been
 taught to trust the CA. The plaintext listener exists precisely so the gallery
-does not have to be: it serves the read path and `/health` and nothing else, and
+does not have to be: it serves the read path, `/health`, and the writes the
+gallery itself makes — the trash, the vault, albums, and the upload page — while
 photod refuses every credential-carrying endpoint on it.
 
 Reaching the gallery from another machine on the LAN is not supported. This app
