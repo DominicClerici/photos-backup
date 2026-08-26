@@ -44,8 +44,8 @@ const PREVIEW = 6;
  * something.
  *
  * Mounted once by the root layout and opened from anywhere — ⌘K, ctrl-K, or the
- * Search tab in the bar — for the reason the vault's prompt is: the places that
- * open it cannot reach each other. See useVault and hooks/usePalette.
+ * search button beside the bar — for the reason the vault's prompt is: the
+ * places that open it cannot reach each other. See useVault and hooks/usePalette.
  *
  * Today it does one thing: it searches photographs, live, and hands the whole
  * ranking to /search. It is a *palette* rather than a search box because of

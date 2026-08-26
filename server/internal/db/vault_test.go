@@ -3,8 +3,12 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // The database half of the vault, with the encryption stubbed out: what these
@@ -25,7 +29,7 @@ func hide(t *testing.T, s *Store, bucket string, sel Selection) VaultResult {
 	}
 	items := make([]SealedItem, len(candidates))
 	for i, c := range candidates {
-		items[i] = SealedItem{AssetID: c.AssetID, Sealed: c.Doc}
+		items[i] = SealedItem{AssetID: c.AssetID, Sealed: c.Doc, SealedAnalysis: c.Analysis}
 	}
 	result, err := s.CommitVault(ctx, bucket, items)
 	if err != nil {
@@ -61,7 +65,8 @@ func unhide(t *testing.T, s *Store, ids []string) int {
 		}
 		items = append(items, Restoration{
 			AssetID: r.AssetID, Asset: doc.Asset,
-			AlbumIDs: albums, People: doc.People, Item: true,
+			AlbumIDs: albums, People: doc.People,
+			Analysis: r.SealedAnalysis, Item: true,
 		})
 	}
 	restored, err := s.CommitUnvault(ctx, items)
@@ -398,7 +403,7 @@ func TestHidingAStillCarriesItsMotion(t *testing.T) {
 	items := make([]SealedItem, len(candidates))
 	found := false
 	for i, c := range candidates {
-		items[i] = SealedItem{AssetID: c.AssetID, Sealed: c.Doc}
+		items[i] = SealedItem{AssetID: c.AssetID, Sealed: c.Doc, SealedAnalysis: c.Analysis}
 		found = found || c.AssetID == video
 	}
 	if !found {
@@ -422,4 +427,232 @@ func TestHidingAStillCarriesItsMotion(t *testing.T) {
 	if vaulted != 2 {
 		t.Errorf("%d rows are hidden, want both halves", vaulted)
 	}
+}
+
+// What the archive thinks a photograph is goes into the vault with it.
+//
+// The probe this test is written from: caption a photograph, read the text off
+// it, tag it, embed it, then hide it — and then go looking in Postgres for any
+// of it. A caption is a sentence in English saying what the picture is of and
+// an OCR row is the account number off a bank statement, which is exactly what
+// migration 0012 meant by "the metadata that would let somebody reconstruct
+// what the picture was without ever seeing it".
+func TestHidingTakesTheWordsWithIt(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	id := seedAsset(t, s, 1, time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC))
+	describeForVault(t, s, id)
+
+	hide(t, s, VaultHidden, Selection{IDs: []string{id}})
+
+	if got := analysisRows(t, s, id); got != (analysisCounts{}) {
+		t.Errorf("a hidden photograph still says %+v about itself", got)
+	}
+	if tsv := searchText(t, s, id); tsv != "" {
+		t.Errorf("a hidden photograph is still in the search index as %q", tsv)
+	}
+	// And the document is what makes that affordable rather than destructive.
+	var sealed []byte
+	if err := s.pool.QueryRow(ctx,
+		`select sealed_analysis from vault_items where asset_id = $1::uuid`, id).
+		Scan(&sealed); err != nil {
+		t.Fatalf("read the sealed analysis: %v", err)
+	}
+	if len(sealed) == 0 {
+		t.Fatal("nothing was sealed, so the words were destroyed rather than hidden")
+	}
+}
+
+// Restoring is the other half of the promise. A photograph that came back out
+// of the vault without its caption would have paid for being hidden.
+func TestRestoringGivesTheWordsBack(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	id := seedAsset(t, s, 1, time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC))
+	describeForVault(t, s, id)
+	before, err := s.AssetAnalysis(ctx, id)
+	if err != nil {
+		t.Fatalf("AssetAnalysis: %v", err)
+	}
+
+	hide(t, s, VaultHidden, Selection{IDs: []string{id}})
+	unhide(t, s, []string{id})
+
+	after, err := s.AssetAnalysis(ctx, id)
+	if err != nil {
+		t.Fatalf("AssetAnalysis: %v", err)
+	}
+	if after.Caption != before.Caption || after.CaptionModel != before.CaptionModel {
+		t.Errorf("caption came back as %q from %q, want %q from %q",
+			after.Caption, after.CaptionModel, before.Caption, before.CaptionModel)
+	}
+	if after.CaptionedAt == nil || !after.CaptionedAt.Equal(*before.CaptionedAt) {
+		t.Errorf("captioned_at came back as %v, want %v", after.CaptionedAt, before.CaptionedAt)
+	}
+	if after.Text != before.Text || after.TextModel != before.TextModel {
+		t.Errorf("recognised text came back as %q from %q, want %q from %q",
+			after.Text, after.TextModel, before.Text, before.TextModel)
+	}
+	if len(after.Tags) != len(before.Tags) {
+		t.Fatalf("tags came back as %+v, want %+v", after.Tags, before.Tags)
+	}
+	for i := range after.Tags {
+		if after.Tags[i] != before.Tags[i] {
+			t.Errorf("tag %d came back as %+v, want %+v", i, after.Tags[i], before.Tags[i])
+		}
+	}
+	if after.Frames != before.Frames || after.VisionModel != before.VisionModel {
+		t.Errorf("frames came back as %d from %q, want %d from %q",
+			after.Frames, after.VisionModel, before.Frames, before.VisionModel)
+	}
+	// The vector itself, not just the count: an embedding that came back as a
+	// different 1152 numbers is a photograph that has quietly stopped being
+	// findable by what it looks like.
+	if got := vectorLiteral(t, s, id); got != VectorLiteral(unit(7)) {
+		t.Errorf("the restored vector is not the one that was sealed")
+	}
+	// And the tsvector, which is rebuilt rather than carried.
+	if tsv := searchText(t, s, id); tsv == "" || !strings.Contains(tsv, "sofa") {
+		t.Errorf("search row came back as %q, want the caption in it", tsv)
+	}
+}
+
+// The sweep, which is how an archive hidden under an older build catches up.
+//
+// Seeding it means writing the rows behind the guards' backs, because the
+// guards are what stop this happening now: the state under test is one no
+// current code path can produce and every existing vault is in.
+func TestTheSweepSealsWordsAnOlderBuildLeftBehind(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	id := seedAsset(t, s, 1, time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC))
+	describeForVault(t, s, id)
+	hide(t, s, VaultHidden, Selection{IDs: []string{id}})
+
+	// Rewind to the leak: the document goes away and the rows come back.
+	if _, err := s.pool.Exec(ctx,
+		`update vault_items set sealed_analysis = null where asset_id = $1::uuid`, id); err != nil {
+		t.Fatalf("unseal: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `
+		insert into asset_descriptions (asset_id, model, caption)
+		values ($1::uuid, $2, 'a man asleep on a sofa in a bedroom')`, id, CaptionModel); err != nil {
+		t.Fatalf("re-leak the caption: %v", err)
+	}
+
+	left, err := s.VaultAnalysisLeftBehind(ctx)
+	if err != nil {
+		t.Fatalf("VaultAnalysisLeftBehind: %v", err)
+	}
+	if len(left) != 1 || left[0].AssetID != id {
+		t.Fatalf("the sweep found %d assets, want the one that is leaking", len(left))
+	}
+
+	sealed := []SealedItem{{AssetID: id, SealedAnalysis: left[0].Analysis}}
+	swept, err := s.CommitVaultAnalysis(ctx, sealed)
+	if err != nil {
+		t.Fatalf("CommitVaultAnalysis: %v", err)
+	}
+	if swept != 1 {
+		t.Fatalf("swept %d assets, want 1", swept)
+	}
+	if got := analysisRows(t, s, id); got != (analysisCounts{}) {
+		t.Errorf("the sweep left %+v behind", got)
+	}
+	if again, err := s.VaultAnalysisLeftBehind(ctx); err != nil || len(again) != 0 {
+		t.Errorf("the sweep found %d assets on a second pass (err %v), want none", len(again), err)
+	}
+}
+
+// A photograph that was restored between the sweep's read and its write keeps
+// its words. The sweep deletes on the strength of a fact it read some
+// milliseconds ago, and the fact it is deleting is the library's own metadata.
+func TestTheSweepLeavesARestoredPhotographAlone(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	id := seedAsset(t, s, 1, time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC))
+	describeForVault(t, s, id)
+	hide(t, s, VaultHidden, Selection{IDs: []string{id}})
+	unhide(t, s, []string{id})
+
+	// Whatever the sweep read a moment ago, aimed at a row that is now back in
+	// the library.
+	swept, err := s.CommitVaultAnalysis(ctx, []SealedItem{{AssetID: id, SealedAnalysis: []byte("stale")}})
+	if err != nil {
+		t.Fatalf("CommitVaultAnalysis: %v", err)
+	}
+	if swept != 0 {
+		t.Fatalf("swept %d restored photographs, want none", swept)
+	}
+	if got := analysisRows(t, s, id); got.captions != 1 {
+		t.Errorf("the sweep took the words off a restored photograph: %+v", got)
+	}
+}
+
+// describeForVault gives one asset the full set: a caption, a handful of tags,
+// the text off it, and a vector.
+func describeForVault(t *testing.T, s *Store, id string) {
+	t.Helper()
+	ctx := context.Background()
+
+	if err := s.PutDescription(ctx, id, CaptionModel,
+		"a man asleep on a sofa in a bedroom",
+		[]Tag{{Name: "sofa", Confidence: 0.9}, {Name: "bedroom", Confidence: 0.5}},
+	); err != nil {
+		t.Fatalf("PutDescription: %v", err)
+	}
+	if err := s.PutOCR(ctx, id, OCRModel, "ACCOUNT 1234 5678 BALANCE 4210.55"); err != nil {
+		t.Fatalf("PutOCR: %v", err)
+	}
+	if err := s.PutEmbeddings(ctx, id, VisionModel, []Embedding{{Frame: 0, Vector: unit(7)}}); err != nil {
+		t.Fatalf("PutEmbeddings: %v", err)
+	}
+}
+
+// analysisCounts is what the four tables hold about one asset. The zero value
+// is the whole assertion in two of the tests above.
+type analysisCounts struct{ captions, ocr, tags, embeddings int }
+
+func analysisRows(t *testing.T, s *Store, id string) analysisCounts {
+	t.Helper()
+
+	var c analysisCounts
+	err := s.pool.QueryRow(context.Background(), `
+		select (select count(*) from asset_descriptions where asset_id = $1::uuid),
+		       (select count(*) from asset_ocr          where asset_id = $1::uuid),
+		       (select count(*) from asset_tags         where asset_id = $1::uuid),
+		       (select count(*) from asset_embeddings   where asset_id = $1::uuid)`, id).
+		Scan(&c.captions, &c.ocr, &c.tags, &c.embeddings)
+	if err != nil {
+		t.Fatalf("count what the archive says about %s: %v", id, err)
+	}
+	return c
+}
+
+// searchText is the tsvector as text, or empty when the asset has no row.
+func searchText(t *testing.T, s *Store, id string) string {
+	t.Helper()
+
+	var tsv *string
+	err := s.pool.QueryRow(context.Background(),
+		`select tsv::text from asset_search where asset_id = $1::uuid`, id).Scan(&tsv)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("read the search row of %s: %v", id, err)
+	}
+	return text(tsv)
+}
+
+func vectorLiteral(t *testing.T, s *Store, id string) string {
+	t.Helper()
+
+	var vec string
+	if err := s.pool.QueryRow(context.Background(),
+		`select embedding::text from asset_embeddings where asset_id = $1::uuid`, id).
+		Scan(&vec); err != nil {
+		t.Fatalf("read the vector of %s: %v", id, err)
+	}
+	return vec
 }

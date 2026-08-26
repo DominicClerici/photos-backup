@@ -146,6 +146,9 @@ type VaultCandidate struct {
 	// Read here rather than assembled from a struct so that a column added by a
 	// future migration is carried without this file having heard of it.
 	Doc json.RawMessage
+	// Analysis is what the ML passes wrote about it, or nil if nothing had.
+	// Sealed separately from Doc — see analysisDoc.
+	Analysis json.RawMessage
 	// Item distinguishes the photograph somebody chose from the components that
 	// went with it, so a count can be reported in the units it was selected in.
 	Item bool
@@ -155,6 +158,8 @@ type VaultCandidate struct {
 type SealedItem struct {
 	AssetID string
 	Sealed  []byte
+	// SealedAnalysis is the encrypted analysisDoc, or nil when there was none.
+	SealedAnalysis []byte
 }
 
 // vaultDoc builds the sealed document for one row.
@@ -180,6 +185,78 @@ const vaultDoc = `
 		), '[]'::jsonb)
 	)`
 
+// analysisDoc is the second sealed document: everything the ML passes wrote
+// about one photograph.
+//
+// Its own document rather than another member of vaultDoc, and the reason is
+// the one internal/api/analysis.go gives for that endpoint being its own route.
+// vault.Index opens every document in a bucket to draw the gallery, where a
+// caption is a sentence, an OCR row is however many kilobytes a screenshot of a
+// terminal came to, and an embedding is 1152 numbers per sampled frame. One
+// document would mean paying all of that to draw a grid of thumbnails. Restore
+// is the only thing that ever reads this one.
+//
+// Null when the four tables have nothing to say, which on a library the
+// captioner has not been run over is most of it — and null is the honest way to
+// record "nothing had been written", as distinct from "a document was sealed
+// and it was empty".
+//
+// The tags travel as names rather than ids. tags is the shared vocabulary and
+// nothing here deletes from it, so the id would probably still resolve — but
+// "probably" is not what a restore should rest on, and a name is what the row
+// meant anyway. canonical_id is deliberately not read: asset_tags records what
+// the model actually wrote, the merge is resolved on the way out, and a
+// document that stored the merged word would bake a merge into rows that could
+// then not be unmerged.
+//
+// The vectors travel as their text form, which pgvector round-trips exactly.
+const analysisDoc = `(
+	select jsonb_build_object(
+		'v', 1,
+		'captions', coalesce((
+			select jsonb_agg(jsonb_build_object(
+				'model', d.model, 'caption', d.caption, 'generated_at', d.generated_at))
+			from asset_descriptions d where d.asset_id = a.id
+		), '[]'::jsonb),
+		'ocr', coalesce((
+			select jsonb_agg(jsonb_build_object(
+				'model', o.model, 'text', o.text, 'generated_at', o.generated_at))
+			from asset_ocr o where o.asset_id = a.id
+		), '[]'::jsonb),
+		'tags', coalesce((
+			select jsonb_agg(jsonb_build_object(
+				'name', tg.name, 'confidence', at.confidence))
+			from asset_tags at join tags tg on tg.id = at.tag_id
+			where at.asset_id = a.id
+		), '[]'::jsonb),
+		'embeddings', coalesce((
+			select jsonb_agg(jsonb_build_object(
+				'frame', e.frame, 'model', e.model, 'vector', e.embedding::text))
+			from asset_embeddings e where e.asset_id = a.id
+		), '[]'::jsonb))
+	where exists (select 1 from asset_descriptions d where d.asset_id = a.id)
+	   or exists (select 1 from asset_ocr o where o.asset_id = a.id)
+	   or exists (select 1 from asset_tags at where at.asset_id = a.id)
+	   or exists (select 1 from asset_embeddings e where e.asset_id = a.id)
+)`
+
+// analysisTables is every table the vault empties of words, in the order a
+// foreign key would want if one of them ever pointed at another.
+//
+// A list rather than five statements written out, for the reason `scrubbed` is
+// a list: the delete on the way in and the sweep that catches what an older
+// build left behind are the same set, and two copies of it would drift the
+// first time the ML pipeline grew a table. asset_search is here too even though
+// it is derived — it is derived from rows that are about to be gone, and a
+// stale tsvector is the most legible of all of them.
+var analysisTables = []string{
+	"asset_descriptions",
+	"asset_ocr",
+	"asset_tags",
+	"asset_embeddings",
+	"asset_search",
+}
+
 // VaultCandidates resolves a selection to the rows that are about to be hidden,
 // widened to the components that have to travel with them.
 //
@@ -197,7 +274,7 @@ func (s *Store) VaultCandidates(ctx context.Context, sel Selection) ([]VaultCand
 
 	rows, err := s.pool.Query(ctx, `
 		with sel as (`+pick+`),`+family+`
-		select a.id::text, a.sha256, a.ext, `+vaultDoc+`, (`+notComponent+`) as item
+		select a.id::text, a.sha256, a.ext, `+vaultDoc+`, `+analysisDoc+`, (`+notComponent+`) as item
 		from assets a where a.id in (select id from fam)`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("read vault candidates: %w", err)
@@ -218,7 +295,7 @@ func (s *Store) VaultAlbumCandidates(ctx context.Context, albumID string) ([]Vau
 			  and exists (select 1 from album_assets m
 			              where m.asset_id = a.id and m.album_id = $1::uuid)
 		),`+family+`
-		select a.id::text, a.sha256, a.ext, `+vaultDoc+`, (`+notComponent+`) as item
+		select a.id::text, a.sha256, a.ext, `+vaultDoc+`, `+analysisDoc+`, (`+notComponent+`) as item
 		from assets a where a.id in (select id from fam)`, albumID)
 	if err != nil {
 		return nil, fmt.Errorf("read the photos in album %s: %w", albumID, err)
@@ -236,7 +313,7 @@ func (s *Store) VaultPersonCandidates(ctx context.Context, name string) ([]Vault
 			  and exists (select 1 from asset_people p
 			              where p.asset_id = a.id and p.name = $1)
 		),`+family+`
-		select a.id::text, a.sha256, a.ext, `+vaultDoc+`, (`+notComponent+`) as item
+		select a.id::text, a.sha256, a.ext, `+vaultDoc+`, `+analysisDoc+`, (`+notComponent+`) as item
 		from assets a where a.id in (select id from fam)`, name)
 	if err != nil {
 		return nil, fmt.Errorf("read the photos of %q: %w", name, err)
@@ -250,7 +327,7 @@ func scanCandidates(rows pgx.Rows) ([]VaultCandidate, error) {
 	var out []VaultCandidate
 	for rows.Next() {
 		var c VaultCandidate
-		if err := rows.Scan(&c.AssetID, &c.SHA256, &c.Ext, &c.Doc, &c.Item); err != nil {
+		if err := rows.Scan(&c.AssetID, &c.SHA256, &c.Ext, &c.Doc, &c.Analysis, &c.Item); err != nil {
 			return nil, fmt.Errorf("scan vault candidate: %w", err)
 		}
 		out = append(out, c)
@@ -279,6 +356,16 @@ type VaultResult struct {
 // The jobs go too. A pending thumbnail for a photograph whose plaintext is
 // about to be deleted is a job that can only fail, five times, and then mark a
 // hidden photograph broken.
+//
+// And last the words: the caption, the recognised text, the tags, the vectors
+// and the tsvector built out of them, sealed into a second document first and
+// then deleted, in that order and for the reason the row's document goes in
+// first. The write paths have refused to describe a hidden photograph since
+// they were written, which was never the same thing as this — the ordinary
+// order of operations is that the backfill runs over the library and things
+// get hidden afterwards, so what mattered was always the rows written before
+// the hide, and until this they simply stayed. See analysisDoc and migration
+// 0023.
 func (s *Store) CommitVault(ctx context.Context, bucket string, items []SealedItem) (VaultResult, error) {
 	if !ValidBucket(bucket) {
 		return VaultResult{}, fmt.Errorf("%w: %q", ErrBadBucket, bucket)
@@ -293,8 +380,9 @@ func (s *Store) CommitVault(ctx context.Context, bucket string, items []SealedIt
 
 	ids := make([]string, len(items))
 	sealed := make([][]byte, len(items))
+	analyses := make([][]byte, len(items))
 	for i, it := range items {
-		ids[i], sealed[i] = it.AssetID, it.Sealed
+		ids[i], sealed[i], analyses[i] = it.AssetID, it.Sealed, it.SealedAnalysis
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -310,11 +398,11 @@ func (s *Store) CommitVault(ctx context.Context, bucket string, items []SealedIt
 	// row is the one way this operation could lose a photograph's metadata for
 	// good, and the cheapest way not to is never to overwrite.
 	if _, err := tx.Exec(ctx, `
-		insert into vault_items (asset_id, sealed)
-		select k.id::uuid, k.sealed
-		from unnest($1::text[], $2::bytea[]) as k(id, sealed)
+		insert into vault_items (asset_id, sealed, sealed_analysis)
+		select k.id::uuid, k.sealed, k.analysis
+		from unnest($1::text[], $2::bytea[], $3::bytea[]) as k(id, sealed, analysis)
 		on conflict (asset_id) do nothing`,
-		ids, sealed); err != nil {
+		ids, sealed, analyses); err != nil {
 		return VaultResult{}, fmt.Errorf("store sealed metadata: %w", err)
 	}
 
@@ -349,6 +437,9 @@ func (s *Store) CommitVault(ctx context.Context, bucket string, items []SealedIt
 		`delete from jobs where asset_id = any($1::uuid[]) and state <> 'running'`, ids); err != nil {
 		return VaultResult{}, fmt.Errorf("drop the queued work for hidden photos: %w", err)
 	}
+	if err := dropAnalysis(ctx, tx, ids); err != nil {
+		return VaultResult{}, err
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return VaultResult{}, fmt.Errorf("commit the vault operation: %w", err)
@@ -356,11 +447,96 @@ func (s *Store) CommitVault(ctx context.Context, bucket string, items []SealedIt
 	return VaultResult{Batch: batch, Count: count}, nil
 }
 
+// dropAnalysis takes the words out, inside whichever transaction sealed them.
+//
+// Unconditional on the ids it is given rather than joined against the vault
+// column, because both callers have just established that in the same transaction —
+// CommitVault by scrubbing the rows, ReconcileAnalysis by its own guard. A join
+// here would be a second opinion about a fact the caller owns.
+func dropAnalysis(ctx context.Context, tx pgx.Tx, ids []string) error {
+	for _, table := range analysisTables {
+		if _, err := tx.Exec(ctx,
+			`delete from `+table+` where asset_id = any($1::uuid[])`, ids); err != nil {
+			return fmt.Errorf("take %s away from the hidden photos: %w", table, err)
+		}
+	}
+	return nil
+}
+
+// restoreAnalysis puts one photograph's words back from its opened document.
+//
+// Every insert is `do nothing` on conflict rather than an update: nothing can
+// have written a row for this asset while it was hidden — the guards on the
+// write paths are what make that true — so a conflict here means this restore
+// has already run once and the row that is there is this one.
+//
+// The tags are interned before they are linked, the way putTags interns them,
+// because `tags` is the shared vocabulary and a word whose only photograph was
+// hidden may have been the last thing holding its row... which is precisely why
+// nothing deletes from that table. Interning is what makes this correct anyway
+// if something one day does.
+func restoreAnalysis(ctx context.Context, tx pgx.Tx, assetID string, doc []byte) error {
+	if len(doc) == 0 {
+		return nil
+	}
+
+	const captions = `
+		insert into asset_descriptions (asset_id, model, caption, generated_at)
+		select $1::uuid, e->>'model', e->>'caption', (e->>'generated_at')::timestamptz
+		from jsonb_array_elements($2::jsonb -> 'captions') e
+		on conflict (asset_id, model) do nothing`
+	if _, err := tx.Exec(ctx, captions, assetID, doc); err != nil {
+		return fmt.Errorf("give %s back its caption: %w", assetID, err)
+	}
+
+	const ocr = `
+		insert into asset_ocr (asset_id, model, text, generated_at)
+		select $1::uuid, e->>'model', e->>'text', (e->>'generated_at')::timestamptz
+		from jsonb_array_elements($2::jsonb -> 'ocr') e
+		on conflict (asset_id, model) do nothing`
+	if _, err := tx.Exec(ctx, ocr, assetID, doc); err != nil {
+		return fmt.Errorf("give %s back its recognised text: %w", assetID, err)
+	}
+
+	const intern = `
+		insert into tags (name)
+		select distinct e->>'name' from jsonb_array_elements($1::jsonb -> 'tags') e
+		on conflict (name) do nothing`
+	if _, err := tx.Exec(ctx, intern, doc); err != nil {
+		return fmt.Errorf("intern the tag names of %s: %w", assetID, err)
+	}
+
+	const link = `
+		insert into asset_tags (asset_id, tag_id, confidence)
+		select $1::uuid, t.id, (e->>'confidence')::real
+		from jsonb_array_elements($2::jsonb -> 'tags') e
+		join tags t on t.name = e->>'name'
+		on conflict (asset_id, tag_id) do nothing`
+	if _, err := tx.Exec(ctx, link, assetID, doc); err != nil {
+		return fmt.Errorf("give %s back its tags: %w", assetID, err)
+	}
+
+	const embeddings = `
+		insert into asset_embeddings (asset_id, frame, model, embedding)
+		select $1::uuid, (e->>'frame')::int, e->>'model', (e->>'vector')::halfvec
+		from jsonb_array_elements($2::jsonb -> 'embeddings') e
+		on conflict (asset_id, frame, model) do nothing`
+	if _, err := tx.Exec(ctx, embeddings, assetID, doc); err != nil {
+		return fmt.Errorf("give %s back its vectors: %w", assetID, err)
+	}
+	return nil
+}
+
 // VaultedRow is one sealed document as it comes back out.
+//
+// SealedAnalysis is read only where it is needed, which is the restore. The
+// gallery deliberately does not carry it — see analysisDoc — so it is nil on
+// every row VaultRows returns and that is not a row with nothing to say.
 type VaultedRow struct {
-	AssetID string
-	Bucket  string
-	Sealed  []byte
+	AssetID        string
+	Bucket         string
+	Sealed         []byte
+	SealedAnalysis []byte
 }
 
 // VaultRows reads the sealed documents in one bucket, or in both when bucket is
@@ -403,7 +579,7 @@ func (s *Store) VaultRows(ctx context.Context, bucket string) ([]VaultedRow, err
 // VaultSealed reads one sealed document, for a restore that names ids.
 func (s *Store) VaultSealed(ctx context.Context, ids []string) ([]VaultedRow, error) {
 	rows, err := s.pool.Query(ctx, `
-		select a.id::text, a.vault, v.sealed
+		select a.id::text, a.vault, v.sealed, v.sealed_analysis
 		from assets a join vault_items v on v.asset_id = a.id
 		where a.id = any($1::uuid[]) and a.vault <> ''`, ids)
 	if err != nil {
@@ -414,7 +590,7 @@ func (s *Store) VaultSealed(ctx context.Context, ids []string) ([]VaultedRow, er
 	var out []VaultedRow
 	for rows.Next() {
 		var r VaultedRow
-		if err := rows.Scan(&r.AssetID, &r.Bucket, &r.Sealed); err != nil {
+		if err := rows.Scan(&r.AssetID, &r.Bucket, &r.Sealed, &r.SealedAnalysis); err != nil {
 			return nil, fmt.Errorf("scan vault row: %w", err)
 		}
 		out = append(out, r)
@@ -464,6 +640,9 @@ type Restoration struct {
 	// been deleted is dropped rather than reported — see CommitUnvault.
 	AlbumIDs []string
 	People   []string
+	// Analysis is the opened analysis document, or nil when nothing had been
+	// written about this photograph before it was hidden.
+	Analysis json.RawMessage
 	Item     bool
 }
 
@@ -531,6 +710,19 @@ func (s *Store) CommitUnvault(ctx context.Context, items []Restoration) (int, er
 				return 0, fmt.Errorf("put %s back under its people: %w", it.AssetID, err)
 			}
 		}
+		if err := restoreAnalysis(ctx, tx, it.AssetID, it.Analysis); err != nil {
+			return 0, err
+		}
+	}
+
+	// And the tsvector, rebuilt rather than carried, because it is the one part
+	// of the analysis that is derived: the recipe lives in migration 0018 and a
+	// stored copy sealed under an older one would come back stale. Run for
+	// every restored id and not only the ones that had a caption — a filename
+	// and a place name are a searchable row on their own, and that row went
+	// when the photograph did.
+	if err := refresh(ctx, tx, ids); err != nil {
+		return 0, err
 	}
 
 	// A restored photograph whose derivatives never finished gets the job back.
@@ -771,6 +963,109 @@ func (s *Store) VaultFiles(ctx context.Context) ([]VaultFile, error) {
 		out = append(out, f)
 	}
 	return out, rows.Err()
+}
+
+// VaultAnalysisLeftBehind names hidden photographs that still have words in
+// the clear, and the document that would take them away.
+//
+// The counterpart of VaultFiles, and it exists for the same reason: a hidden
+// photograph whose caption is still in asset_descriptions is the same kind of
+// finding as one whose original is still in the blob tree, and neither is
+// something to leave until somebody notices. Two things put a row here. One is
+// an archive that hid photographs before migration 0023 existed, which is every
+// archive that has ever used this feature. The other is a crash between
+// CommitVault's two statements, which cannot happen because they are one
+// transaction — named anyway, because "cannot happen" is how the plaintext
+// sweep would have been described too.
+//
+// A read, and only a read. The caller seals what it gets back before anything
+// is deleted, which is the same order Add takes and for the same reason.
+// A VaultCandidate with no Doc, which is the shape rather than an omission: the
+// row itself was scrubbed and sealed when the photograph was hidden, and this
+// is only the half that was missed.
+func (s *Store) VaultAnalysisLeftBehind(ctx context.Context) ([]VaultCandidate, error) {
+	// The four exists clauses rather than `analysisDoc is not null`, which would
+	// say the same thing and build the document twice to say it. They are also
+	// the cheap half: an archive the sweep has caught up with pays four index
+	// probes per hidden photograph and never assembles a document at all.
+	rows, err := s.pool.Query(ctx, `
+		select a.id::text, a.sha256, a.ext, null::jsonb, `+analysisDoc+`, true
+		from assets a
+		where a.vault <> ''
+		  and (exists (select 1 from asset_descriptions d where d.asset_id = a.id)
+		    or exists (select 1 from asset_ocr o where o.asset_id = a.id)
+		    or exists (select 1 from asset_tags t where t.asset_id = a.id)
+		    or exists (select 1 from asset_embeddings e where e.asset_id = a.id)
+		    or exists (select 1 from asset_search x where x.asset_id = a.id))`)
+	if err != nil {
+		return nil, fmt.Errorf("look for words left behind in the vault: %w", err)
+	}
+	return scanCandidates(rows)
+}
+
+// CommitVaultAnalysis stores the sealed documents the sweep built and takes the
+// rows they describe away, in one transaction.
+//
+// `coalesce` rather than a plain assignment, because a document already in that
+// column is the one CommitVault sealed and is by definition the better one: it
+// was written from the full set of rows at the moment of hiding, where anything
+// this sweep finds beside it could only be a fragment. The same reasoning, and
+// the same shape, as CommitVault's `on conflict do nothing`.
+//
+// The vault-column guard is on both statements rather than trusted from the
+// read, because between the read and here somebody may have restored the
+// photograph — at which point its caption is in the clear legitimately and
+// deleting it would be this sweep destroying the library's own metadata.
+func (s *Store) CommitVaultAnalysis(ctx context.Context, items []SealedItem) (int, error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+	ids := make([]string, len(items))
+	sealed := make([][]byte, len(items))
+	for i, it := range items {
+		ids[i], sealed[i] = it.AssetID, it.SealedAnalysis
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var sweptIDs []string
+	rows, err := tx.Query(ctx, `
+		update vault_items v
+		   set sealed_analysis = coalesce(v.sealed_analysis, k.analysis)
+		from unnest($1::text[], $2::bytea[]) as k(id, analysis)
+		join assets a on a.id = k.id::uuid and a.vault <> ''
+		where v.asset_id = k.id::uuid
+		returning v.asset_id::text`, ids, sealed)
+	if err != nil {
+		return 0, fmt.Errorf("seal the words left behind in the vault: %w", err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scan a swept vault item: %w", err)
+		}
+		sweptIDs = append(sweptIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("seal the words left behind in the vault: %w", err)
+	}
+	if len(sweptIDs) == 0 {
+		return 0, nil
+	}
+
+	if err := dropAnalysis(ctx, tx, sweptIDs); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit the vault analysis sweep: %w", err)
+	}
+	return len(sweptIDs), nil
 }
 
 // VaultSecretRow is the stored vault identity, as columns.

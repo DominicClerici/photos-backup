@@ -925,14 +925,17 @@ func (s *Store) UnmergeGroup(ctx context.Context, id string) (Unmerged, error) {
 	}
 
 	var out Unmerged
+	var restored []string
 	if batch != nil {
 		if err := tx.QueryRow(ctx, `
 			with restored as (
 				update assets a set deleted_at = null, purge_after = null, delete_batch = null
 				where a.delete_batch = $1::uuid and a.deleted_at is not null
-				returning (`+notComponent+`) as item
+				returning a.id, (`+notComponent+`) as item
 			)
-			select count(*)::int from restored where item`, *batch).Scan(&out.Restored); err != nil {
+			select (select count(*)::int from restored where item),
+			       (select coalesce(array_agg(id::text), '{}') from restored)`,
+			*batch).Scan(&out.Restored, &restored); err != nil {
 			return Unmerged{}, fmt.Errorf("restore the merged copies: %w", err)
 		}
 	}
@@ -966,6 +969,13 @@ func (s *Store) UnmergeGroup(ctx context.Context, id string) (Unmerged, error) {
 	// Dismissed, so nothing will propose this again — and nothing should be
 	// left in the queue claiming to owe it a join either.
 	if err := discardMergeJob(ctx, tx, id); err != nil {
+		return Unmerged{}, err
+	}
+
+	// The copies are out of the trash, so they want their search rows back —
+	// see db.Store.Restore for why coming out of the trash is the one thing a
+	// tsvector does not survive on its own.
+	if err := refresh(ctx, tx, restored); err != nil {
 		return Unmerged{}, err
 	}
 

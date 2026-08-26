@@ -250,6 +250,13 @@ func (s *Store) RefreshSearch(ctx context.Context, assetIDs ...string) (int64, e
 }
 
 func refresh(ctx context.Context, tx pgx.Tx, ids []string) error {
+	// No ids is nothing to do, and it has to be said here rather than left to
+	// the caller: a nil slice reaches Postgres as a null array, and null is
+	// rebuild_asset_search's word for *the whole library*. The callers that
+	// pass the ids an UPDATE returned can legitimately have none.
+	if len(ids) == 0 {
+		return nil
+	}
 	_, err := tx.Exec(ctx,
 		`select rebuild_asset_search($1::uuid[], $2, $3)`,
 		ids, CaptionModel, OCRModel)
@@ -563,11 +570,14 @@ type Analysis struct {
 // panel that draws a caption is worth more than one that refuses to draw
 // anything, so the caller is expected to log a failure here and carry on.
 //
-// Nothing is read for an asset in the vault, and nothing needs to be: the write
-// paths all refuse it, so the tables are empty for those rows by construction
-// rather than by this query remembering to say so. The guard is repeated
-// anyway, because "the tables happen to be empty" is a fact about the past and
-// the caller is asking about the present.
+// Nothing is read for an asset in the vault. Two things make that true and they
+// are not the same thing: the write paths refuse to describe a hidden
+// photograph, and CommitVault seals and deletes whatever was written about it
+// before it was hidden. The first was here from the start and was never enough
+// on its own — the ordinary order is that the backfill runs over the library
+// and things get hidden afterwards. The guard in the where clause is what makes
+// the answer true today rather than eventually, which matters while an archive
+// hidden under an older build waits for the sweep to reach it.
 func (s *Store) AssetAnalysis(ctx context.Context, assetID string) (Analysis, error) {
 	var a Analysis
 

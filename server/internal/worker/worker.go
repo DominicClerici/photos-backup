@@ -612,15 +612,44 @@ func (r *Runner) runMetadata(ctx context.Context, assetID string) error {
 		if !decodable {
 			return r.Store.SetPlaybackState(ctx, assetID, db.PlaybackNone)
 		}
+		// A second run of this job over a video that has already been
+		// transcoded leaves the playback state alone. Pairing requeues metadata
+		// when a video turns out not to be a Live Photo's motion after all, and
+		// `verify --fix` requeues it to backfill a thumbnail size the library
+		// was built without — neither invalidates an MP4 that is keyed by the
+		// original's digest and is already on disk.
+		//
+		// Flipping it back to pending here is what stranded a set of videos on
+		// "preparing a version this browser can play": the state went to
+		// pending, the enqueue below collided with the completed playback job
+		// and did nothing, and nothing was ever going to move it again.
+		if asset.PlaybackState == db.DerivedReady && r.playbackBuilt(asset, overlay) {
+			return nil
+		}
 		if err := r.Store.SetPlaybackState(ctx, assetID, db.DerivedPending); err != nil {
 			return err
 		}
-		if err := jobs.Enqueue(ctx, r.Store.Pool(), jobs.KindPlayback, assetID); err != nil {
+		// Requeue rather than Enqueue, for the reason pairing.go gives about
+		// this same job pair: the row this reaches can be a playback job that
+		// has already run, and Enqueue's conflict clause would leave it done
+		// with the asset stuck pending.
+		if err := jobs.Requeue(ctx, r.Store.Pool(), jobs.KindPlayback, assetID); err != nil {
 			return err
 		}
 		r.Nudge()
 	}
 	return nil
+}
+
+// playbackBuilt reports whether every playback rendition an asset is owed is
+// already on disk. A Snapchat memory is owed two — the composite every player
+// gets and the photograph underneath for the viewer's toggle — so a video whose
+// caption layer was linked after it was transcoded is correctly not built.
+func (r *Runner) playbackBuilt(asset db.Asset, overlay *derive.Layer) bool {
+	if !r.Derivatives.Exists(asset.SHA256, derivstore.Playback) {
+		return false
+	}
+	return overlay == nil || r.Derivatives.Exists(asset.SHA256, derivstore.PlaybackPlain)
 }
 
 // geocode resolves a place name from the coordinates on an asset's row and

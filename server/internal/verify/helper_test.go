@@ -267,3 +267,18 @@ func truncate(t *testing.T, ctx context.Context, dbURL string) {
 	_, _ = conn.Exec(ctx,
 		"truncate table assets, device_assets, jobs, devices, pairing_codes, albums, tags, purged_content, vault_people, vault_secret cascade")
 }
+
+// stallPlayback puts an asset in the state the metadata job used to leave a
+// re-run video in: promising a rendition, with the job that would build one
+// already finished.
+func (a *archive) stallPlayback(t *testing.T, assetID string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := a.store.SetPlaybackState(ctx, assetID, db.DerivedPending); err != nil {
+		t.Fatalf("set playback state: %v", err)
+	}
+	if _, err := a.store.Pool().Exec(ctx,
+		`insert into jobs (kind, asset_id, state) values ('playback', $1::uuid, 'done')`, assetID); err != nil {
+		t.Fatalf("stall the playback job: %v", err)
+	}
+}

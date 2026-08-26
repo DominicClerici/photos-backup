@@ -427,3 +427,84 @@ func TestAVideoWithAnOverlayIsRequeuedForTheRenditionWithoutIt(t *testing.T) {
 		t.Errorf("%d pending playback jobs, want 1", pending)
 	}
 }
+
+// The inverse of "marked ready but the file is gone", and the one verify used
+// to be blind to: the row still says pending while the job behind the promise
+// has already run to done. The viewer shows "preparing a version this browser
+// can play" over these forever, and the MP4 is right there.
+//
+// Repaired by correcting the row rather than by transcoding again — the bytes
+// are already correct, and a library that collected a few hundred of these
+// should not spend a few hundred transcodes saying so.
+func TestAVideoStuckPendingOverAFinishedTranscodeIsMarkedReady(t *testing.T) {
+	a := newArchive(t)
+	ctx := context.Background()
+	clip := a.add(t, "clip.mov", fixture(t, "clip.mov"), captured)
+
+	if err := a.derivs.Write(clip.SHA256, derivstore.Playback, func(w io.Writer) error {
+		_, err := w.Write([]byte("a rendition"))
+		return err
+	}); err != nil {
+		t.Fatalf("write the rendition: %v", err)
+	}
+	a.stallPlayback(t, clip.ID)
+
+	report := a.run(t, verify.Options{Fix: true})
+	found := one(t, report, verify.DerivativeStalled)
+	if !found.Fixed {
+		t.Fatalf("--fix left the row stalled: %v", found)
+	}
+
+	got, err := a.store.Asset(ctx, clip.ID)
+	if err != nil {
+		t.Fatalf("reload asset: %v", err)
+	}
+	if got.PlaybackState != db.DerivedReady {
+		t.Errorf("PlaybackState = %q, want ready", got.PlaybackState)
+	}
+}
+
+// Same stall with nothing on disk. There is no shortcut here, so the repair is
+// the transcode — requeued, because the job it has to move is already done.
+func TestAVideoStuckPendingWithNoRenditionIsRequeued(t *testing.T) {
+	a := newArchive(t)
+	ctx := context.Background()
+	clip := a.add(t, "clip.mov", fixture(t, "clip.mov"), captured)
+	a.stallPlayback(t, clip.ID)
+
+	report := a.run(t, verify.Options{Fix: true})
+	found := one(t, report, verify.DerivativeStalled)
+	if !found.Fixed {
+		t.Fatalf("--fix did not requeue the transcode: %v", found)
+	}
+
+	var pending int
+	if err := a.store.Pool().QueryRow(ctx,
+		`select count(*) from jobs where asset_id = $1::uuid and kind = 'playback' and state = 'pending'`,
+		clip.ID).Scan(&pending); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if pending != 1 {
+		t.Errorf("%d pending playback jobs, want 1", pending)
+	}
+}
+
+// A video whose transcode is still queued is not stalled, however long it has
+// been waiting. Reporting those would make the finding useless on any library
+// that is still ingesting.
+func TestAVideoWaitingOnAQueuedTranscodeIsNotReported(t *testing.T) {
+	a := newArchive(t)
+	ctx := context.Background()
+	clip := a.add(t, "clip.mov", fixture(t, "clip.mov"), captured)
+
+	if err := a.store.SetPlaybackState(ctx, clip.ID, db.DerivedPending); err != nil {
+		t.Fatalf("set playback state: %v", err)
+	}
+	if err := jobs.Enqueue(ctx, a.store.Pool(), jobs.KindPlayback, clip.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	if got := findings(a.run(t, verify.Options{}), verify.DerivativeStalled); len(got) != 0 {
+		t.Errorf("reported a transcode that has not run yet: %v", got)
+	}
+}

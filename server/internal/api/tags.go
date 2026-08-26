@@ -450,8 +450,11 @@ func (s *Server) answerWithCounts(w http.ResponseWriter, r *http.Request, out ma
 
 // readJSON decodes a request body, answering 400 with the reason when it
 // cannot.
+//
+// Bounded at maxSelectionBody because every route through here takes a list of
+// tag ids, which is the same shape of request the selection routes take.
 func readJSON(w http.ResponseWriter, r *http.Request, into any) bool {
-	if err := json.NewDecoder(r.Body).Decode(into); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxSelectionBody)).Decode(into); err != nil {
 		writeError(w, http.StatusBadRequest, "could not read request body: "+err.Error())
 		return false
 	}

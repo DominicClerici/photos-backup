@@ -179,10 +179,21 @@ func (s *Service) Add(ctx context.Context, bucket string, candidates []db.VaultC
 		if err != nil {
 			return db.VaultResult{}, err
 		}
+		// Nil in, nil out: a photograph nothing has described seals no second
+		// document, and the column is left null rather than holding an
+		// encrypted empty answer.
+		var analysis []byte
+		if len(c.Analysis) > 0 {
+			if analysis, err = SealAnalysis(to, c.AssetID, c.Analysis); err != nil {
+				return db.VaultResult{}, err
+			}
+		}
 		if err := s.sealFiles(to, c); err != nil {
 			return db.VaultResult{}, err
 		}
-		sealed = append(sealed, db.SealedItem{AssetID: c.AssetID, Sealed: doc})
+		sealed = append(sealed, db.SealedItem{
+			AssetID: c.AssetID, Sealed: doc, SealedAnalysis: analysis,
+		})
 	}
 
 	result, err := s.Store.CommitVault(ctx, bucket, sealed)
@@ -279,6 +290,14 @@ func (s *Service) Remove(ctx context.Context, ids []string) (int, error) {
 		if err != nil {
 			return 0, fmt.Errorf("open the sealed metadata of %s: %w", r.AssetID, err)
 		}
+		// Fatal rather than skipped, the same as the row's document. A restore
+		// that quietly dropped the caption would be indistinguishable from a
+		// photograph that never had one, and the whole point of sealing it was
+		// that coming back out of the vault should not cost anything.
+		analysis, err := openAnalysis(priv, r.AssetID, r.SealedAnalysis)
+		if err != nil {
+			return 0, fmt.Errorf("open the sealed analysis of %s: %w", r.AssetID, err)
+		}
 		if err := s.unsealFiles(priv, parsed); err != nil {
 			return 0, err
 		}
@@ -292,6 +311,7 @@ func (s *Service) Remove(ctx context.Context, ids []string) (int, error) {
 			Asset:    doc.Asset,
 			AlbumIDs: albumIDs,
 			People:   doc.People,
+			Analysis: analysis,
 			Item:     !isComponent(parsed),
 		})
 		files = append(files, restored{sha: parsed.SHA256, ext: parsed.Ext})
@@ -526,6 +546,66 @@ func (s *Service) Reconcile(ctx context.Context) (int, error) {
 		}
 	}
 	return cleaned, nil
+}
+
+// ReconcileAnalysis takes the words away from photographs that are already
+// hidden.
+//
+// Reconcile's counterpart, and the reason migration 0023 adds a column and
+// nothing else. Sealing needs the vault's public key and an X25519 exchange,
+// which SQL cannot do, so a migration could only have deleted — and deleting
+// the only record of what a model said about every photograph already in the
+// vault, with nothing to give back on a restore, is not a migration anybody
+// should run. Here instead: seal first, delete second, the same order Add
+// takes, on the same hourly timer.
+//
+// No password, deliberately. Putting something into the vault has never needed
+// one — see the package comment — and this is that operation arriving late for
+// photographs that were hidden before it existed. A sweep that waited for
+// somebody to unlock would be a sweep that never ran on the archives that need
+// it most.
+//
+// An archive with no vault at all has nothing to do and says so by returning
+// zero rather than an error: the sweep runs on a timer on every deployment,
+// including the ones where nobody has ever hidden anything.
+func (s *Service) ReconcileAnalysis(ctx context.Context) (int, error) {
+	left, err := s.Store.VaultAnalysisLeftBehind(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(left) == 0 {
+		return 0, nil
+	}
+	to, err := s.recipient(ctx)
+	if errors.Is(err, ErrNoVault) {
+		// Rows in the vault and no keypair to seal them to. That is a broken
+		// archive rather than a quiet one, so it is said out loud and nothing
+		// is deleted.
+		s.logger().Error("hidden photos still carry their captions and there is no vault key to seal them with",
+			"assets", len(left))
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	sealed := make([]db.SealedItem, 0, len(left))
+	for _, c := range left {
+		// Nil when the only thing left behind is the tsvector, which is the
+		// state of a hidden photograph that was in the library long enough to
+		// get a filename and a place into the search index and never a caption.
+		// There is nothing to seal — the recipe is in migration 0018 and a
+		// restore rebuilds the row from the columns — so this seals nothing and
+		// the sweep goes on to delete it.
+		var doc []byte
+		if len(c.Analysis) > 0 {
+			if doc, err = SealAnalysis(to, c.AssetID, c.Analysis); err != nil {
+				return 0, err
+			}
+		}
+		sealed = append(sealed, db.SealedItem{AssetID: c.AssetID, SealedAnalysis: doc})
+	}
+	return s.Store.CommitVaultAnalysis(ctx, sealed)
 }
 
 // dropStrayPlaintext removes any blob and any rendition sharing a vaulted

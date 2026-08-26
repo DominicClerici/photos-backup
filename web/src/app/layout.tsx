@@ -49,7 +49,7 @@ export default function RootLayout({
       {/* The command palette is here for the same reason as the prompt below it,
           and one more: ⌘K has to work on a page that is still loading and on one
           that has nothing to do with searching, so the listener has to outlive
-          every page. It is also where the Search tab goes — see TabBar. */}
+          every page. It is also what the search button opens — see TabBar. */}
       {/* And the vault's password prompt is here because it is asked for from
           everywhere: a right-click in the library, a menu on an album tile, a
           page that has just found out it is locked. One dialog opened from a

@@ -18,6 +18,9 @@ import (
 // is asked to hold, not on how many questions there are.
 const maxGroups = 60
 
+// maxMergeBody is generous for the one id a merge names.
+const maxMergeBody = 8 << 10
+
 // handleMergeCounts is the overview card: how much is waiting, and how much of
 // the library the answer is based on.
 func (s *Server) handleMergeCounts(w http.ResponseWriter, r *http.Request) {
@@ -131,7 +134,7 @@ type mergeRequest struct {
 // piece and throwing away the rest of the minute.
 func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request) {
 	var req mergeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxMergeBody)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "could not read request body: "+err.Error())
 		return
 	}

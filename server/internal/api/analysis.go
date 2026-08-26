@@ -28,9 +28,14 @@ func (s *Server) handleAssetAnalysis(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Nothing has been written about a hidden photograph — the vault guard is
-	// on all three write paths — so this is not hiding an answer so much as
-	// declining to go and confirm there isn't one. See db.AssetAnalysis.
+	// A hidden photograph's words are in its sealed analysis document and not
+	// in any table this could read — the vault takes them on the way in and
+	// gives them back on the way out. See db.CommitVault and analysisDoc.
+	//
+	// So this is a guard rather than the answer, and the difference matters on
+	// exactly one archive: one that hid photographs before migration 0023, and
+	// whose hourly sweep has not yet reached them. There the rows are still
+	// there and this is the only thing standing between them and the network.
 	if asset.Vault != "" {
 		writeJSON(w, http.StatusOK, db.Analysis{})
 		return

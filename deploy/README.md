@@ -434,17 +434,19 @@ photobackup-admin redeploy
 ```
 
 It rebuilds `photod` and `photobackup` from the checkout, updates any of the
-installed unit files that have drifted from `deploy/`, applies any pending
-database migrations, restarts photod, and waits for `/health` to answer before
-reporting success. If it does not answer within fifteen seconds it prints the
-unit status and the last thirty journal lines and exits non-zero.
+installed unit files that have drifted from `deploy/`, cycles the Postgres
+container, applies any pending database migrations, restarts photod, and waits
+for `/health` to answer before reporting success. If it does not answer within
+fifteen seconds it prints the unit status and the last thirty journal lines and
+exits non-zero.
 
 ```sh
 photobackup-admin redeploy --dry-run          # build and diff, change nothing
+photobackup-admin redeploy --no-db            # leave the container alone
 photobackup-admin redeploy --src ~/src/photos-backup
 ```
 
-Four things worth knowing:
+Five things worth knowing:
 
 - **The build happens before the stop.** A tree that does not compile costs a
   minute and leaves the running service untouched. Downtime is the install and
@@ -456,6 +458,15 @@ Four things worth knowing:
 - **It finds the source tree by walking up from the current directory**, looking
   for `server/go.mod` and `deploy/` together. Run it from anywhere inside the
   checkout, or set `PHOTOBACKUP_SRC`, or pass `--src`.
+- **The database is cycled too**, from the checkout's `docker-compose.yml`, in
+  the window where photod is already down: `stop` then `up -d --wait`, so a
+  changed compose file is actually applied and the healthcheck — not a guess —
+  decides when migrations may run. Nothing restarts that container at boot, so
+  a machine that has rebooted since the last deploy comes back with the
+  database gone and finds out at the migration step, with photod already
+  stopped; this is what closes that. Data lives in the `pgdata` volume and
+  neither command touches it. `--no-db` skips the whole step, and so does a
+  machine with no docker or no compose file — with a note saying so.
 - **Migrations run while photod is stopped**, from the binary that was just
   installed, so the schema change and the code that needs it land together.
   photod migrates on start as well, but a failure there is a service that will

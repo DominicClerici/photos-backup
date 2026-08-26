@@ -48,8 +48,8 @@ export function onPalette(listener: Listener): () => void {
 
 /**
  * Whether the palette is open, for the one control that has to look different
- * while it is: the Search tab, which is a button rather than a destination and
- * would otherwise be the only thing in the bar that never lights up.
+ * while it is: the search button floating beside the tab bar, which opens the
+ * palette rather than going anywhere and would otherwise never light up.
  */
 export function usePaletteOpen(): boolean {
   const [open, setOpen] = useState(false);

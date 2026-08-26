@@ -348,3 +348,173 @@ func withDatabase(t *testing.T, raw, name string) string {
 	u.Path = "/" + name
 	return u.String()
 }
+
+// The words make the same round trip the picture does, through real X25519 and
+// real AES-GCM.
+func TestTheWordsSurviveTheRoundTrip(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	asset := h.archive(t, 4, []byte("a photograph of a receipt"))
+	if err := h.store.PutDescription(ctx, asset.ID, db.CaptionModel,
+		"a man asleep on a sofa in a bedroom",
+		[]db.Tag{{Name: "sofa", Confidence: 0.9}}); err != nil {
+		t.Fatalf("PutDescription: %v", err)
+	}
+	if err := h.store.PutOCR(ctx, asset.ID, db.OCRModel,
+		"ACCOUNT 1234 5678 BALANCE 4210.55"); err != nil {
+		t.Fatalf("PutOCR: %v", err)
+	}
+	if err := h.Setup(ctx, "a password for the vault"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	h.hide(t, db.VaultHidden, asset.ID)
+	if captions := h.countCaptions(t, asset.ID); captions != 0 {
+		t.Fatalf("a hidden photograph still has %d captions in the clear", captions)
+	}
+	// The sealed document is opened with the private key and nothing else, so a
+	// locked vault is as opaque about the words as it is about the picture.
+	h.Keeper.Lock()
+	if _, err := h.Remove(ctx, []string{asset.ID}); err == nil {
+		t.Fatal("a locked vault handed a photograph back")
+	}
+	if err := h.Unlock(ctx, "a password for the vault"); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+
+	if _, err := h.Remove(ctx, []string{asset.ID}); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	analysis, err := h.store.AssetAnalysis(ctx, asset.ID)
+	if err != nil {
+		t.Fatalf("AssetAnalysis: %v", err)
+	}
+	if analysis.Caption != "a man asleep on a sofa in a bedroom" {
+		t.Errorf("the caption came back as %q", analysis.Caption)
+	}
+	if analysis.Text != "ACCOUNT 1234 5678 BALANCE 4210.55" {
+		t.Errorf("the recognised text came back as %q", analysis.Text)
+	}
+	if len(analysis.Tags) != 1 || analysis.Tags[0].Name != "sofa" {
+		t.Errorf("the tags came back as %+v", analysis.Tags)
+	}
+}
+
+// The sweep, which is how an archive hidden before migration 0023 catches up:
+// it seals what it finds rather than deleting it, needs no password, and a
+// restore afterwards is still whole.
+func TestTheSweepSealsWordsLeftInTheClear(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	asset := h.archive(t, 5, []byte("a photograph of a bank statement"))
+	if err := h.Setup(ctx, "a password for the vault"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	h.hide(t, db.VaultHidden, asset.ID)
+
+	// What every archive hidden under an older build looks like: a row in the
+	// vault, nothing in sealed_analysis, and the caption still in the table.
+	if _, err := h.store.Pool().Exec(ctx, `
+		insert into asset_descriptions (asset_id, model, caption)
+		values ($1::uuid, $2, 'a man asleep on a sofa in a bedroom')`,
+		asset.ID, db.CaptionModel); err != nil {
+		t.Fatalf("leak a caption: %v", err)
+	}
+	if _, err := h.store.Pool().Exec(ctx, `
+		insert into asset_ocr (asset_id, model, text)
+		values ($1::uuid, $2, 'ACCOUNT 1234 5678 BALANCE 4210.55')`,
+		asset.ID, db.OCRModel); err != nil {
+		t.Fatalf("leak the recognised text: %v", err)
+	}
+
+	// Locked, deliberately. Putting something into the vault has never needed
+	// the password and this is that operation arriving late — a sweep that
+	// waited for somebody to unlock would never run on the archives that need
+	// it most.
+	h.Keeper.Lock()
+	sealed, err := h.ReconcileAnalysis(ctx)
+	if err != nil {
+		t.Fatalf("ReconcileAnalysis: %v", err)
+	}
+	if sealed != 1 {
+		t.Fatalf("the sweep sealed %d assets, want 1", sealed)
+	}
+	if captions := h.countCaptions(t, asset.ID); captions != 0 {
+		t.Errorf("the sweep left %d captions behind", captions)
+	}
+	// Idempotent: the second tick has nothing to find, which is what makes this
+	// affordable on an hourly timer.
+	if again, err := h.ReconcileAnalysis(ctx); err != nil || again != 0 {
+		t.Errorf("a second sweep sealed %d assets (err %v), want none", again, err)
+	}
+
+	// Sealed rather than deleted, which is the whole difference between this
+	// and the migration that could not have been written.
+	//
+	// A stray tsvector on its own is the other half of the same sweep, and the
+	// one thing here with nothing to seal: the recipe is in migration 0018 and
+	// the row is rebuilt from the columns on the way back out.
+	if _, err := h.store.Pool().Exec(ctx, `
+		insert into asset_search (asset_id, tsv)
+		values ($1::uuid, to_tsvector('english', 'IMG 0005 HEIC'))`, asset.ID); err != nil {
+		t.Fatalf("leak a tsvector: %v", err)
+	}
+	if swept, err := h.ReconcileAnalysis(ctx); err != nil || swept != 1 {
+		t.Fatalf("the sweep took %d stray search rows (err %v), want 1", swept, err)
+	}
+	var indexed int
+	if err := h.store.Pool().QueryRow(ctx,
+		`select count(*) from asset_search where asset_id = $1::uuid`, asset.ID).
+		Scan(&indexed); err != nil {
+		t.Fatalf("count search rows: %v", err)
+	}
+	if indexed != 0 {
+		t.Errorf("a hidden photograph is still in the search index")
+	}
+
+	if err := h.Unlock(ctx, "a password for the vault"); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	if _, err := h.Remove(ctx, []string{asset.ID}); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	analysis, err := h.store.AssetAnalysis(ctx, asset.ID)
+	if err != nil {
+		t.Fatalf("AssetAnalysis: %v", err)
+	}
+	if analysis.Caption != "a man asleep on a sofa in a bedroom" {
+		t.Errorf("the swept caption came back as %q", analysis.Caption)
+	}
+	if analysis.Text != "ACCOUNT 1234 5678 BALANCE 4210.55" {
+		t.Errorf("the swept text came back as %q", analysis.Text)
+	}
+}
+
+// hide runs one asset through the whole write path: resolve, seal, commit, drop
+// the plaintext.
+func (h *harness) hide(t *testing.T, bucket, assetID string) {
+	t.Helper()
+	ctx := context.Background()
+
+	candidates, err := h.store.VaultCandidates(ctx, db.Selection{IDs: []string{assetID}})
+	if err != nil {
+		t.Fatalf("VaultCandidates: %v", err)
+	}
+	if _, err := h.Add(ctx, bucket, candidates); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+}
+
+func (h *harness) countCaptions(t *testing.T, assetID string) int {
+	t.Helper()
+
+	var n int
+	if err := h.store.Pool().QueryRow(context.Background(),
+		`select count(*) from asset_descriptions where asset_id = $1::uuid`, assetID).
+		Scan(&n); err != nil {
+		t.Fatalf("count captions: %v", err)
+	}
+	return n
+}

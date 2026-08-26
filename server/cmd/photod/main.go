@@ -435,20 +435,30 @@ func sweepTrash(ctx context.Context, d purge.Deps, every time.Duration) {
 	}
 }
 
-// sweepVault removes plaintext an interrupted hide left behind, once at startup
-// and on a timer after that.
+// sweepVault removes what a hide left behind, once at startup and on a timer
+// after that: plaintext an interruption stranded on disk, and the words an
+// older build never took out of the database.
 //
-// Cheap by construction: the question is only asked about rows that are already
-// in the vault, and the answer is a stat per digest.
+// Cheap by construction: both questions are only asked about rows that are
+// already in the vault, and on an archive where the sweep has caught up the
+// second one is a single indexed query that returns nothing.
 func sweepVault(ctx context.Context, vaults *vault.Service, every time.Duration) {
 	sweep := func() {
-		cleaned, err := vaults.Reconcile(ctx)
-		if err != nil {
-			return // already logged, and the next tick asks again
-		}
-		if cleaned > 0 {
+		if cleaned, err := vaults.Reconcile(ctx); err == nil && cleaned > 0 {
 			vaults.Log.Warn("swept plaintext left behind by interrupted vault operations",
 				"files", cleaned)
+		}
+		// Separate from the one above rather than gated on it: a failure to
+		// unlink a stray file is no reason to leave a caption in the clear, and
+		// the errors of the two have nothing to do with each other.
+		sealed, err := vaults.ReconcileAnalysis(ctx)
+		if err != nil {
+			vaults.Log.Error("could not seal the words left behind by hidden photos", "error", err)
+			return // the next tick asks again
+		}
+		if sealed > 0 {
+			vaults.Log.Warn("sealed captions, text and vectors that were left behind by hidden photos",
+				"assets", sealed)
 		}
 	}
 

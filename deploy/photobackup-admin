@@ -15,7 +15,7 @@
 #   sudo install -m 0755 deploy/photobackup-admin /usr/local/bin/
 #
 # Usage: photobackup-admin <pair|devices|ca|verify|export|reindex|geocode|import|reset|migrate> [args...]
-#        photobackup-admin redeploy [--src DIR] [--dry-run]
+#        photobackup-admin redeploy [--src DIR] [--no-db] [--dry-run]
 #
 # `redeploy` is the one subcommand that is not a photobackup subcommand. It
 # rebuilds photod and photobackup from a source tree and swaps them in, so it
@@ -52,15 +52,17 @@ UNITS_CHANGED=
 
 redeploy_usage() {
 	cat >&2 <<'EOF'
-usage: photobackup-admin redeploy [--src DIR] [--dry-run]
+usage: photobackup-admin redeploy [--src DIR] [--no-db] [--dry-run]
 
 Rebuild photod and photobackup from the source tree, sync the systemd units,
-apply any pending database migrations, and restart photod. Everything is built
-before anything is stopped, so a tree that does not compile leaves the running
-service exactly where it was.
+cycle the Postgres container, apply any pending database migrations, and
+restart photod. Everything is built before anything is stopped, so a tree that
+does not compile leaves the running service exactly where it was.
 
   --src DIR   repository to build from. Defaults to $PHOTOBACKUP_SRC, then to
               the repository containing the current directory.
+  --no-db     leave the database alone. For a Postgres that this compose file
+              does not own, or a deploy that must not interrupt it.
   --dry-run   print what would happen and change nothing.
 EOF
 }
@@ -148,6 +150,113 @@ wait_healthy() {
 	return 1
 }
 
+# ---------------------------------------------------------------- database ---
+
+# Postgres runs from the repository's docker-compose.yml, not from a system
+# unit (deploy/README.md § The database), and the compose file sets no restart
+# policy — so a machine that has rebooted since the last deploy comes back with
+# photod running and the container exited. Cycling it here is what makes
+# `redeploy` a deploy of the stack rather than of the binaries alone: migrations
+# used to be the first thing to notice the database was gone, by which point
+# photod was already stopped.
+DB_SERVICE=postgres
+NO_DB=
+COMPOSE=
+COMPOSE_FILE=
+DB_WAIT=
+
+# Resolved before anything is stopped, for the same reason the build is: an
+# unusable docker should cost nothing but the time it took to find out.
+db_detect() {
+	if [ -n "$NO_DB" ]; then
+		return 0
+	fi
+	COMPOSE_FILE=$1/docker-compose.yml
+	if [ ! -f "$COMPOSE_FILE" ]; then
+		echo "  note: no $COMPOSE_FILE — leaving the database alone" >&2
+		return 0
+	fi
+	if ! command -v docker >/dev/null 2>&1; then
+		echo "  note: docker is not on PATH — leaving the database alone" >&2
+		return 0
+	fi
+	# Membership in the docker group is the normal case; sudo is the fallback
+	# for a machine whose socket is root-only. -n rather than a prompt because
+	# redeploy has already cached the credentials by the time this runs, and a
+	# --dry-run must not start asking for passwords.
+	if docker info >/dev/null 2>&1; then
+		COMPOSE="docker compose"
+	elif sudo -n docker info >/dev/null 2>&1; then
+		COMPOSE="sudo docker compose"
+	else
+		die "redeploy: docker is installed but not usable by $(id -un) — add yourself to the docker group, or pass --no-db and manage postgres yourself"
+	fi
+	if ! $COMPOSE version >/dev/null 2>&1; then
+		command -v docker-compose >/dev/null 2>&1 ||
+			die "redeploy: neither 'docker compose' nor 'docker-compose' works here — pass --no-db to skip the database"
+		COMPOSE=${COMPOSE%docker compose}docker-compose
+	fi
+	# `up --wait` blocks on the healthcheck the compose file already defines,
+	# which is a better readiness signal than anything reconstructed out here.
+	# Older compose does not have it; db_wait_ready covers those.
+	if $COMPOSE up --help 2>/dev/null | grep -q -- '--wait'; then
+		DB_WAIT=--wait
+	fi
+}
+
+compose() {
+	# Unquoted on purpose: $COMPOSE is a command with its subcommand attached.
+	run $COMPOSE -f "$COMPOSE_FILE" "$@"
+}
+
+db_wait_ready() {
+	i=0
+	while [ "$i" -lt 60 ]; do
+		if $COMPOSE -f "$COMPOSE_FILE" exec -T "$DB_SERVICE" \
+			pg_isready -q >/dev/null 2>&1; then
+			return 0
+		fi
+		i=$((i + 1))
+		sleep 0.5
+	done
+	return 1
+}
+
+# Stop and start rather than `restart`, so a compose file that has itself
+# changed — a new image tag, a new volume — is actually applied. The data lives
+# in the pgdata volume, which neither one touches.
+db_cycle() {
+	if [ -z "$COMPOSE" ]; then
+		return 0
+	fi
+	step "cycling postgres"
+	# Every status checked by hand: db_cycle is called from a || list, which
+	# turns set -e off for everything it runs.
+	if ! compose stop "$DB_SERVICE"; then
+		db_failed "could not stop $DB_SERVICE"
+		return 1
+	fi
+	if ! compose up -d $DB_WAIT "$DB_SERVICE"; then
+		db_failed "$DB_SERVICE did not come up"
+		return 1
+	fi
+	if [ -n "$DRY" ]; then
+		return 0
+	fi
+	if [ -z "$DB_WAIT" ] && ! db_wait_ready; then
+		db_failed "$DB_SERVICE is up but not accepting connections"
+		return 1
+	fi
+}
+
+db_failed() {
+	echo >&2
+	echo "photobackup-admin: $* — photod left stopped" >&2
+	echo "  the new binaries are installed; once the database is back:" >&2
+	echo "    $COMPOSE -f $COMPOSE_FILE logs --tail=30 $DB_SERVICE" >&2
+	echo "    photobackup-admin migrate && sudo systemctl start photod" >&2
+}
+
 redeploy() {
 	src=${PHOTOBACKUP_SRC:-}
 
@@ -160,6 +269,10 @@ redeploy() {
 			;;
 		--src=*)
 			src=${1#--src=}
+			shift
+			;;
+		--no-db)
+			NO_DB=yes
 			shift
 			;;
 		--dry-run)
@@ -193,6 +306,8 @@ redeploy() {
 	# Ask for the password now. The alternative is a sudo prompt appearing
 	# between the stop and the start, with the service down while it waits.
 	[ -n "$DRY" ] || sudo -v
+
+	db_detect "$src"
 
 	stage=$(mktemp -d) || die "redeploy: cannot create a build directory"
 	trap 'rm -rf "$stage"' EXIT INT TERM
@@ -230,6 +345,8 @@ redeploy() {
 		run sudo systemctl daemon-reload
 	fi
 
+	db_cycle || return 1
+
 	# With photod down and the new binary in place: the migrations that ship
 	# with this build are applied by the build that needs them, and a schema
 	# change that fails is a failed deploy here rather than a daemon that will
@@ -241,6 +358,10 @@ redeploy() {
 	elif ! as_photod migrate; then
 		echo >&2
 		echo "photobackup-admin: migrations failed — photod left stopped" >&2
+		if [ -z "$COMPOSE" ]; then
+			echo "  the database was not touched by this run (--no-db, or no compose file):" >&2
+			echo "  check that postgres is up and reachable at DATABASE_URL." >&2
+		fi
 		echo "  the new binaries are installed; fix the schema and run:" >&2
 		echo "    photobackup-admin migrate && sudo systemctl start photod" >&2
 		return 1

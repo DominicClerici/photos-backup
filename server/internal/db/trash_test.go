@@ -470,3 +470,89 @@ func TestPurgeExpiredTakesOnlyWhatIsDue(t *testing.T) {
 		t.Errorf("trash = %v, want %v", got, want)
 	}
 }
+
+// The one thing a photograph does not get back on its own.
+//
+// Nothing about a trashed asset is moved or destroyed — that is the whole point
+// of the column — so a restore is an UPDATE and everything reappears. Except the
+// tsvector: rebuild_asset_search deletes the row of anything trashed every time
+// it runs, and it runs on its own account, whenever somebody reindexes or signs
+// off a tag triage. The delete is right; what was missing was the other half.
+func TestRestoreRebuildsASearchRowARebuildTookAway(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	id := seedAsset(t, s, 1, time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC))
+
+	if err := s.PutDescription(ctx, id, CaptionModel,
+		"A golden retriever running along a beach at sunset",
+		[]Tag{{Name: "dog", Confidence: 0.9}}); err != nil {
+		t.Fatalf("PutDescription: %v", err)
+	}
+	if !matches(t, s, id, "golden retriever") {
+		t.Fatal("the caption did not reach the tsvector")
+	}
+
+	if _, err := s.Trash(ctx, Selection{IDs: []string{id}}); err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+	// Any rebuild at all, at any point in the year the trash holds it: an `ml
+	// reindex`, a re-geocode, a tag triage.
+	if _, err := s.RefreshSearch(ctx); err != nil {
+		t.Fatalf("RefreshSearch: %v", err)
+	}
+	if matches(t, s, id, "golden retriever") {
+		t.Fatal("a rebuild left a tsvector behind on a trashed photograph")
+	}
+
+	if _, err := s.Restore(ctx, Selection{IDs: []string{id}}); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if !matches(t, s, id, "golden retriever") {
+		t.Error("the restored photograph cannot be found by its caption")
+	}
+	if !matches(t, s, id, "dog") {
+		t.Error("the restored photograph cannot be found by its tags")
+	}
+}
+
+// And the undo behind the toast, which is a different code path to the same
+// place — including for the motion of a Live Photo, which is a row nobody
+// selected and which has a tsvector of its own.
+func TestRestoreBatchRebuildsTheSearchRowsOfTheWholeFamily(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	stillRec, videoRec := livePair(t, 0)
+	still, _, err := s.RecordAsset(ctx, stillRec)
+	if err != nil {
+		t.Fatalf("record still: %v", err)
+	}
+	motion, _, err := s.RecordAsset(ctx, videoRec)
+	if err != nil {
+		t.Fatalf("record paired video: %v", err)
+	}
+
+	for _, id := range []string{still, motion} {
+		if err := s.PutDescription(ctx, id, CaptionModel,
+			"A golden retriever running along a beach at sunset", nil); err != nil {
+			t.Fatalf("PutDescription: %v", err)
+		}
+	}
+
+	result, err := s.Trash(ctx, Selection{IDs: []string{still}})
+	if err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+	if _, err := s.RefreshSearch(ctx); err != nil {
+		t.Fatalf("RefreshSearch: %v", err)
+	}
+
+	if _, _, err := s.RestoreBatch(ctx, result.Batch); err != nil {
+		t.Fatalf("RestoreBatch: %v", err)
+	}
+	for _, id := range []string{still, motion} {
+		if !matches(t, s, id, "golden retriever") {
+			t.Errorf("%s came back out of the trash without its tsvector", id)
+		}
+	}
+}

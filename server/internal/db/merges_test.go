@@ -1025,3 +1025,38 @@ func TestSegmentPreviewsListsOnlyGroupsStillWaitingToBeJoined(t *testing.T) {
 		t.Errorf("SegmentPreviews = %v after its parts were destroyed, want none", got)
 	}
 }
+
+// An undo is a restore, and restores rebuild search rows. A merge can sit
+// merged for as long as anybody leaves it there, so the rebuild that took the
+// copies' tsvectors away has almost certainly happened by the time somebody
+// changes their mind — see db.Store.Restore.
+func TestUnmergeGivesThePiecesBackTheirSearchRows(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	pieces := seedCopies(t, s, 3)
+	joined := seedAsset(t, s, 99, mergeEpoch)
+
+	for _, id := range pieces {
+		if err := s.PutDescription(ctx, id, CaptionModel,
+			"A golden retriever running along a beach at sunset", nil); err != nil {
+			t.Fatalf("PutDescription: %v", err)
+		}
+	}
+
+	group := recordGroup(t, s, merge.KindSegments, pieces...)
+	if _, err := s.MergeSegments(ctx, group, joined); err != nil {
+		t.Fatalf("MergeSegments: %v", err)
+	}
+	if _, err := s.RefreshSearch(ctx); err != nil {
+		t.Fatalf("RefreshSearch: %v", err)
+	}
+
+	if _, err := s.UnmergeGroup(ctx, group); err != nil {
+		t.Fatalf("UnmergeGroup: %v", err)
+	}
+	for _, id := range pieces {
+		if !matches(t, s, id, "golden retriever") {
+			t.Errorf("piece %s came back out of the trash without its tsvector", id)
+		}
+	}
+}

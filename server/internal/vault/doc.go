@@ -226,3 +226,29 @@ func openDoc(priv *ecdh.PrivateKey, assetID string, sealed []byte) (Doc, row, er
 func SealAsset(to *ecdh.PublicKey, assetID string, doc []byte) ([]byte, error) {
 	return SealDoc(to, "asset\x00"+assetID, doc)
 }
+
+// SealAnalysis and openAnalysis are the same round trip for the second
+// document: the caption, the recognised text, the tags and the vectors.
+//
+// A different context string rather than the same one, which is the whole
+// reason there are two functions here instead of a bool. The two documents are
+// both bytea on the same row, and a context that did not tell them apart would
+// mean an analysis blob moved into `sealed` opened cleanly and was handed to
+// jsonb_populate_record as an asset row.
+func SealAnalysis(to *ecdh.PublicKey, assetID string, doc []byte) ([]byte, error) {
+	return SealDoc(to, "analysis\x00"+assetID, doc)
+}
+
+// openAnalysis unseals it, and answers nil for a photograph that has none —
+// which is most of a library the captioner has not been run over, and is not an
+// error.
+func openAnalysis(priv *ecdh.PrivateKey, assetID string, sealed []byte) (json.RawMessage, error) {
+	if len(sealed) == 0 {
+		return nil, nil
+	}
+	raw, err := OpenDoc(priv, "analysis\x00"+assetID, sealed)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(raw), nil
+}

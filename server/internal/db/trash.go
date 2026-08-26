@@ -208,6 +208,15 @@ func (s *Store) Trash(ctx context.Context, sel Selection) (TrashResult, error) {
 // Restore brings a selection back out of the trash, into whatever it was part
 // of when it left: the timeline, its albums, its categories, and — for a still
 // — the motion that went down with it.
+//
+// And its search row, which is the one thing here that has to be rebuilt rather
+// than merely stopped being hidden. Trash moves nothing and destroys nothing,
+// so everything else comes back the moment the column changes; asset_search is
+// the exception, because rebuild_asset_search deletes the row of anything
+// trashed every time it runs. A photograph deleted, left in the trash across
+// one `ml reindex` or one tag triage, and then restored would otherwise return
+// to the timeline findable by its date, its place and its tags and never again
+// by its caption or by the text in it. See migration 0018.
 func (s *Store) Restore(ctx context.Context, sel Selection) (int, error) {
 	sel.Filter.Trash = true
 
@@ -216,18 +225,35 @@ func (s *Store) Restore(ctx context.Context, sel Selection) (int, error) {
 		return 0, err
 	}
 
-	row := s.pool.QueryRow(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Two answers off one UPDATE, and they are counted in different units: the
+	// number is items, because that is what somebody selected, and the ids are
+	// rows, because a Live Photo's motion needs a tsvector of its own.
+	var count int
+	var ids []string
+	if err := tx.QueryRow(ctx, `
 		with sel as (`+pick+`),`+family+`,
 		done as (
 			update assets a set deleted_at = null, purge_after = null, delete_batch = null
 			where a.id in (select id from fam) and a.deleted_at is not null
 			returning a.id
 		)
-		select count(*)::int from sel join done on done.id = sel.id`, args...)
-
-	var count int
-	if err := row.Scan(&count); err != nil {
+		select count(sel.id)::int, coalesce(array_agg(done.id::text), '{}')
+		from done left join sel on sel.id = done.id`, args...).Scan(&count, &ids); err != nil {
 		return 0, fmt.Errorf("restore selection from the trash: %w", err)
+	}
+
+	if err := refresh(ctx, tx, ids); err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit the restore: %w", err)
 	}
 	return count, nil
 }
@@ -243,11 +269,18 @@ func (s *Store) Restore(ctx context.Context, sel Selection) (int, error) {
 //
 // Idempotent: a batch that has already been restored puts nothing back.
 func (s *Store) RestoreBatch(ctx context.Context, batch string) (assets, albums int, err error) {
-	row := s.pool.QueryRow(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var ids []string
+	row := tx.QueryRow(ctx, `
 		with restored as (
 			update assets a set deleted_at = null, purge_after = null, delete_batch = null
 			where a.delete_batch = $1::uuid and a.deleted_at is not null
-			returning (`+notComponent+`) as item
+			returning a.id, (`+notComponent+`) as item
 		),
 		regrouped as (
 			update albums set deleted_at = null, purge_after = null, delete_batch = null
@@ -255,10 +288,22 @@ func (s *Store) RestoreBatch(ctx context.Context, batch string) (assets, albums 
 			returning 1
 		)
 		select (select count(*)::int from restored where item),
-		       (select count(*)::int from regrouped)`, batch)
+		       (select count(*)::int from regrouped),
+		       (select coalesce(array_agg(id::text), '{}') from restored)`, batch)
 
-	if err := row.Scan(&assets, &albums); err != nil {
+	if err := row.Scan(&assets, &albums, &ids); err != nil {
 		return 0, 0, fmt.Errorf("restore batch %s: %w", batch, err)
+	}
+
+	// The tsvectors, for the same reason Restore rebuilds them: the undo behind
+	// a toast is a restore like any other, and a batch can sit unrestored for a
+	// year with a reindex somewhere in the middle of it.
+	if err := refresh(ctx, tx, ids); err != nil {
+		return 0, 0, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, 0, fmt.Errorf("commit the restore: %w", err)
 	}
 	return assets, albums, nil
 }

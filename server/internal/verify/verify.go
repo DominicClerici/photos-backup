@@ -55,6 +55,11 @@ const (
 	ManifestOrphan Kind = "manifest-orphan"
 	// DerivativeMissing is an asset claiming a derivative that is not on disk.
 	DerivativeMissing Kind = "derivative-missing"
+	// DerivativeStalled is the mirror image: an asset still waiting on a
+	// derivative that nothing is going to build, because the job behind the
+	// wait has already finished or given up. The rendition is often already on
+	// disk and only the row is wrong.
+	DerivativeStalled Kind = "derivative-stalled"
 	// DerivativeFailed is a derivative job that gave up permanently.
 	DerivativeFailed Kind = "derivative-failed"
 	// StaleUpload is an abandoned partial upload.
@@ -208,6 +213,9 @@ func Run(ctx context.Context, d Deps, opt Options) (Report, error) {
 	if err := checkAssets(ctx, d, opt, r, indexed, sealed, counts); err != nil {
 		return *r, err
 	}
+	if err := checkStalledPlayback(ctx, d, opt, r); err != nil {
+		return *r, err
+	}
 	if err := checkManifest(ctx, d, opt, r, indexed, sealed); err != nil {
 		return *r, err
 	}
@@ -342,6 +350,12 @@ func checkVaulted(d Deps, r *Report, a db.Asset) {
 // checkDerivatives confirms an asset that claims a thumbnail or a playback
 // rendition actually has one. A missing derivative is repairable by re-running
 // the job that built it, which is what --fix does.
+//
+// Only what an asset claims to have. The opposite mistake — a rendition on disk
+// that the row is still promising rather than serving — cannot be seen one
+// asset at a time, because a row saying pending is indistinguishable from a
+// video uploaded a moment ago without also looking at the queue. That is
+// checkStalledPlayback.
 func checkDerivatives(ctx context.Context, d Deps, opt Options, r *Report, a db.Asset) {
 	if d.Derivatives == nil {
 		return
@@ -567,6 +581,44 @@ func checkBlobTree(ctx context.Context, d Deps, opt Options, r *Report, indexed 
 		}
 		return nil
 	})
+}
+
+// checkStalledPlayback finds videos stuck part-way: the row says a playback
+// rendition is on the way, and the job that would build one is done, failed, or
+// missing. The viewer gates its player on `playback_state === "ready"`, so
+// every one of these is a video showing "preparing a version this browser can
+// play" with nothing left running behind the message.
+//
+// The repair is usually free. These rows go stalled by being overwritten rather
+// than by losing anything, so the MP4 is normally sitting on disk under the
+// original's digest and the fix is to say so — a transcode is only spent when
+// the rendition genuinely is not there.
+func checkStalledPlayback(ctx context.Context, d Deps, opt Options, r *Report) error {
+	if d.Derivatives == nil {
+		return nil
+	}
+	stalled, err := d.Store.StalledPlaybackAssets(ctx)
+	if err != nil {
+		return err
+	}
+	for _, v := range stalled {
+		built := d.Derivatives.Exists(v.SHA256, derivstore.Playback) &&
+			(!v.HasOverlay || d.Derivatives.Exists(v.SHA256, derivstore.PlaybackPlain))
+
+		finding := Finding{
+			Kind: DerivativeStalled, SHA256: v.SHA256,
+			Path:   d.Derivatives.Path(v.SHA256, derivstore.Playback),
+			Detail: "waiting on a playback job that has already finished",
+		}
+		if built {
+			finding.Detail = "the playback rendition is on disk but the row still says pending"
+			finding.Fixed = opt.Fix && d.Store.SetPlaybackState(ctx, v.AssetID, db.DerivedReady) == nil
+		} else {
+			finding.Fixed = opt.Fix && requeue(ctx, d, jobs.KindPlayback, v.AssetID) == nil
+		}
+		r.Findings = append(r.Findings, finding)
+	}
+	return nil
 }
 
 func checkFailedJobs(ctx context.Context, d Deps, opt Options, r *Report) error {

@@ -113,3 +113,50 @@ func (s *Store) SetPlaybackState(ctx context.Context, assetID, state string) err
 	}
 	return nil
 }
+
+// StalledPlayback is a video whose row promises a playback rendition that
+// nothing is going to deliver.
+type StalledPlayback struct {
+	AssetID string
+	SHA256  string
+	// HasOverlay reports whether the asset carries a caption layer, and so is
+	// owed a second rendition without it.
+	HasOverlay bool
+}
+
+// StalledPlaybackAssets finds videos left saying 'pending' with no live
+// playback job behind the promise: the job ran to done or gave up, or there is
+// no job row at all.
+//
+// The inverse of the question verify used to ask about renditions, and the one
+// nothing could answer. "Marked ready but the file is gone" is visible from the
+// filesystem; this is only visible from the queue, because a row that says
+// pending looks exactly like a video uploaded a second ago until you know that
+// the work behind it is finished. A stalled row is not repaired by waiting —
+// the viewer shows "preparing a version this browser can play" over it forever.
+func (s *Store) StalledPlaybackAssets(ctx context.Context) ([]StalledPlayback, error) {
+	const query = `
+		select a.id::text, a.sha256, a.overlay_asset_id is not null
+		from assets a
+		left join jobs j on j.asset_id = a.id and j.kind = 'playback'
+		where a.media_kind = 'video'
+		  and a.playback_state = 'pending'
+		  and a.vault = ''
+		  and (j.id is null or j.state in ('done', 'failed'))
+		order by a.id`
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("list stalled playback assets: %w", err)
+	}
+	defer rows.Close()
+
+	var stalled []StalledPlayback
+	for rows.Next() {
+		var v StalledPlayback
+		if err := rows.Scan(&v.AssetID, &v.SHA256, &v.HasOverlay); err != nil {
+			return nil, fmt.Errorf("scan stalled playback asset: %w", err)
+		}
+		stalled = append(stalled, v)
+	}
+	return stalled, rows.Err()
+}

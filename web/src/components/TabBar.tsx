@@ -10,27 +10,11 @@ import { cn } from "@/lib/utils";
 import { FilterPill } from "./FilterPill";
 import { SelectionPill } from "./SelectionPill";
 
-/**
- * A tab is a place, except for one of them.
- *
- * Search opens the palette instead of navigating, because a search is a
- * question rather than a destination: there is nothing on /search until
- * something has been asked, and sending somebody to an empty results page to
- * type into it would be one extra screen between the thought and the answer.
- * The route still exists and is still what the tab is highlighted for — it is
- * where the palette hands the whole ranking over to.
- */
-const TABS: {
-  href: string;
-  label: string;
-  Icon: typeof Images;
-  /** Opens the palette rather than following the href. */
-  palette?: boolean;
-}[] = [
+/** Every tab is a place. Search is not a tab; see SearchButton. */
+const TABS: { href: string; label: string; Icon: typeof Images }[] = [
   { href: "/", label: "Gallery", Icon: Images },
   { href: "/collections", label: "Collections", Icon: Library },
   { href: "/status", label: "Status", Icon: Activity },
-  { href: "/search", label: "Search", Icon: Search, palette: true },
   { href: "/other", label: "Other", Icon: Ellipsis },
 ];
 
@@ -51,7 +35,6 @@ interface Pill {
  */
 export function TabBar() {
   const pathname = usePathname();
-  const palette = usePaletteOpen();
   const row = useRef<HTMLUListElement>(null);
   const tabs = useRef<(HTMLElement | null)[]>([]);
 
@@ -61,14 +44,9 @@ export function TabBar() {
   // the left edge.
   const [placed, setPlaced] = useState(false);
 
-  // The palette wins while it is open, wherever it was opened from: it is the
-  // thing in front of everything else, and a highlight still sitting on the
-  // gallery underneath it would be describing the page nobody is looking at.
-  const opened = TABS.findIndex((tab) => tab.palette);
-  const here = TABS.findIndex(
+  const active = TABS.findIndex(
     (tab) => pathname === tab.href || (tab.href !== "/" && pathname.startsWith(`${tab.href}/`)),
   );
-  const active = palette && opened >= 0 ? opened : here;
 
   const measure = useCallback(() => {
     const el = tabs.current[active];
@@ -106,8 +84,9 @@ export function TabBar() {
     >
       {/* The tabs and everything moored to them. The wrapper is only here to
           give the floating controls an edge to hang off: they are positioned
-          against the row's left edge and grow away from it, so a selection of
-          eleven thousand photographs widens its pill without nudging a tab. */}
+          against the row's left and right edges and grow away from them, so a
+          selection of eleven thousand photographs widens its pill without
+          nudging a tab. */}
       <div className="pointer-events-none relative flex max-w-full">
         {/* Anchored by its right edge and unconstrained on the left, so the row
             grows leftwards as the pills in it find things to say. Both of them
@@ -141,61 +120,83 @@ export function TabBar() {
             />
           ) : null}
 
-          {TABS.map(({ href, label, Icon, palette: opens }, i) => {
+          {TABS.map(({ href, label, Icon }, i) => {
             const current = i === active;
-            const skin = cn(
-              "relative flex h-10 items-center gap-2 rounded-full px-3.5 text-[13px] font-medium tracking-[0.01em] transition-colors duration-200 focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:outline-none sm:px-4",
-              current
-                ? "text-foreground"
-                : "text-muted-foreground hover:bg-foreground/[0.05] hover:text-foreground",
-            );
-            const inside = (
-              <>
-                <Icon
-                  className={cn(
-                    "size-[18px] shrink-0 transition-colors duration-200",
-                    current && "text-primary",
-                  )}
-                  aria-hidden="true"
-                />
-                {/* Below 640px the row is icons only. The label stays in the
-                    accessibility tree, so each tab keeps its name. */}
-                <span className="max-sm:sr-only">{label}</span>
-              </>
-            );
 
             return (
               <li key={href}>
-                {opens ? (
-                  <button
-                    type="button"
-                    ref={(el) => {
-                      tabs.current[i] = el;
-                    }}
-                    onClick={() => openPalette()}
-                    aria-haspopup="dialog"
-                    aria-expanded={current}
-                    className={skin}
-                  >
-                    {inside}
-                  </button>
-                ) : (
-                  <Link
-                    href={href}
-                    ref={(el) => {
-                      tabs.current[i] = el;
-                    }}
-                    aria-current={current ? "page" : undefined}
-                    className={skin}
-                  >
-                    {inside}
-                  </Link>
-                )}
+                <Link
+                  href={href}
+                  ref={(el) => {
+                    tabs.current[i] = el;
+                  }}
+                  aria-current={current ? "page" : undefined}
+                  className={cn(
+                    "relative flex h-10 items-center gap-2 rounded-full px-3.5 text-[13px] font-medium tracking-[0.01em] transition-colors duration-200 focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:outline-none sm:px-4",
+                    current
+                      ? "text-foreground"
+                      : "text-muted-foreground hover:bg-foreground/[0.05] hover:text-foreground",
+                  )}
+                >
+                  <Icon
+                    className={cn(
+                      "size-[18px] shrink-0 transition-colors duration-200",
+                      current && "text-primary",
+                    )}
+                    aria-hidden="true"
+                  />
+                  {/* Below 640px the row is icons only. The label stays in the
+                      accessibility tree, so each tab keeps its name. */}
+                  <span className="max-sm:sr-only">{label}</span>
+                </Link>
               </li>
             );
           })}
         </ul>
+
+        {/* The mirror of the selection pill, on the other side of the row. */}
+        <div className="absolute bottom-0 left-full ml-2 flex w-max items-end">
+          <SearchButton />
+        </div>
       </div>
     </nav>
+  );
+}
+
+/**
+ * Search, standing to the right of the tab bar.
+ *
+ * It is a button and not a tab because a search is a question rather than a
+ * destination: there is nothing on /search until something has been asked, and
+ * sending somebody to an empty results page to type into it would be one extra
+ * screen between the thought and the answer. Sitting it outside the row says as
+ * much before it is pressed — the tabs are four places, and this is the thing
+ * you do to them.
+ *
+ * The route still exists and is still what the button lights up for: it is
+ * where the palette hands the whole ranking over to.
+ */
+function SearchButton() {
+  const pathname = usePathname();
+  const palette = usePaletteOpen();
+
+  // The palette wins while it is open, wherever it was opened from, because it
+  // is the thing in front of everything else.
+  const on = palette || pathname === "/search" || pathname.startsWith("/search/");
+
+  return (
+    <button
+      type="button"
+      onClick={() => openPalette()}
+      aria-label="Search"
+      aria-haspopup="dialog"
+      aria-expanded={palette}
+      className={cn(
+        "pointer-events-auto flex size-13 items-center justify-center rounded-full border bg-card/80 shadow-lg backdrop-blur-xl transition-colors duration-200 focus-visible:ring-2 focus-visible:ring-ring/70 focus-visible:outline-none",
+        on ? "text-primary" : "text-muted-foreground hover:text-foreground",
+      )}
+    >
+      <Search className="size-[18px] shrink-0" aria-hidden="true" />
+    </button>
   );
 }

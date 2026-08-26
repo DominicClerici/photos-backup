@@ -1,0 +1,54 @@
+-- +goose Up
+-- The other half of what the vault takes: the words.
+--
+-- Migration 0012 said what hiding a photograph encrypts — "the picture and
+-- everything that describes it… the metadata that would let somebody
+-- reconstruct what the picture was without ever seeing it" — and the scrub list
+-- in internal/db/vault.go delivers that for the assets row. What neither of
+-- them reached is the four tables 0016 and 0018 added afterwards:
+-- asset_descriptions, asset_ocr, asset_tags and asset_embeddings, plus the
+-- asset_search tsvector built out of them.
+--
+-- Those are, word for word, the thing 0012 was describing. A caption is a
+-- sentence in English saying what is in the photograph; an OCR row is the
+-- literal text off a receipt; the tsvector is both of them tokenised and
+-- indexed for lookup. derivstore.Suffixes() is sealed because "leaving them
+-- behind would be leaving the picture behind", and a caption is that one step
+-- further along — it is the picture in the form a search engine can read.
+--
+-- The write paths have carried an `a.vault = ''` guard since they were written,
+-- so nothing new is recorded about a photograph once it is hidden. That was
+-- always only half the story, and the wrong half: the ordinary order of
+-- operations is that `ml backfill` runs over the library and things get hidden
+-- afterwards, so the rows that matter are the ones written *before* the hide,
+-- and they simply stayed.
+--
+-- sealed_analysis is where they go instead. A second document beside the row's,
+-- sealed to the same key, and separate rather than folded into it for the
+-- reason internal/api/analysis.go gives for having its own route: an OCR blob
+-- is unbounded where the row is all scalars, and an embedding is 1152 numbers
+-- per frame. vault.Index opens every document in a bucket to draw the gallery,
+-- and that must not mean decrypting a megabyte of recognised text per page.
+-- Restore is the only thing that reads this one.
+--
+-- Nullable, because null is the truthful answer for a photograph nothing had
+-- described yet — which on a library the captioner has not finished is most of
+-- them.
+alter table vault_items add column sealed_analysis bytea;
+
+-- Deliberately no backfill here, and no delete either.
+--
+-- Sealing needs the vault's public key and an X25519 exchange, which is not a
+-- thing SQL can do, so a migration could only delete — and deleting would
+-- destroy the only copy of what a model said about every photograph already in
+-- the vault, with no way to give it back on a restore. That is the one outcome
+-- this feature is not allowed to produce.
+--
+-- So the cleanup is a sweep instead: vault.Service.ReconcileAnalysis seals what
+-- it finds and then deletes it, holding the public key, needing no password,
+-- on the same hourly timer that sweeps plaintext an interrupted hide left
+-- behind. Until the first tick after this deploy, the rows stay exactly where
+-- they are, which is where they have been all along.
+
+-- +goose Down
+alter table vault_items drop column sealed_analysis;

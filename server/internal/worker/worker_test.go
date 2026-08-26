@@ -418,3 +418,65 @@ func TestReconcileQueuesWorkForAnAssetWithNoJob(t *testing.T) {
 		t.Errorf("queued %s, want %s", job.AssetID, asset.ID)
 	}
 }
+
+// The metadata job runs a second time over a video whose transcode has already
+// finished — pairing requeues it when a video turns out not to be a Live
+// Photo's motion, and `verify --fix` requeues it to backfill a thumbnail size.
+// Neither invalidates the MP4.
+//
+// This used to flip playback_state back to pending and then no-op on the
+// enqueue, because the completed playback job already held the (asset_id, kind)
+// row. The viewer gates its player on ready, so the video went on saying
+// "preparing a version this browser can play" over a rendition that was on disk
+// the whole time, with nothing left to move it.
+func TestMetadataRerunLeavesAFinishedTranscodeAlone(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	asset := h.ingest(t, "clip.mov", db.MediaVideo)
+
+	h.claimAndRun(t, jobs.KindMetadata)
+	h.claimAndRun(t, jobs.KindPlayback)
+
+	if err := jobs.Requeue(ctx, h.store.Pool(), jobs.KindMetadata, asset.ID); err != nil {
+		t.Fatalf("requeue metadata: %v", err)
+	}
+	h.claimAndRun(t, jobs.KindMetadata)
+
+	if got := h.reload(t, asset.ID); got.PlaybackState != db.DerivedReady {
+		t.Errorf("PlaybackState = %q, want ready — the rendition never went anywhere", got.PlaybackState)
+	}
+	if _, err := h.Queue.Claim(ctx, []jobs.Kind{jobs.KindPlayback}, "t"); !errors.Is(err, jobs.ErrNoJob) {
+		t.Errorf("Claim = %v, want ErrNoJob — nothing needs transcoding twice", err)
+	}
+}
+
+// And the case that genuinely does owe a transcode: the rendition is gone, so
+// the second metadata run has to revive a playback job that has already run to
+// done. Enqueue cannot — its conflict clause leaves the finished row alone.
+func TestMetadataRerunRequeuesATranscodeWhoseRenditionIsGone(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	asset := h.ingest(t, "clip.mov", db.MediaVideo)
+
+	h.claimAndRun(t, jobs.KindMetadata)
+	h.claimAndRun(t, jobs.KindPlayback)
+	if err := h.Derivatives.Remove(asset.SHA256, derivstore.Playback); err != nil {
+		t.Fatalf("remove the rendition: %v", err)
+	}
+
+	if err := jobs.Requeue(ctx, h.store.Pool(), jobs.KindMetadata, asset.ID); err != nil {
+		t.Fatalf("requeue metadata: %v", err)
+	}
+	h.claimAndRun(t, jobs.KindMetadata)
+
+	if got := h.reload(t, asset.ID); got.PlaybackState != db.DerivedPending {
+		t.Errorf("PlaybackState = %q, want pending", got.PlaybackState)
+	}
+	if state := h.jobState(t, asset.ID, jobs.KindPlayback); state != string(jobs.StatePending) {
+		t.Fatalf("playback job state = %q, want pending — a done row would strand the asset", state)
+	}
+	h.claimAndRun(t, jobs.KindPlayback)
+	if !h.Derivatives.Exists(asset.SHA256, derivstore.Playback) {
+		t.Error("the rendition was not rebuilt")
+	}
+}
