@@ -181,7 +181,7 @@ All optional; every one falls back to its default rather than refusing to start.
 | | |
 |---|---|
 | `PHOTO_ML_ADDR` | `127.0.0.1` — loopback, and it should stay there. There is no authentication here because the only thing on the other end is a process on this machine. |
-| `PHOTO_ML_PORT` | `8789`, beside photod's 8787 and 8788 |
+| `PHOTO_ML_PORT` | `8789`, beside photod's 8787 |
 | `PHOTO_ML_DEVICE` | `auto` — CUDA when it is there, the CPU when it is not. The fallback is about fifty times slower and completely correct. |
 | `PHOTO_ML_IDLE_SECONDS` | `300` — how long an on-demand model may sit unused before its VRAM goes back |
 | `PHOTO_ML_MAX_BATCH` | `32`. The worker sends 1 image for a photograph and 3 or 6 for a video, so this bounds mistakes rather than tuning anything. |

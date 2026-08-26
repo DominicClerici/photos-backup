@@ -19,6 +19,7 @@ import { Card } from "@/components/ui/card";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StatusCard, StatusFigure } from "./StatusCard";
+import { Security } from "./Security";
 import { StatusIssues } from "./StatusIssues";
 import { StorageCard } from "./StorageCard";
 
@@ -120,6 +121,12 @@ export function Status() {
               </div>
 
               <StatusIssues status={status} />
+
+              {/* Last, because it is the only thing on this page that is not a
+                  reading of the archive. Everything above answers "what is it
+                  doing"; this answers "who can open it", which is asked far
+                  less often and is worth scrolling for when it is. */}
+              <Security />
             </>
           )}
         </div>

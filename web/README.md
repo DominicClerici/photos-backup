@@ -5,37 +5,47 @@ Next.js App Router, rendered entirely on the client.
 
 ## Running
 
+photod is the front door. Start it, and open **its** address — not this app's.
+
 ```sh
-cd ../server && go run ./cmd/photod    # HTTPS on :8787, read path on :8788
+cd ../server && go run ./cmd/photod    # HTTPS on :8787
 pnpm install
-pnpm dev                               # http://localhost:3000
+pnpm dev                               # 127.0.0.1:3000, reached only through photod
 ```
 
 | variable | default | meaning |
 |---|---|---|
-| `PHOTOD_URL` | `http://localhost:8788` | where `/api/*` is proxied |
-| `NEXT_PUBLIC_MEDIA_BASE` | unset — use the proxy | origin for thumbnails, previews, and video |
+| `NEXT_PUBLIC_MEDIA_BASE` | unset — same origin | origin for thumbnails, previews, and video |
 
-Since Phase 5, photod serves `:8787` over **HTTPS** with a certificate it signs
-itself, and puts the gallery's read endpoints on a second plaintext listener at
-`127.0.0.1:8788`, which is what `PHOTOD_URL` now defaults to. Anything pointed at
-`:8787` needs the CA: every `/api/*` request fails its certificate check, and `<img>` tags
-pointed at `https://…:8787` show broken images in any browser that has not been
-taught to trust the CA. The plaintext listener exists precisely so the gallery
-does not have to be: it serves the read path, `/health`, and the writes the
-gallery itself makes — the trash, the vault, albums, and the upload page — while
-photod refuses every credential-carrying endpoint on it.
+There is no `/api/*` rewrite any more, and no `PHOTOD_URL`. Until recently this
+app proxied to a plaintext photod listener on `127.0.0.1:8788` that served the
+whole archive — reads, the trash, the vault, the upload page — with no
+credential at all, safe only because it was loopback. That listener is gone.
 
-Reaching the gallery from another machine on the LAN is not supported. This app
-is a browser on the archive host talking to the loopback listener, and there is
-no authentication in front of it — widening `PLAINTEXT_ADDR` is what it always
-was: the whole archive, on the network, asking for nothing.
+photod now terminates TLS, authenticates every request against a passkey session
+or a device token, serves `/v1` and the media itself, and reverse-proxies this
+process for everything else. So the bundle, the JSON and the thumbnails all
+arrive from one origin under one cookie, which is what makes the session cover a
+thumbnail at all: a browser attaches a same-origin cookie to an `<img>` and will
+not attach a bearer header to one.
 
-Both are read at **build** time, not at start time. `rewrites()` is evaluated by
-`next build` and frozen into `.next/routes-manifest.json`, so setting
-`PHOTOD_URL` in front of `pnpm start` does nothing — the server keeps proxying to
-whatever was set when it was built, and every `/api/*` request 500s with
-`ECONNREFUSED` if that host is not there. Set it for the build.
+What that means day to day:
+
+- **Open photod's address, not `:3000`.** This app's own port serves a gallery
+  with no API behind it. Hot reload still works through the proxy.
+- **Sign in first.** photod serves the sign-in page itself, so an
+  unauthenticated browser never receives this bundle. On a fresh archive, run
+  `photobackup passkey add` for an enrollment code.
+- **`WEB_ORIGIN` must match the address you open.** A passkey is bound to its
+  origin. For local work that means `WEB_ORIGIN=https://localhost:8787`.
+
+`NEXT_PUBLIC_MEDIA_BASE` is the one setting left, and it is now rarely useful:
+media is same-origin by default because photod serves it directly, with no Node
+hop to skip.
+
+`NEXT_PUBLIC_MEDIA_BASE` is read at **build** time, not at start time — it is
+inlined into the bundle by `next build`, so setting it in front of `pnpm start`
+does nothing. Set it for the build.
 
 ```sh
 pnpm test     # layout arithmetic, via node --test
@@ -43,24 +53,24 @@ pnpm lint     # tsc --noEmit
 pnpm build
 ```
 
-## Two origins, no CORS
+## One origin, no CORS
 
-photod is a separate process, so the browser has to reach two servers. Rather
-than configuring allowed origins, `next.config.ts` rewrites `/api/*` to photod.
-The JSON is then same-origin: no preflight, no origin list, and nothing to get
-wrong when this eventually sits behind a real domain.
+There are two processes and one origin. photod terminates TLS and reverse-
+proxies this app, so the bundle, the JSON and the media all come from the same
+place: no preflight, no allowed-origin list, and nothing for a cookie to fail to
+cross.
 
-Media is exempt from that reasoning. `<img>` and `<video>` are not subject to
-CORS unless they opt in, so `NEXT_PUBLIC_MEDIA_BASE` can point them straight at
-photod and skip the proxy — worth doing when several thousand thumbnails would
-otherwise stream through Node. Leaving it unset uses the proxy, which always
-works.
+That last part is the whole reason for the arrangement rather than a bonus. The
+credential a browser can actually carry onto a subresource is a cookie — it
+attaches a same-origin cookie to an `<img>` and will not attach a bearer header
+to one — so any layout that puts the thumbnails somewhere other than the app has
+to solve authentication a second time, with signed URLs or a second credential.
+Phase 12 established this the hard way and PROJECT.md records it.
 
-Point it at 8788, never 8787. Since Phase 6 the TLS listener authenticates its
-read path, and a browser cannot put a bearer token on an `<img>` — the tiles
-would all 401. That limit is the browser's alone: the phone puts the header on
-every rendition, which is why the app reads the archive over 8787 and needs no
-signed URLs.
+`NEXT_PUBLIC_MEDIA_BASE` survives from the arrangement before this one, where
+media could skip a Node proxy hop by pointing straight at photod. There is no
+hop to skip now — photod serves the media itself — so it is left unset, and
+anything it is pointed at has to be an origin the session cookie reaches.
 
 Next's `<Image>` is deliberately unused. It exists to resize arbitrary source
 images at the edge; photod already stores a thumbnail at each size the grid

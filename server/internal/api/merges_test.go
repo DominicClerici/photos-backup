@@ -459,12 +459,12 @@ func TestScanReportsItsOwnFailure(t *testing.T) {
 // The plaintext listener is the one the browser gallery reaches, so the review
 // has to work over it — and it is loopback-only, which is what makes that
 // acceptable. Same exposure as the trash endpoints beside it.
-func TestMergeRoutesAreServedOnThePlaintextListener(t *testing.T) {
+func TestMergeRoutesAreServedToTheGallery(t *testing.T) {
 	h := newHarness(t)
 	seedGroup(t, h, merge.KindDuplicate, 2)
-	plain := h.plaintext(t)
+	gallery := h.gallery(t)
 
-	resp, err := plain.Client().Get(plain.URL + "/v1/merges/groups")
+	resp, err := gallery.Client().Get(gallery.URL + "/v1/merges/groups")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

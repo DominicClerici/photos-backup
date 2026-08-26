@@ -12,13 +12,17 @@ go run ./cmd/photod                  # migrations run at startup, TLS generates 
 photobackup pair                     # a code to pair a device with
 ```
 
-photod serves no HTML. The gallery is the Next.js app in `../web`, which
-proxies `/api/*` here; see its README to bring the browser side up.
+photod serves one page — the sign-in form — and reverse-proxies the rest. The
+gallery is the Next.js app in `../web`, which runs on loopback behind this
+process; see its README to bring the browser side up.
 
 | variable | default | meaning |
 |---|---|---|
 | `LISTEN_ADDR` | `:8787` | bind address for the **HTTPS** listener |
-| `PLAINTEXT_ADDR` | `127.0.0.1:8788` | read-only listener, in the clear; empty disables it |
+| `WEB_ORIGIN` | unset | the origin a browser reaches this archive at; empty disables browser sign-in |
+| `WEB_APP_URL` | `http://127.0.0.1:3000` | the Next process to reverse-proxy; empty serves the API only |
+| `WEB_IDLE` | `1h` | ends a browser session that has not been used |
+| `WEB_LIFETIME` | `12h` | the absolute cap on a browser session; nothing resets it |
 | `TLS_DIR` | `$PHOTOS_ROOT/tls` | the CA and the server certificate |
 | `TLS_EXTRA_SANS` | unset | extra names or addresses to certify, comma-separated |
 | `TLS_DISABLED` | unset | serve everything in the clear; **development only** |
@@ -243,30 +247,41 @@ through the archive and download originals. It is an accepted, known gap, in the
 same category as the single drive, and `TestReadPathNeedsNoToken` exists so that
 changing it is a decision rather than an accident.
 
-### Two listeners
+### One listener, two credentials
 
-| | serves | who reaches it |
+Everything arrives on `LISTEN_ADDR` over TLS: the phone, the browser, the
+gallery bundle, and every thumbnail in it.
+
+| credential | carried as | who uses it |
 |---|---|---|
-| `LISTEN_ADDR` (HTTPS) | everything | the phone |
-| `PLAINTEXT_ADDR` (HTTP) | the read path, the gallery's writes, `/health` | the Next app, the browser, the CLI |
+| device token | `Authorization: Bearer pbk_…` | the phone |
+| session | `__Host-photobackup_session` cookie | the browser |
 
-The plaintext listener exists so the gallery does not have to trust a private CA
-to load a thumbnail. Pairing is absent from its routing table and every
-authenticated route answers `426 Upgrade Required`, so **a device token cannot
-travel unencrypted regardless of where that listener is bound**. That is a
-property of the routes rather than of a check inside a handler, which is what
-makes widening `PLAINTEXT_ADDR` to the LAN — something the gallery may
-legitimately want — safe for credentials, whatever it does for the read path.
+`requireAuth` takes either, and it guards the read path and the gallery's
+writes alike. The upload path is narrower still — `requireDevice`, because an
+upload names a device and a session names none.
 
-The gallery's own writes are served here, and that is a widening rather than an
-exception. They carry no credential and name no device, so nothing about them can
-leak one; what they do mean is that anyone who can reach `PLAINTEXT_ADDR` can now
-move photographs to the trash as well as look at them. Undoable for a year is not
-the same as harmless, so this is one more reason `PLAINTEXT_ADDR` stays on
-loopback. Authenticating the gallery is the fix, and it is exactly the piece of
-work it was before deletion existed.
+There used to be a second listener. `PLAINTEXT_ADDR` served the read path and
+the gallery's writes in the clear and with no credential at all, so that the
+Next app need not trust a private CA to load a thumbnail. It was safe only
+because it was bound to `127.0.0.1` and both processes were on the same
+machine — anyone who could open that port could read every photograph, empty
+the trash and unlock the vault. Authenticating the gallery was the standing fix
+for it in this file for two phases; it is done, and the listener is gone with
+it.
 
-`TLS_DISABLED=1` collapses both onto one cleartext listener, tokens and all. It
+What replaced it is one origin. photod terminates TLS, serves `/v1` and the
+media itself, and reverse-proxies the Next process for everything else — so the
+bundle, the JSON and the thumbnails all arrive from the same place under one
+cookie. That is not tidiness: a browser attaches a same-origin cookie to an
+`<img>` and will not attach a bearer header to one, which is the constraint
+Phase 12 established and PROJECT.md records.
+
+The sign-in page is served by photod rather than by Next, which means an
+unauthenticated visitor receives no application code at all, and means signing
+in still works while the Next process is down or being deployed.
+
+`TLS_DISABLED=1` serves that one listener in the clear, tokens and all. It
 exists for development, it logs a warning saying exactly that, and it is the one
 switch here that gives something away.
 
@@ -1099,8 +1114,9 @@ answering it with 17,788 photographs would be worse than saying so.
 ### Trying it
 
 ```sh
-curl -s --get --data-urlencode 'q=phoenix at the beach last summer' \
-     localhost:8788/v1/search | python3 -m json.tool
+curl -s --cacert "$TLS_DIR/ca.crt" -H "Authorization: Bearer $PHOTOBACKUP_TOKEN" \
+     --get --data-urlencode 'q=phoenix at the beach last summer' \
+     https://localhost:8787/v1/search | python3 -m json.tool
 ```
 
 The `query` object in the response is the parse. If a search surprises you, read

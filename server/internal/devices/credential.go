@@ -4,9 +4,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"errors"
 	"fmt"
-	"strings"
+
+	"github.com/dominicclerici/photos-backup/server/internal/code"
 )
 
 // TokenPrefix marks a photobackup device token wherever one turns up — a log
@@ -14,23 +14,22 @@ import (
 // sight is worth four characters.
 const TokenPrefix = "pbk_"
 
-const (
-	// tokenBytes is the size of the secret inside a token. 256 bits of
-	// randomness, which is why a digest is the right way to store it: there is
-	// no dictionary to attack and nothing for a password KDF to slow down.
-	tokenBytes = 32
-	// codeBytes is 40 bits, which is exactly eight characters of base32.
-	codeBytes = 5
-	codeChars = 8
-)
+// tokenBytes is the size of the secret inside a token. 256 bits of randomness,
+// which is why a digest is the right way to store it: there is no dictionary to
+// attack and nothing for a password KDF to slow down.
+const tokenBytes = 32
 
-// codeAlphabet is Crockford base32: no I, L, O or U, so nothing in a printed
-// code can be confused with a digit and nothing spells anything.
-const codeAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+// codeChars is the pairing code's length, re-exported into this package's own
+// namespace so the tests that assert the format read against the credential
+// they are about rather than against the package it is implemented in.
+const codeChars = code.Chars
 
 // ErrMalformedCode means the input could not be a pairing code at all, as
 // opposed to being one this server does not hold.
-var ErrMalformedCode = errors.New("devices: not a pairing code")
+//
+// The same value the code package returns, so `errors.Is(err, ErrMalformedCode)`
+// holds for errors raised in either place.
+var ErrMalformedCode = code.ErrMalformed
 
 // newToken mints a device token and the digest to store for it.
 func newToken() (token string, digest []byte, err error) {
@@ -42,61 +41,20 @@ func newToken() (token string, digest []byte, err error) {
 	return token, digestOf(token), nil
 }
 
-// newCode mints a pairing code in normalized form.
-func newCode() (string, error) {
-	buf := make([]byte, codeBytes)
-	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("generate pairing code: %w", err)
-	}
+// The pairing code's format lives in internal/code, which the passkey
+// enrollment flow also uses. These three stay here because the pairing API is
+// what the CLI and the phone are written against, and moving them would be a
+// rename for its own sake.
 
-	// Five bytes to eight characters, five bits at a time, most significant
-	// first. Not encoding/base32: that alphabet includes I, L and O.
-	var acc uint64
-	for _, b := range buf {
-		acc = acc<<8 | uint64(b)
-	}
-	out := make([]byte, codeChars)
-	for i := codeChars - 1; i >= 0; i-- {
-		out[i] = codeAlphabet[acc&0x1f]
-		acc >>= 5
-	}
-	return string(out), nil
-}
+// newCode mints a pairing code in normalized form.
+func newCode() (string, error) { return code.New() }
 
 // NormalizeCode reduces however a human typed a code to the one form the server
 // compares.
-//
-// Everything that is not a code character is dropped, so the grouping dash from
-// Format costs nothing and neither does a stray space. The three characters the
-// alphabet leaves out are folded onto the digits they look like, because
-// somebody reading "0" off a terminal and typing "O" has not made a mistake
-// worth failing a pairing over.
-func NormalizeCode(raw string) (string, error) {
-	var b strings.Builder
-	for _, r := range strings.ToUpper(raw) {
-		switch r {
-		case 'O':
-			r = '0'
-		case 'I', 'L':
-			r = '1'
-		}
-		if strings.ContainsRune(codeAlphabet, r) {
-			b.WriteRune(r)
-		}
-	}
-	if b.Len() != codeChars {
-		return "", fmt.Errorf("%w: expected %d characters, got %d", ErrMalformedCode, codeChars, b.Len())
-	}
-	return b.String(), nil
-}
+func NormalizeCode(raw string) (string, error) { return code.Normalize(raw) }
 
 // FormatCode groups a code for reading aloud and typing in.
-func FormatCode(code string) string {
-	if len(code) != codeChars {
-		return code
-	}
-	return code[:4] + "-" + code[4:]
-}
+func FormatCode(c string) string { return code.Format(c) }
 
 // digestOf is how both credentials are stored. sha256 rather than a password
 // hash on purpose: these are 40- and 256-bit random values, so there is no

@@ -125,15 +125,30 @@ func (s *Server) handleVaultUnlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Rate limited before the password is looked at, so a wrong guess costs the
+	// guesser an attempt whether or not it was well-formed — and before Argon2id
+	// is run, so a flood cannot turn the KDF's own cost into the denial of
+	// service it would otherwise be.
+	//
+	// This used to argue it was unnecessary, and on a loopback listener it was:
+	// Argon2id at 64MiB puts a hard ceiling on attempts per second all by
+	// itself. That ceiling is unchanged and it is no longer the only thing
+	// standing here, because this endpoint is reachable from every device on the
+	// tailnet now rather than from one browser on this machine. The cost of the
+	// limiter is nothing — nobody types a vault password twelve times in five
+	// minutes.
+	if retryAfter, ok := s.vaultUnlocks().allow(clientIP(r)); !ok {
+		tooManyAttempts(w, retryAfter)
+		return
+	}
+
 	switch err := s.Vault.Unlock(r.Context(), req.Password); {
 	case errors.Is(err, vault.ErrNoVault):
 		writeError(w, http.StatusNotFound, "this archive has no vault yet")
 		return
 	case errors.Is(err, vault.ErrBadPassword):
 		// Logged, because a vault somebody is guessing at is a thing to be able
-		// to see afterwards. Not rate limited: Argon2id at 64MiB already puts a
-		// hard ceiling on attempts per second, and it is a ceiling that does not
-		// depend on this process still being the one being talked to.
+		// to see afterwards.
 		s.logger().Warn("rejected a vault password", "remote", clientIP(r))
 		writeError(w, http.StatusForbidden, "that password does not open this vault")
 		return

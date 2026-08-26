@@ -86,20 +86,25 @@ func TestStatsRequireADeviceToken(t *testing.T) {
 	}
 }
 
-// Not a write, but it is answered from a device token, and the plaintext
-// listener refuses every one of those. 426 rather than 404 so the failure says
-// what is actually wrong.
-func TestStatsAreRefusedOnThePlaintextListener(t *testing.T) {
+// Not a write, but it is scoped to which phone is asking, so it is the one
+// route the browser cannot reach: a session names no device, and there is no
+// device id to report numbers for.
+//
+// This used to assert 426 from the plaintext listener, which was the shape of
+// the same rule when there were two listeners. There is one now, so the rule is
+// enforced by the guard instead — requireDevice rather than requireAuth — and
+// 401 is what that says.
+func TestStatsAreRefusedToABrowserSession(t *testing.T) {
 	h := newHarness(t)
-	ts := h.plaintext(t)
+	ts := h.gallery(t)
 
 	resp, err := ts.Client().Get(ts.URL + "/v1/stats")
 	if err != nil {
-		t.Fatalf("GET /v1/stats over plaintext: %v", err)
+		t.Fatalf("GET /v1/stats as a browser: %v", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusUpgradeRequired {
-		t.Errorf("status = %d, want 426", resp.StatusCode)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 — a session is not a device", resp.StatusCode)
 	}
 }

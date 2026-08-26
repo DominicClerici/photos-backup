@@ -1,0 +1,81 @@
+# photoweb — the Next.js gallery, behind photod.
+#
+# UNTESTED, like photod.service beside it. See deploy/README.md.
+#
+#   sudo cp deploy/photoweb.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now photoweb
+#
+# This unit existed once before and was removed with Phase 12, when the shared
+# gallery password came out. It is back for the design that replaced it: photod
+# terminates TLS, authenticates every request against a passkey session or a
+# device token, and reverse-proxies this process for everything that is not an
+# API route. So this listens on loopback and is never reached directly.
+#
+# Nothing here is a security boundary. The guard is in photod — see
+# server/internal/api/frontdoor.go — and this process would serve the bundle to
+# anyone who asked. That is exactly why it is bound to 127.0.0.1 and why
+# WEB_APP_URL points at loopback.
+
+[Unit]
+Description=photoweb photo archive gallery
+Documentation=https://github.com/dominicclerici/photos-backup
+After=network-online.target photod.service
+Wants=network-online.target
+# After, not Requires: photod restarting must not take the gallery down with it,
+# and photod coming up without this answers 502 rather than failing to start.
+# The front door reports that state properly on its own.
+
+[Service]
+Type=simple
+User=photoweb
+Group=photoweb
+WorkingDirectory=/opt/photoweb
+
+# Loopback only. photod is the only thing that should ever connect.
+Environment=NODE_ENV=production
+Environment=HOSTNAME=127.0.0.1
+
+# 8790, and the number is chosen rather than arbitrary. It sits below the
+# ephemeral range (/proc/sys/net/ipv4/ip_local_port_range is 32768-60999), so
+# the kernel will never hand it to something else as a source port, and it
+# continues the archive's own numbering: photod 8787, photo-ml 8789.
+#
+# 3000 is what this used to be, and it is exactly the wrong choice on a machine
+# somebody also writes code on. Every framework's dev server defaults to it, so
+# WEB_APP_URL was a race between this unit and whichever project got started
+# first — which is how photod ended up reverse-proxying an unrelated portfolio
+# site to the gallery's origin.
+Environment=PORT=8790
+
+# `next build` with output: "standalone" traces the modules actually imported
+# and emits a server that needs no package manager and no dependency
+# resolution at startup. So this is plain node against one file, not a
+# framework CLI walking node_modules.
+ExecStart=/usr/bin/node /opt/photoweb/server.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+
+# It serves a compiled bundle and talks to nothing. No database, no archive
+# drive, no TLS directory — every one of those belongs to photod.
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/photoweb/.next/cache
+PrivateTmp=yes
+NoNewPrivileges=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Behind photod, this only ever renders. Yield to the workers.
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

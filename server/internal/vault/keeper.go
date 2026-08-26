@@ -20,14 +20,19 @@ const DefaultIdle = 15 * time.Minute
 
 // Keeper holds the private key while the vault is unlocked, and nothing else.
 //
-// It is one per server rather than one per client, and that is a real property
-// of this deployment rather than an oversight: the gallery's endpoints are
-// unauthenticated on a loopback listener, so "who is asking" is a question this
-// server has never been able to answer. Unlocking the vault unlocks it for
-// whoever can reach that port, which is the same set of people who could
-// already read every photograph in the archive. Widening PLAINTEXT_ADDR was
-// always a decision with consequences; this adds one more to the list, and the
-// answer to all of them is the same piece of work — authenticating the gallery.
+// It is one per server rather than one per client, and that is still a real
+// property of this deployment. This comment used to say the reason was that the
+// gallery was unauthenticated and "who is asking" was unanswerable; that is no
+// longer true — every route is behind a passkey session or a device token now.
+// What remains true is that there is one archive and one person, so unlocking
+// the vault unlocks it for every signed-in client rather than for the tab that
+// typed the password. That is a deliberate simplification and not an oversight:
+// scoping the key to a session would mean the phone and the laptop each type
+// the password, which is exactly the friction that teaches people to leave a
+// vault unlocked.
+//
+// The idle timeout is what carries the weight instead, and it is why it is idle
+// time rather than a fixed session.
 //
 // What it does not do is write the key anywhere. It is in memory, it is dropped
 // on a lock, on an idle timeout, and on a restart, and there is no path from

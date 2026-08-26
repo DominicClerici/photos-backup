@@ -1,0 +1,77 @@
+#!/bin/sh
+# photoweb-deploy — the gallery's first install.
+#
+#   ./deploy/photoweb-deploy [--src DIR]
+#
+# Only the first one. Everything after this is `photobackup-admin redeploy`,
+# which builds the bundle from the same tree as the binaries and swaps it in
+# alongside them.
+#
+# The split is the one photo-ml already has, and it is deliberate: redeploy
+# replaces a deployment rather than performing one, so it skips a unit that was
+# never installed and a $DEST that does not exist. This is what creates them —
+# the service user, the directory it owns, and the unit — and then hands over.
+
+set -eu
+
+SRC=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+DEST=/opt/photoweb
+UNIT_DIR=/etc/systemd/system
+
+die() { printf '\nphotoweb-deploy: %s\n' "$*" >&2; exit 1; }
+step() { printf '==> %s\n' "$*"; }
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	--src) [ $# -ge 2 ] || die "--src needs a directory"; SRC=$2; shift 2 ;;
+	--src=*) SRC=${1#--src=}; shift ;;
+	-h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+	*) die "unknown argument: $1" ;;
+	esac
+done
+
+[ -d "$SRC/web" ] || die "no web/ under $SRC"
+[ -f "$SRC/deploy/photoweb.service" ] || die "no deploy/photoweb.service under $SRC"
+command -v npm >/dev/null 2>&1 || die "npm is not on PATH; the gallery is built with it"
+command -v rsync >/dev/null 2>&1 || die "rsync is not on PATH"
+
+if [ -d "$DEST" ]; then
+	die "$DEST already exists — this is the first install only. Use: photobackup-admin redeploy"
+fi
+
+# Its own user, owning nothing but the bundle. Nothing here is a security
+# boundary — the guard is photod, and this process would serve the bundle to
+# anyone who asked — which is exactly why it is bound to loopback and why it
+# has no read access to the archive it draws.
+step "creating the photoweb user and $DEST"
+id photoweb >/dev/null 2>&1 || sudo useradd --system \
+	--home-dir "$DEST" --shell /usr/sbin/nologin photoweb
+sudo install -d -o photoweb -g photoweb -m 0755 "$DEST"
+sudo install -d -o photoweb -g photoweb -m 0755 "$DEST/.next" "$DEST/.next/cache"
+
+step "installing the unit"
+sudo install -m 0644 "$SRC/deploy/photoweb.service" "$UNIT_DIR/photoweb.service"
+sudo systemctl daemon-reload
+# enable, not start: redeploy builds and starts it. Without this the gallery
+# comes back from a reboot dead, and photod answers 502 for it — which looks
+# like a broken deploy rather than a unit nobody enabled.
+sudo systemctl enable photoweb
+
+PORT=$(sed -n 's/^Environment=PORT=\([0-9][0-9]*\)$/\1/p' "$SRC/deploy/photoweb.service" | head -1)
+[ -n "$PORT" ] || die "could not read PORT out of deploy/photoweb.service"
+
+cat <<EOF
+
+  Created. The build and the first start are redeploy's job from here:
+
+     photobackup-admin redeploy --src $SRC
+
+  One thing to check first, because photod does not error when it is wrong —
+  it reverse-proxies whatever else is on the port, from the archive's own
+  origin, behind the archive's own session:
+
+     WEB_APP_URL=http://127.0.0.1:$PORT
+
+  in /etc/photod/photod.env. redeploy warns when the two disagree.
+
+EOF

@@ -32,6 +32,9 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
 	"github.com/dominicclerici/photos-backup/server/internal/vault"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
+	"github.com/dominicclerici/photos-backup/server/internal/webauth"
+
+	lib "github.com/go-webauthn/webauthn/webauthn"
 )
 
 const (
@@ -55,7 +58,13 @@ type harness struct {
 	// answered by every test in the package instead of by one of them.
 	token    string
 	deviceID string
-	nudges   atomic.Int64
+	// web and session are the browser's half of the same idea: a real session,
+	// minted through the real store, so the gallery's routes are exercised the
+	// way a signed-in browser reaches them rather than through a door only the
+	// tests can open.
+	web     *webauth.Store
+	session string
+	nudges  atomic.Int64
 }
 
 // newHarness wires the real server against a real Postgres and a temp photos
@@ -93,6 +102,20 @@ func newHarness(t *testing.T) *harness {
 		manifestPath: manifestPath,
 	}
 	h.devices = devices.New(store.Pool())
+	h.web = webauth.New(store.Pool())
+
+	// A relying party the ceremonies can be configured against. No test drives a
+	// real authenticator — there is none to drive — so what this buys is that the
+	// endpoints answer their real errors instead of "not configured".
+	rp, err := lib.New(&lib.Config{
+		RPID:          "localhost",
+		RPDisplayName: "photobackup test",
+		RPOrigins:     []string{"https://localhost"},
+	})
+	if err != nil {
+		t.Fatalf("configure webauthn: %v", err)
+	}
+
 	h.srv = &Server{
 		Store:       store,
 		Blobs:       blobstore.New(root),
@@ -107,6 +130,9 @@ func newHarness(t *testing.T) *harness {
 		Queue:        jobs.NewQueue(store.Pool()),
 		Uploads:      uploads.New(filepath.Join(root, "incoming")),
 		Devices:      h.devices,
+		Web:          h.web,
+		WebAuthn:     rp,
+		Ceremonies:   webauth.NewCeremonies(time.Minute),
 		Vault: &vault.Service{
 			Store:            store,
 			Blobs:            blobstore.New(root),
@@ -129,7 +155,23 @@ func newHarness(t *testing.T) *harness {
 	h.server = ts
 
 	h.deviceID, h.token = h.pair(t, "test phone")
+	h.session = h.signIn(t)
 	return h
+}
+
+// signIn mints a browser session directly through the store.
+//
+// Not through POST /v1/auth/login/finish, because that needs an authenticator
+// to sign a challenge and there is none in a test binary. What it does exercise
+// is everything downstream of the assertion: the same Mint the real handler
+// calls, the same cookie, and the same guard.
+func (h *harness) signIn(t *testing.T) string {
+	t.Helper()
+	token, _, err := h.web.Mint(context.Background(), "", webauth.MethodPasskey, "test", "go test")
+	if err != nil {
+		t.Fatalf("mint session: %v", err)
+	}
+	return token
 }
 
 // pair redeems a fresh code, returning the device id and its token.
@@ -324,11 +366,29 @@ func (h *harness) getWith(t *testing.T, path string, headers map[string]string) 
 	return resp
 }
 
-// plaintext starts the unauthenticated listener the browser gallery uses, so a
-// test can assert what it can reach without a token.
-func (h *harness) plaintext(t *testing.T) *httptest.Server {
+// gallery starts a listener that answers as a signed-in browser.
+//
+// It was `plaintext` until this phase, and it wrapped a second routing table
+// that served the whole archive to anyone who could open the port. That table is
+// gone; the gallery is a browser holding a session cookie now, so this injects
+// one. Every route these tests reach through here therefore passes the real
+// guard rather than one that waves everything through.
+//
+// Sec-Fetch-Site is stamped for the same reason: a real browser sends it, and
+// requireAuth refuses an unsafe method without it. A test that wants to assert
+// the refusal sets its own — see TestGalleryWriteNeedsSameOrigin.
+func (h *harness) gallery(t *testing.T) *httptest.Server {
 	t.Helper()
-	ts := httptest.NewServer(h.srv.PlaintextHandler())
+	inner := h.srv.Handler()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := r.Cookie(SessionCookie); err != nil {
+			r.AddCookie(&http.Cookie{Name: SessionCookie, Value: h.session})
+		}
+		if r.Header.Get("Sec-Fetch-Site") == "" {
+			r.Header.Set("Sec-Fetch-Site", "same-origin")
+		}
+		inner.ServeHTTP(w, r)
+	}))
 	t.Cleanup(ts.Close)
 	return ts
 }

@@ -16,6 +16,9 @@
 //	photobackup pair [--ttl 10m]
 //	photobackup devices [--revoke ID]
 //	photobackup ca [--serve] [--export PATH]
+//	photobackup passkey add [--ttl 5m] | list | revoke ID
+//	photobackup recovery [--count 10] [--yes]
+//	photobackup web [--revoke-all]
 package main
 
 import (
@@ -55,6 +58,14 @@ const usage = `photobackup — maintenance for the photo archive
   pair [--ttl 10m]                     mint a single-use code to pair a device
   devices [--revoke ID]                list paired devices, or unpair one
   ca [--serve] [--export PATH]         the CA to install on a device, and how
+
+  passkey add | list | revoke ID       the credential the browser signs in with;
+                                       "add" mints an enrollment code, and is how
+                                       a fresh archive is opened for the first
+                                       time
+  recovery [--count 10] [--yes]        mint the codes that survive losing every
+                                       passkey; shown once
+  web [--revoke-all]                   list open browser sessions, or end them
 
 Reads PHOTOS_ROOT, DERIVATIVES_ROOT, DATABASE_URL, GEONAMES_DIR and TLS_DIR,
 the same as photod. Run a subcommand with --help for its own flags.
@@ -109,6 +120,12 @@ func main() {
 		code, err = runDevices(ctx, os.Args[2:])
 	case "ca":
 		code, err = runCA(ctx, os.Args[2:])
+	case "passkey":
+		code, err = runPasskey(ctx, os.Args[2:])
+	case "recovery":
+		code, err = runRecovery(ctx, os.Args[2:])
+	case "web":
+		code, err = runWeb(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return

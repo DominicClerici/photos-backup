@@ -47,18 +47,33 @@ type Config struct {
 	// TLSDisabled serves the API in the clear on ListenAddr, tokens and all.
 	// Development only, and photod says so loudly at startup.
 	TLSDisabled bool
-	// PlaintextAddr is a second, unencrypted listener carrying the gallery's
-	// own endpoints and /health, and no endpoint that takes a device token —
-	// no pairing, and not the phone's upload path. It is how the Next app and a
-	// browser on this machine reach photod without having to trust a private
-	// CA. Empty disables it.
+	// WebOrigin is the address a browser reaches this archive at, e.g.
+	// https://archive.tail1234.ts.net. Empty disables browser sign-in entirely:
+	// the sign-in endpoints answer 503 and only paired devices can read the
+	// archive.
 	//
-	// "The gallery's own endpoints" is more than the reads and has been since
-	// the trash: the browser deletes, hides, files into albums, and since the
-	// upload page also archives a photograph it was handed. None of that
-	// carries a credential, all of it is available to anyone who can reach this
-	// address, and that is why the address is a loopback one.
-	PlaintextAddr string
+	// It is not a cosmetic setting. A passkey is bound to the origin it was
+	// registered under — that binding is what makes it unphishable — so this
+	// value is baked into every credential this archive holds. Changing it means
+	// every registered passkey stops resolving and has to be registered again,
+	// which is why it is configured explicitly rather than sniffed from the Host
+	// header of whatever request happens to arrive.
+	WebOrigin string
+	// WebAppURL is where the Next process is listening, e.g.
+	// http://127.0.0.1:3000. photod reverse-proxies it, so the gallery, the JSON
+	// and the thumbnails all arrive from one origin under one cookie — the
+	// constraint PROJECT.md records from Phase 12, since a browser attaches a
+	// same-origin cookie to an <img> and will not attach a bearer header to one.
+	//
+	// Empty means photod serves the API and no gallery, which is the right
+	// degradation while the Next process is being deployed: the phone keeps
+	// backing up.
+	WebAppURL string
+	// WebIdle ends a browser session that has not been used, and WebLifetime is
+	// the absolute cap that nothing resets. A session dies at whichever comes
+	// first.
+	WebIdle     time.Duration
+	WebLifetime time.Duration
 
 	// MDNSInstance is the advertised service name. Empty means "derive it from
 	// the hostname".
@@ -198,7 +213,10 @@ func FromEnv() Config {
 		TLSDisabled:  truthy(os.Getenv("TLS_DISABLED")),
 		// Loopback by default. Widening it is a deliberate choice with a
 		// documented consequence: the read path has no authentication yet.
-		PlaintextAddr: or(os.Getenv("PLAINTEXT_ADDR"), "127.0.0.1:8788"),
+		WebOrigin:   strings.TrimRight(os.Getenv("WEB_ORIGIN"), "/"),
+		WebAppURL:   or(os.Getenv("WEB_APP_URL"), "http://127.0.0.1:3000"),
+		WebIdle:     duration(os.Getenv("WEB_IDLE"), time.Hour),
+		WebLifetime: duration(os.Getenv("WEB_LIFETIME"), 12*time.Hour),
 
 		MDNSInstance: os.Getenv("MDNS_INSTANCE"),
 		MDNSDisabled: truthy(os.Getenv("MDNS_DISABLED")),

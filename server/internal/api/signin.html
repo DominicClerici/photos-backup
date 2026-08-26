@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b0b0d">
+<title>Photos</title>
+<style nonce="{{nonce}}">
+  /* The gallery's tokens, copied rather than imported: this page is served by
+     photod and must render before — and without — anything Next builds. */
+  :root {
+    --background: #0b0b0d;
+    --foreground: #ececed;
+    --card: #16161a;
+    --muted: #1c1c21;
+    --muted-foreground: #9a9aa4;
+    --faint: #6a6a74;
+    --primary: #6ea8fe;
+    --primary-foreground: #0b0b0d;
+    --destructive: #f0755f;
+    --border: #26262d;
+    --radius: 0.625rem;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--background);
+    color: var(--foreground);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: grid;
+    place-items: center;
+    padding: 1.5rem;
+  }
+  main {
+    width: 100%;
+    max-width: 22rem;
+  }
+  h1 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0 0 0.4rem;
+  }
+  p.lede {
+    color: var(--muted-foreground);
+    margin: 0 0 1.75rem;
+    font-size: 0.9rem;
+  }
+  button {
+    width: 100%;
+    padding: 0.7rem 1rem;
+    border: 0;
+    border-radius: var(--radius);
+    background: var(--primary);
+    color: var(--primary-foreground);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { filter: brightness(1.08); }
+  button:disabled { opacity: 0.55; cursor: default; }
+  button.secondary {
+    background: transparent;
+    color: var(--muted-foreground);
+    font-weight: 500;
+    padding: 0.5rem;
+    margin-top: 0.75rem;
+  }
+  button.secondary:hover:not(:disabled) { color: var(--foreground); filter: none; }
+  input {
+    width: 100%;
+    padding: 0.65rem 0.85rem;
+    margin-bottom: 0.75rem;
+    background: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--foreground);
+    font: inherit;
+    font-variant-numeric: tabular-nums;
+  }
+  input::placeholder { color: var(--faint); }
+  input:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -1px;
+    border-color: transparent;
+  }
+  .msg {
+    margin-top: 1rem;
+    font-size: 0.85rem;
+    min-height: 1.25rem;
+    color: var(--muted-foreground);
+  }
+  .msg.error { color: var(--destructive); }
+  .hint {
+    margin-top: 1.5rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--border);
+    color: var(--faint);
+    font-size: 0.8rem;
+  }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--muted-foreground);
+  }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Photos</h1>
+  <p class="lede" id="lede">Checking this archive&hellip;</p>
+
+  <div id="signin" hidden>
+    <button id="signin-btn" type="button">Sign in</button>
+    <button id="recover-toggle" class="secondary" type="button">Use a recovery code</button>
+  </div>
+
+  <div id="enroll" hidden>
+    <input id="enroll-code" inputmode="latin" autocapitalize="characters"
+           autocomplete="one-time-code" spellcheck="false" placeholder="XXXX-XXXX">
+    <button id="enroll-btn" type="button">Register this device</button>
+  </div>
+
+  <div id="recover" hidden>
+    <input id="recover-code" autocomplete="off" spellcheck="false" placeholder="pbr_&hellip;">
+    <button id="recover-btn" type="button">Sign in with a recovery code</button>
+    <button id="recover-cancel" class="secondary" type="button">Back</button>
+  </div>
+
+  <p class="msg" id="msg"></p>
+
+  <p class="hint" id="hint" hidden>
+    No passkey is registered yet. Run <code>photobackup passkey add</code> on the
+    archive machine to mint an enrollment code.
+  </p>
+</main>
+
+<script nonce="{{nonce}}">
+(() => {
+  "use strict";
+
+  const NEXT = "{{next}}";
+
+  const el = (id) => document.getElementById(id);
+  const msg = el("msg");
+
+  const say = (text, isError) => {
+    msg.textContent = text || "";
+    msg.classList.toggle("error", Boolean(isError));
+  };
+
+  const show = (...ids) => {
+    for (const id of ["signin", "enroll", "recover"]) {
+      el(id).hidden = !ids.includes(id);
+    }
+  };
+
+  // WebAuthn speaks ArrayBuffers; the wire speaks base64url. These four are the
+  // whole of the translation, and they are why this page does not need a
+  // library.
+  const b64urlToBytes = (s) => {
+    const pad = s.replace(/-/g, "+").replace(/_/g, "/");
+    const raw = atob(pad + "=".repeat((4 - (pad.length % 4)) % 4));
+    const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  };
+
+  const bytesToB64url = (buf) => {
+    const bytes = new Uint8Array(buf);
+    let raw = "";
+    for (let i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
+    return btoa(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  };
+
+  const decodeDescriptors = (list) =>
+    (list || []).map((d) => ({ ...d, id: b64urlToBytes(d.id) }));
+
+  const post = async (path, body) => {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // Same-origin is the default, and stating it is the point: this page and
+      // the API it calls are one origin, which is what lets one cookie cover
+      // the gallery and every thumbnail in it.
+      credentials: "same-origin",
+      body: JSON.stringify(body || {}),
+    });
+    const text = await res.text();
+    let parsed = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
+    if (!res.ok) {
+      throw new Error((parsed && parsed.error) || `request failed (${res.status})`);
+    }
+    return parsed;
+  };
+
+  const done = () => { window.location.replace(NEXT); };
+
+  // A user-cancelled prompt is not a failure worth shouting about: somebody
+  // pressed escape. Everything else is worth the exact words the server chose.
+  const explain = (err) => {
+    if (err && (err.name === "NotAllowedError" || err.name === "AbortError")) {
+      return "Cancelled.";
+    }
+    if (err && err.name === "InvalidStateError") {
+      return "This device already has a passkey for this archive.";
+    }
+    return (err && err.message) || "Something went wrong.";
+  };
+
+  const busy = (button, on, label) => {
+    button.disabled = on;
+    if (on) {
+      button.dataset.label = button.textContent;
+      button.textContent = label;
+    } else if (button.dataset.label) {
+      button.textContent = button.dataset.label;
+    }
+  };
+
+  async function signIn() {
+    const button = el("signin-btn");
+    busy(button, true, "Waiting for your passkey…");
+    say("");
+    try {
+      const options = await post("/api/v1/auth/login/start");
+      const publicKey = options.publicKey;
+      publicKey.challenge = b64urlToBytes(publicKey.challenge);
+      publicKey.allowCredentials = decodeDescriptors(publicKey.allowCredentials);
+
+      const assertion = await navigator.credentials.get({ publicKey });
+      await post("/api/v1/auth/login/finish", {
+        id: assertion.id,
+        rawId: bytesToB64url(assertion.rawId),
+        type: assertion.type,
+        response: {
+          clientDataJSON: bytesToB64url(assertion.response.clientDataJSON),
+          authenticatorData: bytesToB64url(assertion.response.authenticatorData),
+          signature: bytesToB64url(assertion.response.signature),
+          userHandle: assertion.response.userHandle
+            ? bytesToB64url(assertion.response.userHandle)
+            : "",
+        },
+      });
+      done();
+    } catch (err) {
+      say(explain(err), true);
+      busy(button, false);
+    }
+  }
+
+  async function enroll() {
+    const button = el("enroll-btn");
+    const code = el("enroll-code").value.trim();
+    if (!code) {
+      say("Enter the enrollment code.", true);
+      return;
+    }
+    busy(button, true, "Waiting for your passkey…");
+    say("");
+    try {
+      const options = await post("/api/v1/auth/register/start", { code });
+      const publicKey = options.publicKey;
+      publicKey.challenge = b64urlToBytes(publicKey.challenge);
+      publicKey.user.id = b64urlToBytes(publicKey.user.id);
+      publicKey.excludeCredentials = decodeDescriptors(publicKey.excludeCredentials);
+
+      const cred = await navigator.credentials.create({ publicKey });
+      await post("/api/v1/auth/register/finish", {
+        id: cred.id,
+        rawId: bytesToB64url(cred.rawId),
+        type: cred.type,
+        response: {
+          clientDataJSON: bytesToB64url(cred.response.clientDataJSON),
+          attestationObject: bytesToB64url(cred.response.attestationObject),
+        },
+      });
+      // Registering does not sign you in — the ceremony proved you can create a
+      // key, not that you can use one — so this goes straight on to doing that.
+      say("Passkey registered. Signing in…");
+      await signIn();
+    } catch (err) {
+      say(explain(err), true);
+      busy(button, false);
+    }
+  }
+
+  async function recover() {
+    const button = el("recover-btn");
+    const code = el("recover-code").value.trim();
+    if (!code) {
+      say("Enter a recovery code.", true);
+      return;
+    }
+    busy(button, true, "Checking…");
+    say("");
+    try {
+      await post("/api/v1/auth/recover", { code });
+      done();
+    } catch (err) {
+      say(explain(err), true);
+      busy(button, false);
+    }
+  }
+
+  async function start() {
+    if (!window.PublicKeyCredential) {
+      say("This browser does not support passkeys.", true);
+      return;
+    }
+    try {
+      const res = await fetch("/api/v1/auth/status", { credentials: "same-origin" });
+      const status = await res.json();
+      if (status.signedIn) {
+        done();
+        return;
+      }
+      if (status.enrolled) {
+        el("lede").textContent = "Sign in with your passkey to open this archive.";
+        show("signin");
+      } else {
+        el("title").textContent = "Set up Photos";
+        el("lede").textContent = "Register a passkey to claim this archive.";
+        el("hint").hidden = false;
+        show("enroll");
+      }
+    } catch {
+      say("Could not reach the archive.", true);
+    }
+  }
+
+  el("signin-btn").addEventListener("click", signIn);
+  el("enroll-btn").addEventListener("click", enroll);
+  el("recover-btn").addEventListener("click", recover);
+  el("recover-toggle").addEventListener("click", () => {
+    say("");
+    show("recover");
+    el("recover-code").focus();
+  });
+  el("recover-cancel").addEventListener("click", () => {
+    say("");
+    show("signin");
+  });
+  for (const [input, action] of [["enroll-code", enroll], ["recover-code", recover]]) {
+    el(input).addEventListener("keydown", (e) => {
+      if (e.key === "Enter") action();
+    });
+  }
+
+  start();
+})();
+</script>
+</body>
+</html>

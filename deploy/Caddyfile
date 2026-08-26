@@ -1,0 +1,64 @@
+# Caddy — the public name and the publicly-trusted certificate, in front of photod.
+#
+# This exists for exactly one reason: a passkey is bound to an origin, and the
+# origin has to be one a browser will load without a certificate interstitial.
+# photod cannot provide that. internal/tlsca always self-signs from photod's own
+# CA and has no knob for an externally-issued certificate — and it must not get
+# one, because that CA is what the phone pins to pair. So photod keeps its own
+# identity on 8787 for the phone, and this terminates a real certificate on 443
+# for the browser.
+#
+# It is not a security boundary. The guard is requirePage/requireAuth in
+# server/internal/api/frontdoor.go, behind this. What this adds is a name and a
+# certificate, and the one-origin invariant still holds: the sign-in page, the
+# JSON and the media all still arrive from the same host.
+{
+	email dclerici77@gmail.com
+
+	# No :80. With DNS-01 there is no challenge that needs it, and the whole
+	# point of this deployment is that nothing is listening for the internet.
+	auto_https disable_redirects
+}
+
+gallery.dominicclerici.com {
+	# The tailnet address, not 0.0.0.0. firewalld restricting 443 to the
+	# tailscale0 zone is the real enforcement; this is the second lock.
+	bind {env.GALLERY_BIND}
+
+	# DNS-01, because nothing here is reachable from the internet: this name
+	# resolves to a 100.64/10 address that is unroutable off the tailnet, and
+	# both HTTP-01 and TLS-ALPN need the CA to open a connection inbound.
+	#
+	# Namecheap's setHosts replaces every host record on the domain, so the
+	# provider has to read the whole zone and write it back to add one TXT.
+	# libdns/namecheap does that under a mutex and it is correct — but a crash
+	# between the read and the write, or an edit made in Namecheap's web UI
+	# while a renewal is in flight, takes the rest of the zone with it. The
+	# apex A record pointing at Vercel is in that blast radius. Snapshot the
+	# zone before changing anything here.
+	#
+	# client_ip is pinned rather than auto-discovered because Namecheap
+	# authorises by source address: the value here must match the allowlist
+	# entry in the Namecheap console, and a residential IP that changes is the
+	# most likely way this breaks — silently, sixty days from now, at renewal.
+	tls {
+		dns namecheap {
+			api_key {env.NAMECHEAP_API_KEY}
+			user {env.NAMECHEAP_API_USER}
+			client_ip {env.NAMECHEAP_CLIENT_IP}
+		}
+		# Ask the authoritative servers directly. The system resolver caches
+		# the challenge TXT's absence and Let's Encrypt then checks too early.
+		resolvers 1.1.1.1 9.9.9.9
+	}
+
+	# photod's own certificate on the inside. Verified rather than skipped:
+	# the CA is not publicly trusted, but it is known, and pinning it here is
+	# the difference between "encrypted" and "encrypted to the right process".
+	# The copy is at /etc/caddy because /var/lib/photod/tls is 0700 photod.
+	reverse_proxy https://127.0.0.1:8787 {
+		transport http {
+			tls_trust_pool file /etc/caddy/photod-ca.crt
+		}
+	}
+}

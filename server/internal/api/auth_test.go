@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -134,21 +135,11 @@ func TestAPairedDeviceReadsTheGallery(t *testing.T) {
 // /health is the exception, and it has to be: the app pings a remembered address
 // to see whether it still answers, which happens before pairing and after a
 // token has been revoked.
-func TestHealthNeedsNoTokenOnEitherListener(t *testing.T) {
+func TestHealthNeedsNoCredential(t *testing.T) {
 	h := newHarness(t)
 
 	if resp := h.raw(t, http.MethodGet, "/health", ""); resp.StatusCode != http.StatusOK {
-		t.Errorf("GET /health on the TLS listener = %d, want 200", resp.StatusCode)
-	}
-
-	plain := h.plaintext(t)
-	resp, err := plain.Client().Get(plain.URL + "/health")
-	if err != nil {
-		t.Fatalf("GET /health: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("GET /health on the plaintext listener = %d, want 200", resp.StatusCode)
+		t.Errorf("GET /health = %d, want 200", resp.StatusCode)
 	}
 }
 
@@ -192,11 +183,11 @@ func TestRevokingKeepsWhatTheDeviceDelivered(t *testing.T) {
 		t.Fatalf("blobs = %v, want the %d from before revoking", after, len(before))
 	}
 
-	// Read through the gallery's listener, because the revoked token can no
-	// longer read through the other one — the archive still holds what the device
-	// delivered, which is the property under test.
-	plain := h.plaintext(t)
-	resp, err := plain.Client().Get(plain.URL + "/v1/timeline")
+	// Read back as the browser, because the revoked token can no longer read
+	// anything — the archive still holds what the device delivered, which is the
+	// property under test, and a second credential is how it is observed.
+	gallery := h.gallery(t)
+	resp, err := gallery.Client().Get(gallery.URL + "/v1/timeline")
 	if err != nil {
 		t.Fatalf("GET /v1/timeline: %v", err)
 	}
@@ -345,49 +336,286 @@ func TestPairingRateLimitsAttempts(t *testing.T) {
 	}
 }
 
-// The plaintext listener is the gallery's, and the routing table is what keeps a
-// token off it. This asserts the shape rather than a check inside a handler,
-// because the shape is what survives PLAINTEXT_ADDR being widened to the LAN.
-func TestPlaintextListenerServesNoCredentialPath(t *testing.T) {
+// galleryRoutes is a sample of what the browser reaches: two reads and two
+// writes. Not the whole table — that is what the guard is for — but enough that
+// "the gallery is authenticated" is asserted rather than assumed.
+var galleryRoutes = []struct {
+	method, path string
+}{
+	{http.MethodGet, "/v1/timeline"},
+	{http.MethodGet, "/v1/collections"},
+	{http.MethodPost, "/v1/trash"},
+	{http.MethodPost, "/v1/vault/unlock"},
+}
+
+// Until this phase the whole of this table was served, unauthenticated, to
+// anyone who could open PLAINTEXT_ADDR — including the deletes and the vault.
+// The listener that did it is gone, and this is the property that replaced it.
+func TestGalleryRoutesRefuseAnAnonymousCaller(t *testing.T) {
 	h := newHarness(t)
 
-	plain := h.plaintext(t)
-
-	for _, route := range append(writeRoutes, struct{ method, path string }{http.MethodPost, "/v1/pair"}) {
+	for _, route := range galleryRoutes {
 		t.Run(route.method+" "+route.path, func(t *testing.T) {
-			req, err := http.NewRequest(route.method, plain.URL+route.path, strings.NewReader("{}"))
-			if err != nil {
-				t.Fatalf("build request: %v", err)
-			}
-			// Sending a valid token, because the point is that it is refused
-			// anyway rather than that an anonymous request is.
-			req.Header.Set("Authorization", "Bearer "+h.token)
-			resp, err := plain.Client().Do(req)
-			if err != nil {
-				t.Fatalf("%s: %v", route.path, err)
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusUpgradeRequired {
-				t.Fatalf("status = %d, want 426", resp.StatusCode)
+			resp := h.raw(t, route.method, route.path, "")
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401 — this route is reachable without a credential", resp.StatusCode)
 			}
 		})
 	}
+}
 
-	// And the read path stays open here, which is the whole reason this listener
-	// exists: the browser gallery proxies to it from the same machine rather than
-	// teaching Node to trust a private CA. The other listener now wants a token
-	// for these same two paths.
-	for _, path := range []string{"/health", "/v1/timeline"} {
-		resp, err := plain.Client().Get(plain.URL + path)
+// The other half: a session cookie is a credential these routes accept, so the
+// refusal above is a guard rather than a route that stopped working.
+func TestGalleryRoutesAcceptASessionCookie(t *testing.T) {
+	h := newHarness(t)
+	gallery := h.gallery(t)
+
+	for _, path := range []string{"/v1/timeline", "/v1/collections"} {
+		resp, err := gallery.Client().Get(gallery.URL + path)
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			t.Errorf("GET %s = %d, want 200 — the gallery reads this listener", path, resp.StatusCode)
+			t.Errorf("GET %s = %d, want 200", path, resp.StatusCode)
 		}
 	}
+}
+
+// A device token reaches the same routes, because the phone reads the archive
+// through them too. One guard, two credentials.
+func TestGalleryRoutesAcceptADeviceToken(t *testing.T) {
+	h := newHarness(t)
+
+	if resp := h.raw(t, http.MethodGet, "/v1/timeline", h.token); resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /v1/timeline with a device token = %d, want 200", resp.StatusCode)
+	}
+}
+
+// CSRF. SameSite=Strict is the first defence and this is the second: a write
+// that the browser says came from somewhere else is refused even though it
+// carried a live cookie.
+func TestGalleryWriteNeedsSameOrigin(t *testing.T) {
+	h := newHarness(t)
+	gallery := h.gallery(t)
+
+	req, err := http.NewRequest(http.MethodPost, gallery.URL+"/v1/trash", strings.NewReader(`{"ids":[]}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+
+	resp, err := gallery.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/trash: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 — a cross-site write was accepted", resp.StatusCode)
+	}
+}
+
+// A read is exempt, and has to be: <img> and <video> issue GETs that carry no
+// Origin, and every thumbnail in the grid is one of them.
+func TestGalleryReadIsExemptFromTheOriginCheck(t *testing.T) {
+	h := newHarness(t)
+	gallery := h.gallery(t)
+
+	req, err := http.NewRequest(http.MethodGet, gallery.URL+"/v1/timeline", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+
+	resp, err := gallery.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/timeline: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// Signing out is a real revocation rather than a discarded cookie: the row is
+// dead on the server, so the cookie the browser still holds stops working.
+func TestAnEndedSessionStopsWorking(t *testing.T) {
+	h := newHarness(t)
+	gallery := h.gallery(t)
+
+	if err := h.web.Revoke(context.Background(), h.session); err != nil {
+		t.Fatalf("revoke session: %v", err)
+	}
+
+	resp, err := gallery.Client().Get(gallery.URL + "/v1/timeline")
+	if err != nil {
+		t.Fatalf("GET /v1/timeline: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 after signing out", resp.StatusCode)
+	}
+}
+
+// Registering a passkey needs authority: an enrollment code, or a session. An
+// anonymous caller with neither cannot start the ceremony, which is what stops
+// a fresh archive from being claimed by whoever reaches it first.
+func TestRegisteringAPasskeyNeedsAuthority(t *testing.T) {
+	h := newHarness(t)
+
+	resp := h.postAnon(t, "/v1/auth/register/start", `{"label":"laptop"}`)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 without an enrollment code", resp.StatusCode)
+	}
+
+	resp = h.postAnon(t, "/v1/auth/register/start", `{"code":"AAAA-AAAA"}`)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 for a code this archive does not hold", resp.StatusCode)
+	}
+}
+
+// A recovery code opens a session, once. The second attempt with the same code
+// is refused, which is the whole of what "single use" means here.
+func TestARecoveryCodeIsSpentOnce(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	codes, err := h.web.MintRecovery(ctx, 3)
+	if err != nil {
+		t.Fatalf("mint recovery codes: %v", err)
+	}
+
+	body := fmt.Sprintf(`{"code":%q}`, codes[0])
+	resp := h.postAnon(t, "/v1/auth/recover", body)
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("first redemption = %d (%s), want 200", resp.StatusCode, raw)
+	}
+	if !hasCookie(resp, SessionCookie) {
+		t.Error("no session cookie was set by a successful recovery")
+	}
+
+	if resp := h.postAnon(t, "/v1/auth/recover", body); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("second redemption = %d, want 403 — the code was reusable", resp.StatusCode)
+	}
+}
+
+// The status endpoint is the one thing a stranger may read, and it says only
+// whether this archive has been set up. It must not leak how many recovery
+// codes are left, which is a fact about the credentials rather than about
+// whether to show a sign-in button.
+func TestAuthStatusTellsAStrangerNothingButWhetherItIsSetUp(t *testing.T) {
+	h := newHarness(t)
+
+	resp := h.raw(t, http.MethodGet, "/v1/auth/status", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var got authStatus
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.SignedIn {
+		t.Error("an anonymous caller was reported as signed in")
+	}
+	if got.Recovery != nil {
+		t.Errorf("recoveryRemaining = %d, want it withheld from an anonymous caller", *got.Recovery)
+	}
+}
+
+// The credential-management endpoints, which nothing else in this package
+// touches and which are therefore the easy ones to break.
+//
+// It exists because they were broken: the first version of migration 0024 had
+// no `transports` column and every query here reads one, so `GET
+// /v1/auth/passkeys` failed against a real schema while the whole suite stayed
+// green. Reading the columns back is the point of the test.
+func TestThePasskeyEndpointsAnswer(t *testing.T) {
+	h := newHarness(t)
+	gallery := h.gallery(t)
+
+	resp, err := gallery.Client().Get(gallery.URL + "/v1/auth/passkeys")
+	if err != nil {
+		t.Fatalf("GET /v1/auth/passkeys: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d (%s), want 200", resp.StatusCode, raw)
+	}
+
+	var listed struct {
+		Passkeys []struct {
+			ID    string `json:"id"`
+			Label string `json:"label"`
+		} `json:"passkeys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Minting is the other half, and it is what the status endpoint's
+	// recoveryRemaining is read from.
+	req, err := http.NewRequest(http.MethodPost, gallery.URL+"/v1/auth/recovery-codes", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	minted, err := gallery.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/auth/recovery-codes: %v", err)
+	}
+	defer minted.Body.Close()
+	if minted.StatusCode != http.StatusCreated {
+		raw, _ := io.ReadAll(minted.Body)
+		t.Fatalf("status = %d (%s), want 201", minted.StatusCode, raw)
+	}
+
+	var out struct {
+		Codes []string `json:"codes"`
+	}
+	if err := json.NewDecoder(minted.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out.Codes) == 0 {
+		t.Fatal("no recovery codes were returned")
+	}
+
+	// And a signed-in caller is told how many are left, where an anonymous one
+	// is not.
+	status, err := gallery.Client().Get(gallery.URL + "/v1/auth/status")
+	if err != nil {
+		t.Fatalf("GET /v1/auth/status: %v", err)
+	}
+	defer status.Body.Close()
+	var got authStatus
+	if err := json.NewDecoder(status.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Recovery == nil || *got.Recovery != len(out.Codes) {
+		t.Errorf("recoveryRemaining = %v, want %d", got.Recovery, len(out.Codes))
+	}
+}
+
+// postAnon issues a POST with no credential of any kind.
+func (h *harness) postAnon(t *testing.T, path, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, h.server.URL+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	return h.do(t, req)
+}
+
+func hasCookie(resp *http.Response, name string) bool {
+	for _, c := range resp.Cookies() {
+		if c.Name == name && c.Value != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // A server with no device store must serve no write path at all, rather than an

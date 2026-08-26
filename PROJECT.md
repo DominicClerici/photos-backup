@@ -101,21 +101,27 @@ of hardlinks on demand, costing no extra bytes.
 
 ```
      iPhone  (Expo / React Native)        browser
-       - PhotoKit enumeration               |
-       - local SQLite upload queue          v
-       - foreground bulk upload    +------------------------+
-       - background top-up         |  web  (Next.js)        |
-              |                    |    virtualized timeline|
-              |                    |    full-size viewer    |
-              |                    |    /api/* -> photod    |
-              |                    +-----------+------------+
-              |                                |
+       - PhotoKit enumeration               - passkey (WebAuthn)
+       - local SQLite upload queue          - session cookie
+       - foreground bulk upload             |
+       - background top-up                  |
+       - device token (pbk_)                |
+              |                             |
               +---- HTTPS over LAN (mDNS) or Tailscale ----+
                                   |
                                   v
         +---------------------------------------------------+
         |  photod  (Go)                          always-on   |
+        |    the front door: one origin, one guard           |
         |    device pairing + token auth                     |
+        |    passkey sign-in + browser sessions              |
+        |                    |                               |
+        |                    v  reverse proxy, loopback      |
+        |    +--------------------------------------+        |
+        |    |  web  (Next.js)                      |        |
+        |    |    virtualized timeline              |        |
+        |    |    full-size viewer                  |        |
+        |    +--------------------------------------+        |
         |    POST /v1/sync/check     dedup pre-check         |
         |    POST /v1/assets         single-shot upload      |
         |    PUT  /v1/assets/:id/chunk   resumable upload    |
@@ -144,16 +150,18 @@ of hardlinks on demand, costing no extra bytes.
 Three server processes under systemd, plus the web app. The split is by process
 boundary, not sprinkled through one codebase.
 
-The gallery is a separate Next.js app rather than pages served by photod. It
-costs a second process on the archive machine, and buys the ability to put the
-gallery on the public internet later without moving the upload endpoints or the
-archive drive along with it. photod stays a private API; the web app is the only
-part that would ever face outward.
+The gallery is a separate Next.js app rather than pages served by photod, which
+costs a second process and keeps the rendering in the framework built for it.
+It is not, however, a separate deployment: photod is the front door and proxies
+it on loopback.
 
-The browser talks to one origin. Next rewrites `/api/*` to photod, so the JSON
-is same-origin and CORS never enters the picture. Thumbnails and video are the
-exception: `<img>` and `<video>` are not subject to CORS, so they can point
-straight at photod and skip the proxy hop entirely.
+**The browser talks to one origin, and that is a security property rather than a
+convenience.** A browser attaches a same-origin cookie to an `<img>` and will
+not attach a bearer header to one, so the app and the media have to arrive from
+the same place for one session to cover both. Phase 12 established this and
+Phase 17 is built on it. Splitting the gallery onto a different origin — a CDN,
+a hosting provider — means solving authentication a second time with signed URLs
+or a second credential, which is why that option was considered and dropped.
 
 **Hard rule:** `photo-ml` is optional forever. If it is down, mid-model-swap, or
 saturating the GPU, backups still complete and photos still display. Search
@@ -865,6 +873,7 @@ which was the point, because a browser attaches a same-origin cookie to an
 **It has since been removed, whole.** One shared password with no accounts, no
 roles and no revocation was always meant as a house key rather than an identity
 system, and it is being replaced by something more robust rather than extended.
+That replacement is Phase 17: a passkey, which is an identity system.
 The removal touched no data: sessions lived only in the serving process's
 memory, so there was no table, no migration and no file on disk to unwind. What
 came out was `internal/websession`, `internal/api/websession.go`, the
@@ -1244,6 +1253,82 @@ device mapping it already holds, and each item settles straight back to done,
 describing itself on the way past. Nothing is fetched from iCloud and nothing is
 uploaded twice.
 
+### Phase 17 — A passkey, and one origin
+
+The gallery is authenticated, the plaintext listener is gone, and the archive is
+closed until its owner opens it.
+
+**What this replaced.** Since Phase 6 the archive had two routing tables. The
+TLS listener wanted a device token for everything. The other one — `PLAINTEXT_ADDR`,
+loopback, unencrypted — served the reads *and* the gallery's writes to anybody
+who could open the port: the timeline, every original, the trash, the purge, the
+album writes, the browser upload page, and `POST /v1/vault/unlock`. It existed
+for one honest reason, that the Next app should not have to trust a private CA
+to draw a thumbnail, and it was contained by exactly one thing, that it was
+bound to `127.0.0.1`. Risk 7 said for five phases that widening it was the whole
+risk and that closing it properly was the open design question. Phase 12 tried
+once, with a shared password, and was removed whole for being a house key rather
+than an identity system.
+
+**The credential is a passkey.** WebAuthn, discoverable, `userVerification:
+"required"` — so one Touch ID gesture is both factors, the device and the person
+holding it. There is no shared secret: the authenticator keeps the private half
+and `web_passkeys` stores only the public one, so unlike a password there is
+nothing here to phish, nothing to replay, and nothing a dump of this database
+can be turned into. Registration is authorised either by an enrollment code from
+`photobackup passkey add` — which writes straight to the database, the same
+authority `photobackup pair` rests on — or by an existing session, which is how
+the laptop gets added after the phone.
+
+**Bootstrap is closed, not open.** An archive with no registered passkey refuses
+everything and serves the enrollment page. The alternative — open until somebody
+claims it — is how a machine on a network acquires an owner it did not choose.
+
+**Sessions have two clocks.** An idle window and an absolute cap, and a session
+dies at whichever comes first. The cookie is `__Host-` prefixed, `HttpOnly`,
+`Secure`, `SameSite=Strict`, and carries no `Max-Age`, so closing the browser
+ends it without waiting for either — which is the stated requirement for the
+dashboard. Only the digest of its 256-bit token is stored, exactly as `devices`
+does. Signing out revokes the row rather than dropping the cookie, so it is a
+real revocation.
+
+**One origin, and that is the load-bearing part.** photod terminates TLS,
+authenticates, serves `/v1` and the media itself, and reverse-proxies the Next
+process for everything else. This is the constraint Phase 12 established and
+this phase is built on: *a browser attaches a same-origin cookie to an `<img>`
+and will not attach a bearer header to one.* Any layout that puts the thumbnails
+on a different origin has to solve authentication a second time, with signed
+URLs or a second credential. Serving everything from one place means there is
+nothing to solve — and it is why the Vercel deployment this phase started out
+aimed at was abandoned: the app and the archive cannot be on different origins
+without giving that property up.
+
+**The sign-in page is served by Go.** Not by Next, so an unauthenticated visitor
+receives no application code at all — and so signing in still works while the
+Next process is down, being deployed, or has never been started.
+
+**Recovery codes are load-bearing here specifically.** The passkey this archive
+is used with is a platform credential synced through iCloud Keychain, so the
+realistic loss is the Apple account rather than a device. Ten single-use codes,
+128 bits each, digest-stored, replaced as a set rather than extended — a list
+printed a year ago and long since lost must stop working when a new one is
+printed.
+
+**Two things that came along with it.** `POST /v1/vault/unlock` is rate limited
+now; the old comment argued Argon2id at 64MiB was its own ceiling, which was
+true of a loopback listener and is weaker on one every device can reach. And
+`internal/code` was extracted from `internal/devices`, because a pairing code and
+an enrollment code are the same eight Crockford characters and were about to be
+two implementations of it.
+
+**What did not change.** Device tokens still never expire — PROJECT.md's
+reasoning holds, that a backup which stops overnight is worse than one that runs
+until it is revoked — and revocation plus Keychain storage is what secures them
+instead. The vault stays a separate credential with its own password, because
+folding it under the session would mean an unlocked laptop is an open vault, and
+its whole design is that putting something in must not require the password and
+taking anything out must.
+
 ### v2
 
 - **ML service.** Python, CLIP semantic search, then face detection and clustering.
@@ -1281,25 +1366,22 @@ Cheap to verify now, annoying to discover in Phase 3.
 **6. Battery and heat.** Pushing 100GB will heat the phone significantly. Bulk
 backfill should be gated on charging + Wi-Fi by default, with a manual override.
 
-**7. Unauthenticated gallery.** Open again, deliberately, since the Phase 12
-browser gate was removed. The TLS listener is token-only, so nothing on the LAN
-reads the archive without having been paired — but a browser cannot carry a
-token, which means there is no supported way for a laptop or an iPad in the
-house to open the gallery at all. The plaintext listener is what the development
-gallery talks to, it asks for nothing, and it is bound to loopback; widening
-`PLAINTEXT_ADDR` is still the whole risk. A device token cannot cross it —
-pairing and every authenticated route are absent from its routing table — so
-widening it exposes photographs but never a credential. What it exposes has
-grown by one kind since: the browser upload page puts a new photograph into the
-archive over that listener, which is the first write there that creates rather
-than moves. It is the smaller half of the exposure the trash already opened —
-an unwanted upload is one click from Recently Deleted, where it is recoverable
-for a year — and it is one more thing that only stays contained because the
-address is a loopback one. Closing this properly is
-the open design question the gate's removal reopened, and whatever answers it
-still has to put the app and the media on one origin: a cookie is the only
-credential a browser will attach to an `<img>`. Putting the gallery on the
-internet, which §4 keeps as an option, is a different question again.
+**7. Unauthenticated gallery.** *Closed by Phase 17.* This was the standing
+risk for five phases: the gallery's endpoints were served, with no credential of
+any kind, on a plaintext loopback listener, and the only thing containing them
+was that `PLAINTEXT_ADDR` was bound to `127.0.0.1`. Anyone who could reach that
+port could read every photograph, empty the trash, unlock the vault and add a
+photograph to the archive. Widening it to the LAN — something a laptop or an
+iPad in the house made tempting — was the whole risk, and the entry ended by
+saying that whatever closed it had to put the app and the media on one origin,
+because a cookie is the only credential a browser will attach to an `<img>`.
+
+That is what Phase 17 did. The listener is gone, `requireAuth` takes a passkey
+session or a device token on every route, and photod serves the sign-in page and
+reverse-proxies the gallery so that all of it arrives from one origin under one
+cookie. What is left of this risk is smaller and different in kind: the archive
+is now reachable from any device on the tailnet, so the credential rather than
+the network is what stands between somebody and the photographs. See Risk 10.
 
 **8. Losing `ca.key`.** It is the one file whose loss means physically re-pairing
 every device, and the one whose disclosure lets somebody impersonate the archive
@@ -1311,6 +1393,17 @@ deliberately rsync-friendly and `photobackup verify` detects bit rot, so adding 
 second drive or an encrypted offsite target later requires no code changes. Until
 then, this is an accepted, known risk.
 
+
+**10. Losing every passkey.** The new shape of the old risk, and the reason
+recovery codes exist. The passkey this archive is used with is a platform
+credential synced through iCloud Keychain, so the realistic loss is not a
+dropped phone — it is losing the Apple account that syncs it. Recovery codes are
+the answer and they are only an answer if they are somewhere else: not on the
+archive machine, whose disk is what the vault's Argon2id is defending against,
+and not in the same account. Registering a second authenticator on a different
+platform is the better fix and the one to prefer; `photobackup passkey add` from
+the machine itself is the floor under both, and it works whether or not photod
+is running.
 ---
 
 ## 9. Deliberately not built

@@ -128,7 +128,7 @@ func confirm() (bool, error) {
 // --force; the check earns that by catching the ordinary mistake of resetting
 // while the service is up.
 func daemonAddr(cfg config.Config) (string, bool) {
-	for _, addr := range []string{cfg.ListenAddr, cfg.PlaintextAddr} {
+	for _, addr := range []string{cfg.ListenAddr} {
 		if addr == "" {
 			continue
 		}

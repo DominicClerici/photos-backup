@@ -6,6 +6,11 @@
 // Nothing is imported back the other way at runtime — layout.ts takes only a
 // type from here — so this is a dependency rather than a cycle.
 import { BASE_THUMB_SIZE, type ThumbSize } from "./layout";
+import {
+  decodeCreationOptions,
+  encodeAttestation,
+  type WireCreationOptions,
+} from "./webauthn";
 
 export type MediaKind = "image" | "video";
 export type DerivedState = "pending" | "ready" | "failed";
@@ -108,9 +113,44 @@ class ApiError extends Error {
   }
 }
 
+/**
+ * Every failed response is built here, so that a 401 is noticed exactly once
+ * and in one place.
+ *
+ * photod answers 401 when a session has ended — the idle window elapsed, the
+ * absolute cap was reached, the browser was closed and reopened, or somebody
+ * ran `photobackup web --revoke-all`. There is nothing the gallery can do about
+ * that except go and ask for a new one, and it cannot render anything
+ * meaningful in the meantime: every request it has in flight is about to fail
+ * the same way.
+ *
+ * The sign-in page is served by photod rather than by Next — see
+ * internal/api/frontdoor.go — which is why this is a location assignment rather
+ * than a router push. There is no route on this side to push to.
+ */
+function apiError(status: number, message: string): ApiError {
+  if (status === 401) sessionEnded();
+  return new ApiError(status, message);
+}
+
+/**
+ * Sends the browser to sign in again, remembering where it was.
+ *
+ * Guarded, because a grid firing two hundred thumbnail requests will see two
+ * hundred 401s within a few milliseconds of each other, and each one must not
+ * queue its own navigation.
+ */
+let leaving = false;
+function sessionEnded() {
+  if (leaving || typeof window === "undefined") return;
+  leaving = true;
+  const here = window.location.pathname + window.location.search;
+  window.location.assign(`/signin?next=${encodeURIComponent(here)}`);
+}
+
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, { signal });
-  if (!res.ok) throw new ApiError(res.status, await errorText(res));
+  if (!res.ok) throw apiError(res.status, await errorText(res));
   return res.json() as Promise<T>;
 }
 
@@ -486,7 +526,7 @@ export async function fetchStates(
     body: JSON.stringify({ ids }),
     signal,
   });
-  if (!res.ok) throw new ApiError(res.status, await errorText(res));
+  if (!res.ok) throw apiError(res.status, await errorText(res));
   const body = (await res.json()) as { items: TimelineItem[] };
   return body.items ?? [];
 }
@@ -688,7 +728,7 @@ async function send<T>(path: string, body: unknown, method = "POST"): Promise<T>
     headers: { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!res.ok) throw new ApiError(res.status, await errorText(res));
+  if (!res.ok) throw apiError(res.status, await errorText(res));
   return res.json() as Promise<T>;
 }
 
@@ -1136,7 +1176,7 @@ export function mergeGroup(group: string, keeper: string): Promise<Merged> {
 /** Records that these are different photographs, and stops them being paired again. */
 export async function dismissGroup(group: string): Promise<void> {
   const res = await fetch(`${API_BASE}/v1/merges/${group}/dismiss`, { method: "POST" });
-  if (!res.ok) throw new ApiError(res.status, await errorText(res));
+  if (!res.ok) throw apiError(res.status, await errorText(res));
 }
 
 /** What an undo put back, and what it took away in exchange. */
@@ -1170,7 +1210,7 @@ export function unmergeGroup(group: string): Promise<Unmerged> {
 export async function approveGroup(group: string, approved: boolean): Promise<void> {
   const path = approved ? "approve" : "unapprove";
   const res = await fetch(`${API_BASE}/v1/merges/${group}/${path}`, { method: "POST" });
-  if (!res.ok) throw new ApiError(res.status, await errorText(res));
+  if (!res.ok) throw apiError(res.status, await errorText(res));
 }
 
 /**
@@ -1511,7 +1551,7 @@ export async function checkContent(
     body: JSON.stringify({ sha256 }),
     signal,
   });
-  if (!res.ok) throw new ApiError(res.status, await errorText(res));
+  if (!res.ok) throw apiError(res.status, await errorText(res));
   const body = (await res.json()) as { known: KnownContent[] };
   return body.known ?? [];
 }
@@ -1579,11 +1619,11 @@ export function uploadAsset(file: File, options: UploadOptions = {}): Promise<Up
         try {
           resolve(JSON.parse(req.responseText) as Uploaded);
         } catch {
-          reject(new ApiError(req.status, "the server's answer was not JSON"));
+          reject(apiError(req.status, "the server's answer was not JSON"));
         }
         return;
       }
-      reject(new ApiError(req.status, uploadErrorText(req)));
+      reject(apiError(req.status, uploadErrorText(req)));
     };
     // No status and no body, so there is nothing to report but the fact.
     req.onerror = () => {
@@ -1625,4 +1665,101 @@ function headerSafe(name: string): string {
   // eslint-disable-next-line no-control-regex
   const cleaned = name.replace(/[^\x20-\x7e]/g, "_").trim();
   return cleaned === "" ? "upload" : cleaned;
+}
+
+// ---------------------------------------------------------------------------
+// Signing in, and the credentials behind it.
+//
+// Signing *in* is not here: photod serves that page itself, so that an
+// unauthenticated visitor gets a sign-in form rather than this bundle. See
+// server/internal/api/frontdoor.go. What is here is everything the gallery does
+// once it is already signed in — look at its own session, add an authenticator,
+// withdraw one, and leave.
+// ---------------------------------------------------------------------------
+
+export interface AuthStatus {
+  /** False only on an archive nobody has claimed yet. */
+  enrolled: boolean;
+  signedIn: boolean;
+  /** "passkey" or "recovery". Absent without a session. */
+  method?: string;
+  /** When this session dies if nothing touches it — idle window or cap. */
+  expires?: string;
+  /**
+   * How many recovery codes remain. Withheld from an unauthenticated caller,
+   * so it is absent rather than zero when nobody is signed in.
+   */
+  recoveryRemaining?: number;
+}
+
+export interface Passkey {
+  id: string;
+  label: string;
+  /** "internal" for Touch ID and the like, "usb"/"nfc" for a security key. */
+  transports?: string;
+  createdAt: string;
+  lastUsedAt?: string;
+  revokedAt?: string;
+}
+
+export function fetchAuthStatus(signal?: AbortSignal): Promise<AuthStatus> {
+  return get<AuthStatus>("/v1/auth/status", signal);
+}
+
+export function fetchPasskeys(signal?: AbortSignal): Promise<{ passkeys: Passkey[] }> {
+  return get<{ passkeys: Passkey[] }>("/v1/auth/passkeys", signal);
+}
+
+/**
+ * Withdraws an authenticator, and every session it opened.
+ *
+ * photod refuses to withdraw the last one: an archive reachable only by
+ * recovery code is a state worth being able to get into deliberately from the
+ * command line and not by accident from a menu.
+ */
+export function revokePasskey(id: string): Promise<{ passkeyId: string; sessionsEnded: number }> {
+  return send<{ passkeyId: string; sessionsEnded: number }>(
+    `/v1/auth/passkeys/${encodeURIComponent(id)}`,
+    undefined,
+    "DELETE",
+  );
+}
+
+/**
+ * Replaces the recovery codes and returns the new set. This is the only time
+ * they exist anywhere but on whatever they get written down on.
+ */
+export function mintRecoveryCodes(): Promise<{ codes: string[] }> {
+  return send<{ codes: string[] }>("/v1/auth/recovery-codes", undefined);
+}
+
+/**
+ * Ends this session on the server, then reloads.
+ *
+ * The reload is what actually takes the browser to the sign-in page: photod
+ * guards the app itself, so the next navigation is redirected there. Doing it
+ * this way rather than pushing a route means there is one place that decides
+ * where an unauthenticated browser goes, and it is in Go.
+ */
+export async function signOut(): Promise<void> {
+  await send<unknown>("/v1/auth/logout", undefined);
+  window.location.assign("/signin");
+}
+
+/**
+ * Registers an additional passkey from a browser that is already signed in.
+ *
+ * No enrollment code: whoever holds a live session can already read and delete
+ * the entire archive, so requiring a trip to the terminal to add a second
+ * authenticator would be ceremony rather than security. The codeless path is
+ * photod's AddPasskeyAuthorized.
+ */
+export async function registerPasskey(): Promise<Passkey> {
+  const options = await send<WireCreationOptions>("/v1/auth/register/start", {});
+  const credential = (await navigator.credentials.create({
+    publicKey: decodeCreationOptions(options),
+  })) as PublicKeyCredential | null;
+
+  if (!credential) throw new Error("no passkey was created");
+  return send<Passkey>("/v1/auth/register/finish", encodeAttestation(credential));
 }

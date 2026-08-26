@@ -109,20 +109,21 @@ func TestImportMetadataOnAnUnknownAssetIs404(t *testing.T) {
 	}
 }
 
-// It is a write, and writes are not reachable on the listener that carries no
-// credentials.
-func TestImportMetadataIsRefusedOnThePlaintextListener(t *testing.T) {
+// It is a device write — it says what an export knew about a photograph this
+// phone delivered — so it wants a device token, and a browser session is not
+// one. The gallery's own writes are a different table; see galleryRoutes.
+func TestImportMetadataIsRefusedToABrowserSession(t *testing.T) {
 	h := newHarness(t)
 	uploaded := decodeUpload(t, h.upload(t, loadFixture(t), nil))
 
-	plain := h.plaintext(t)
-	resp, err := http.Post(plain.URL+"/v1/assets/"+uploaded.ID+"/import-metadata",
+	gallery := h.gallery(t)
+	resp, err := http.Post(gallery.URL+"/v1/assets/"+uploaded.ID+"/import-metadata",
 		"application/json", nil)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNoContent {
-		t.Error("the plaintext listener accepted a write")
+		t.Error("a browser session was accepted on a device write")
 	}
 }

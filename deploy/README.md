@@ -372,16 +372,17 @@ step the phone's mDNS scan finds the server and every connection to it times out
 which looks exactly like photod not running.
 
 ```sh
-sudo firewall-cmd --permanent --add-port=8787/tcp     # photod, HTTPS: pairing and uploads
+sudo firewall-cmd --permanent --add-port=8787/tcp     # photod, HTTPS: everything
 sudo firewall-cmd --permanent --add-port=5353/udp     # mDNS, for Avahi to answer
 sudo firewall-cmd --reload
 ```
 
-Port 8788 stays closed. That is the read-only plaintext listener, bound to
-127.0.0.1 for the Next app and the CLI — it is the one way into the archive that
-asks for nothing, so opening it would put the whole archive on the LAN
-unauthenticated, which is a decision, not a step (see "What is still open"
-below).
+Port 3000 stays closed. That is the Next process, bound to 127.0.0.1, and photod
+reverse-proxies it — reaching it directly would serve the gallery bundle to
+anyone who asked, because the guard is in photod and not in Next.
+
+There is no longer an 8788 to keep closed. The unauthenticated plaintext
+listener that used to live there is gone; see "What is still open" below.
 
 `photobackup ca --serve` needs one port open for as long as the transfer takes:
 
@@ -571,9 +572,9 @@ All four stores go together because any one of them left behind would undo the
 others: `reindex` rebuilds the database from `manifest.jsonl`, so emptying
 Postgres alone means the next reindex puts the entire library straight back.
 
-Two guards. It refuses to run while something is listening on `LISTEN_ADDR` or
-`PLAINTEXT_ADDR` — stop photod first, or pass `--force` if that socket is not
-this archive's daemon. And it refuses outright if `TLS_DIR` sits inside anything
+Two guards. It refuses to run while something is listening on `LISTEN_ADDR` —
+stop photod first, or pass `--force` if that socket is not this archive's
+daemon. And it refuses outright if `TLS_DIR` sits inside anything
 it would remove, which is the configuration where a reset would take `ca.key`
 with it and silently unpair every device.
 
@@ -597,20 +598,30 @@ only for a scripted rebuild.
 
 ## What is still open
 
-The read endpoints are authenticated on 8787 and open on 8788. A phone reads the
-gallery with the same device token it uploads with; the Next app on this machine
-reads without a token, over loopback, which is what keeps a development browser
-from having to trust a private CA to draw a thumbnail.
+Every endpoint on 8787 is authenticated, and there is nothing else. A phone
+reads and writes with the device token it paired with; a browser reads and acts
+on the gallery with a passkey session. `requireAuth` takes either.
 
-So 8788 is the only unauthenticated way into the archive, and everything that
-protects it is the fact that it is bound to `127.0.0.1` and left out of the
-firewall. Widening `PLAINTEXT_ADDR` puts the whole archive on the LAN for anyone
-who asks. It still cannot leak a credential — the plaintext listener serves
-neither pairing nor any authenticated route — but there is no browser-facing
-authentication in front of it either: reaching the gallery from another machine
-on the LAN is not something this deployment supports today.
+There used to be a second listener on 8788 that served the read path and the
+gallery's writes with no credential at all — the only unauthenticated way into
+the archive, and safe only because it was bound to `127.0.0.1` and left out of
+the firewall. It is gone. Reaching the gallery from another machine is now
+something this deployment supports rather than something it cannot survive:
+photod serves the sign-in page, the bundle, the JSON and the media from one
+origin behind one guard.
 
-`/health` is unauthenticated on both, on purpose: the app pings a remembered
+Two things follow from that, and both are worth knowing before the first
+restart:
+
+- **Enroll a passkey before restarting into the new binary.** An archive with
+  none is closed, not open. `photobackup passkey add` mints an enrollment code,
+  and it writes straight to the database, so it works whether or not photod is
+  running.
+- **`WEB_ORIGIN` is permanent in practice.** A passkey is bound to the origin it
+  was registered under, which is what makes it unphishable and what makes
+  changing this setting mean re-registering every credential.
+
+`/health` is unauthenticated, on purpose: the app pings a remembered
 address to see whether it still answers, which it has to be able to do before it
 has a token and after one has been revoked.
 
@@ -667,12 +678,19 @@ bind. Set `MDNS_DISABLED=1` and let Avahi advertise:
 ```sh
 systemctl status photod
 journalctl -u photod -f
-curl -s localhost:8788/health                        # the plaintext read listener
+systemctl status photoweb                            # the gallery, behind photod
 curl -s --cacert /var/lib/photod/tls/ca.crt https://localhost:8787/health
 
-# The gallery reads without a token only on 8788. On 8787 they answer 401.
-curl -s localhost:8788/v1/timeline?limit=1
+# Every read wants a credential now. Without one this is 401, which is the
+# check: a 200 here would mean the guard is not in front of the archive.
 curl -si --cacert /var/lib/photod/tls/ca.crt https://localhost:8787/v1/timeline | head -1
+
+# What the sign-in page reads to decide what to offer. "enrolled":false means
+# no passkey is registered and nothing can sign in — run `photobackup passkey add`.
+curl -s --cacert /var/lib/photod/tls/ca.crt https://localhost:8787/v1/auth/status
+
+photobackup-admin passkey list            # registered authenticators, and recovery codes left
+photobackup-admin web                     # open browser sessions
 
 photobackup-admin verify                  # fast: stat only
 photobackup-admin verify --deep           # slow: re-hashes the whole archive

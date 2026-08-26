@@ -25,6 +25,9 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
 	"github.com/dominicclerici/photos-backup/server/internal/vault"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
+	"github.com/dominicclerici/photos-backup/server/internal/webauth"
+
+	lib "github.com/go-webauthn/webauthn/webauthn"
 )
 
 type Server struct {
@@ -46,6 +49,19 @@ type Server struct {
 	// answer 503 rather than running unauthenticated, so forgetting to wire it
 	// takes the archive offline instead of opening it.
 	Devices *devices.Store
+	// Web authenticates the browser: passkeys, sessions, and the codes that
+	// bootstrap and recover them. Without it every guarded route answers 401 to
+	// a cookie and the archive is reachable only by a paired device — which is
+	// the same fail-closed rule Devices follows, from the other side.
+	Web *webauth.Store
+	// WebAuthn is the relying party: which origin this archive answers as, and
+	// therefore which origin a passkey is bound to. Built from WEB_ORIGIN; nil
+	// when that is unset, and then the sign-in endpoints answer 503 rather than
+	// verifying assertions against a name nobody configured.
+	WebAuthn *lib.WebAuthn
+	// Ceremonies holds the two-minute state between halves of a WebAuthn
+	// exchange. In memory, and a restart is allowed to lose it.
+	Ceremonies *webauth.Ceremonies
 	// Uploads holds partially-received originals. Optional: without it the
 	// resumable endpoints answer 404 and single-shot uploads still work, which
 	// is the right degradation for a server whose staging directory is gone.
@@ -86,8 +102,9 @@ type Server struct {
 	Tools []Tool
 	Log   *slog.Logger
 
-	pairOnce    sync.Once
-	pairLimiter *attemptLimiter
+	// limiters holds the per-credential attempt limiters, built on first use.
+	// See Server.limiter.
+	limiters sync.Map
 	// vocab holds the archive's own people and place names, which the query
 	// parser is only allowed to recognise things from. See search.go.
 	vocab vocabularyCache
@@ -122,84 +139,46 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/uploads/{id}", s.requireDevice(s.handleAbortUpload))
 
 	// A read, but not one readRoutes can carry. Every other read answers the
-	// same thing to every paired device, which is why guard drops the identity
-	// and why a device id only ever reaches the database through a
-	// deviceHandler. This one is scoped to who is asking, so it takes the
-	// authenticated path instead of widening guard to smuggle an identity
-	// through the read routes.
+	// same thing to every caller, which is why guard drops the identity and why
+	// a device id only ever reaches the database through a deviceHandler. This
+	// one is scoped to which phone is asking, so it takes the device path.
 	//
-	// The cost is that the plaintext listener cannot serve it, so the browser
-	// gallery cannot read these numbers. It does not show them today, and an
-	// unauthenticated archive-wide variant for it is a separate decision.
+	// The cost is that a browser cannot read these numbers, because a browser
+	// has no device id to be scoped to. It does not show them today, and an
+	// archive-wide variant for it is a separate decision.
 	mux.HandleFunc("GET /v1/stats", s.requireDevice(s.handleStats))
 
-	// Reads are authenticated here and open on the plaintext listener. Which
-	// listener a request arrived on is the whole of the difference, so it is
-	// settled once, at the routing table, rather than sampled inside handlers.
-	s.readRoutes(mux, s.requireToken)
-	s.galleryRoutes(mux, s.requireToken)
-	return mux
-}
+	// How a browser signs in. The only routes here that answer somebody holding
+	// no credential, and the reason the rest can refuse everyone else.
+	s.authRoutes(mux)
 
-// PlaintextHandler serves only what is safe to send in the clear: the gallery's
-// own endpoints and health.
-//
-// The device endpoints are present but refuse, and pairing is absent entirely,
-// so a device token cannot travel unencrypted no matter where this listener is
-// bound. That is a property of the routing table rather than of a check inside a
-// handler, which is why widening PLAINTEXT_ADDR to the LAN — a thing the gallery
-// may legitimately want — cannot accidentally expose a credential.
-//
-// What it does expose is the archive, unauthenticated, to anyone who can reach
-// it. Since Phase 6 that is the only place the archive is readable without a
-// token, which is why PLAINTEXT_ADDR stays on loopback: the browser gallery
-// reaches it through the Next.js rewrite from the same machine, and nothing else
-// should.
-func (s *Server) PlaintextHandler() http.Handler {
-	mux := http.NewServeMux()
-
-	for _, route := range []string{
-		"POST /v1/pair",
-		"POST /v1/sync/check",
-		"POST /v1/assets",
-		"POST /v1/assets/{id}/import-metadata",
-		"POST /v1/import/orphans",
-		"POST /v1/uploads",
-		"GET /v1/uploads/{id}",
-		"PUT /v1/uploads/{id}",
-		"POST /v1/uploads/{id}/commit",
-		"DELETE /v1/uploads/{id}",
-		// Not a write, but it needs a device token to know whose stats to
-		// report, and a token is exactly what this listener will not accept.
-		"GET /v1/stats",
-	} {
-		mux.HandleFunc(route, refuseInsecure)
-	}
-
-	s.readRoutes(mux, openToAnyone)
-	s.galleryRoutes(mux, openToAnyone)
+	// Reads and the gallery's writes, behind the guard that takes either
+	// credential. There is one routing table now: until this phase there were
+	// two, and the second one — PlaintextHandler — served all of this to
+	// anybody who could open a loopback port. Moving the gallery off that port
+	// is what let it be deleted.
+	s.readRoutes(mux, s.requireAuth)
+	s.galleryRoutes(mux, s.requireAuth)
 	return mux
 }
 
 // galleryRoutes are the writes the browser makes: delete, restore, purge, the
 // vault, and making and filling albums.
 //
-// They are here rather than beside the upload endpoints because of what they
-// are not. Every route above is about a device — it carries a token, it names a
-// local id, it says which phone is asking — and refusing all of them on the
-// plaintext listener is what keeps a credential off the wire. These carry no
-// credential and name no device. They are the gallery acting on the archive,
-// and the gallery is a browser on this machine talking to a loopback port.
+// They are separate from the upload endpoints above because of what they are
+// not. Every route up there is about a device — it carries a token, it names a
+// local id, it says which phone is asking — and a device id reaches the
+// database only through a deviceHandler. These name no device. They are the
+// gallery acting on the archive, whoever is holding it.
 //
-// Which means the guard here is the same one the reads get, and the exposure is
-// the same exposure: anyone who can reach PLAINTEXT_ADDR can already read every
-// photograph in the archive, and can now also move them to the trash. That is a
-// widening, and it is why PLAINTEXT_ADDR stays on loopback — the trash is
-// undoable for a year, but "readable by anyone on the LAN" and "deletable by
-// anyone on the LAN" are not the same sentence. Authenticating the gallery was
-// the fix, and it is done — on the TLS listener, where a browser signs in with
-// the gallery password and gets a cookie these routes accept. This listener did
-// not change: it is loopback, and it is open.
+// For most of this project's life that meant they were unauthenticated: they
+// sat on a loopback listener with no credential at all, and the comment here
+// used to say that authenticating the gallery was the fix and that it was done.
+// It was not — Phase 12 built a shared password and it was removed again. It is
+// done now, and this is what it means: the guard on these is requireAuth, the
+// same one the reads get, and it takes a passkey session or a device token.
+// There is no longer any address from which this table is reachable without
+// one.
 func (s *Server) galleryRoutes(mux *http.ServeMux, allow guard) {
 	// The browser's upload, which is the one write in this table that creates a
 	// photograph rather than moving one. It is here and not beside POST
@@ -301,13 +280,11 @@ func (s *Server) galleryRoutes(mux *http.ServeMux, allow guard) {
 	mux.HandleFunc("GET /v1/vault/{bucket}/timeline/locate", allow(s.handleVaultLocate))
 }
 
-// guard decides who may call a read route. There are two: a device token, or
-// nobody in particular.
+// guard decides who may call a route. There is one — requireAuth — and this
+// stays a parameter rather than being called directly so that the two tables
+// below keep saying, at the routing table rather than inside a handler, that
+// every route in them is guarded.
 type guard func(http.HandlerFunc) http.HandlerFunc
-
-// openToAnyone is the plaintext listener's guard. Named rather than passed as a
-// bare identity function so the call site reads as a decision.
-func openToAnyone(next http.HandlerFunc) http.HandlerFunc { return next }
 
 // readRoutes are the endpoints the gallery is built on, plus health.
 //

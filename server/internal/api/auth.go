@@ -66,22 +66,9 @@ func (s *Server) requireDevice(next deviceHandler) http.HandlerFunc {
 	}
 }
 
-// requireToken guards a route that needs the caller to be a paired device but
-// has no use for which one — the read path, where every device sees the same
-// archive.
-//
-// It is requireDevice with the identity dropped rather than a second
-// implementation, so revocation, an unrecognised token and a database outage all
-// answer identically on both paths, and so the rule that a device id only ever
-// reaches the database through a deviceHandler still holds.
-func (s *Server) requireToken(next http.HandlerFunc) http.HandlerFunc {
-	return s.requireDevice(func(w http.ResponseWriter, r *http.Request, _ devices.Device) {
-		next(w, r)
-	})
-}
-
-// handlePair exchanges a pairing code for a device token. It is served only on
-// the TLS listener, so the token it returns cannot be handed out in the clear.
+// handlePair exchanges a pairing code for a device token. Everything this
+// server serves is now behind TLS on one listener, so the token it returns
+// cannot be handed out in the clear.
 func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	if s.Devices == nil {
 		writeError(w, http.StatusServiceUnavailable, "device authentication is not configured on this server")
@@ -129,17 +116,6 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 		"token":      token,
 		"serverName": host,
 	})
-}
-
-// refuseInsecure answers the write endpoints on the plaintext listener.
-//
-// They are not merely absent there: a 404 on POST /v1/assets would read as a
-// server too old to accept uploads, which is a bad half hour with a phone in
-// hand. This says what is actually wrong.
-func refuseInsecure(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Upgrade", "TLS/1.2")
-	writeError(w, http.StatusUpgradeRequired,
-		"this endpoint is only served over HTTPS; a device token is never accepted on an unencrypted connection")
 }
 
 // ownedBy reports whether an upload session belongs to the device asking about
@@ -209,17 +185,67 @@ const (
 	pairAttemptsPerIP = 10
 	pairAttemptsTotal = 40
 	pairWindow        = 5 * time.Minute
-	// pairMaxKeys bounds the map. Reached only by something spraying from many
-	// addresses, and at that point the global limit is doing the work anyway.
-	pairMaxKeys = 1024
 )
 
+// Sign-in attempt limits. Lower than pairing's, because unlike a pairing code
+// these guard credentials somebody might actually sit and guess at: an
+// enrollment code is 40 bits and a recovery code is one of ten live values.
+// Neither is guessable either, and this is again about noticing rather than
+// preventing — a log line per rejected attempt is how a real one becomes
+// visible.
+const (
+	signInAttemptsPerIP = 20
+	signInAttemptsTotal = 60
+	signInWindow        = 5 * time.Minute
+)
+
+// Vault unlock limits. internal/api/vault.go used to argue that Argon2id at
+// 64MiB is its own ceiling and no limiter was needed, and on a loopback-only
+// listener that was true. It is weaker now that the endpoint is reachable from
+// every device on the tailnet, so the ceiling gets a floor under it. The cost is
+// nothing: nobody types a vault password twelve times in five minutes.
+const (
+	vaultAttemptsPerIP = 12
+	vaultAttemptsTotal = 30
+	vaultWindow        = 5 * time.Minute
+)
+
+// pairMaxKeys bounds a limiter's map. Reached only by something spraying from
+// many addresses, and at that point the global limit is doing the work anyway.
+const pairMaxKeys = 1024
+
 func (s *Server) pairing() *attemptLimiter {
-	s.pairOnce.Do(func() { s.pairLimiter = &attemptLimiter{} })
-	return s.pairLimiter
+	return s.limiter("pair", pairAttemptsPerIP, pairAttemptsTotal, pairWindow)
+}
+
+// signIn limits the browser credentials: enrollment codes, recovery codes, and
+// failed assertions. One bucket rather than three, because they are three ways
+// of asking the same door to open and somebody working through all of them
+// should not get three budgets.
+func (s *Server) signIn() *attemptLimiter {
+	return s.limiter("signin", signInAttemptsPerIP, signInAttemptsTotal, signInWindow)
+}
+
+func (s *Server) vaultUnlocks() *attemptLimiter {
+	return s.limiter("vault", vaultAttemptsPerIP, vaultAttemptsTotal, vaultWindow)
+}
+
+// limiter returns the named limiter, building it on first use. Named rather than
+// a field per caller so that adding a fourth guarded credential is one function
+// rather than another sync.Once.
+func (s *Server) limiter(name string, perIP, total int, window time.Duration) *attemptLimiter {
+	if v, ok := s.limiters.Load(name); ok {
+		return v.(*attemptLimiter)
+	}
+	v, _ := s.limiters.LoadOrStore(name, &attemptLimiter{perIPLimit: perIP, totalLimit: total, window: window})
+	return v.(*attemptLimiter)
 }
 
 type attemptLimiter struct {
+	perIPLimit int
+	totalLimit int
+	window     time.Duration
+
 	mu     sync.Mutex
 	perIP  map[string][]time.Time
 	global []time.Time
@@ -232,7 +258,7 @@ func (l *attemptLimiter) allow(ip string) (time.Duration, bool) {
 	defer l.mu.Unlock()
 
 	now := time.Now()
-	cutoff := now.Add(-pairWindow)
+	cutoff := now.Add(-l.window)
 	if l.perIP == nil {
 		l.perIP = make(map[string][]time.Time)
 	}
@@ -243,11 +269,11 @@ func (l *attemptLimiter) allow(ip string) (time.Duration, bool) {
 	l.global = recent(l.global, cutoff)
 	mine := recent(l.perIP[ip], cutoff)
 
-	if len(mine) >= pairAttemptsPerIP {
-		return pairWindow - now.Sub(mine[0]), false
+	if len(mine) >= l.perIPLimit {
+		return l.window - now.Sub(mine[0]), false
 	}
-	if len(l.global) >= pairAttemptsTotal {
-		return pairWindow - now.Sub(l.global[0]), false
+	if len(l.global) >= l.totalLimit {
+		return l.window - now.Sub(l.global[0]), false
 	}
 
 	l.perIP[ip] = append(mine, now)

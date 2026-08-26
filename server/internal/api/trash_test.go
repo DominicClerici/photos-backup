@@ -330,12 +330,12 @@ func TestSelectionRejectsTwoCollectionsAtOnce(t *testing.T) {
 
 // The gallery reaches photod through the plaintext loopback listener, so its
 // writes have to be served there or the browser cannot delete anything.
-func TestTheGalleryCanDeleteOverThePlaintextListener(t *testing.T) {
+func TestTheGalleryCanDeleteWithASession(t *testing.T) {
 	h := newHarness(t)
 	ids := seedThree(t, h)
-	plain := h.plaintext(t)
+	gallery := h.gallery(t)
 
-	resp, err := plain.Client().Post(plain.URL+"/v1/trash", "application/json",
+	resp, err := gallery.Client().Post(gallery.URL+"/v1/trash", "application/json",
 		strings.NewReader(fmt.Sprintf(`{"ids":[%q]}`, ids[0])))
 	if err != nil {
 		t.Fatalf("POST /v1/trash: %v", err)
@@ -354,19 +354,20 @@ func TestTheGalleryCanDeleteOverThePlaintextListener(t *testing.T) {
 	}
 }
 
-// The upload path is the one that carries a device token, and no amount of
-// gallery writing may make it reachable in the clear.
-func TestThePlaintextListenerStillRefusesUploads(t *testing.T) {
+// The upload path names a device, and no amount of gallery writing may make it
+// reachable by something that is not one. A session can trash a photograph and
+// still cannot deliver one through the phone's endpoint.
+func TestTheDeviceUploadPathRefusesASession(t *testing.T) {
 	h := newHarness(t)
-	plain := h.plaintext(t)
+	gallery := h.gallery(t)
 
-	resp, err := plain.Client().Post(plain.URL+"/v1/assets", "application/octet-stream",
+	resp, err := gallery.Client().Post(gallery.URL+"/v1/assets", "application/octet-stream",
 		strings.NewReader("bytes"))
 	if err != nil {
 		t.Fatalf("POST /v1/assets: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-		t.Errorf("the plaintext listener accepted an upload: %d", resp.StatusCode)
+		t.Errorf("a browser session was accepted on the device upload path: %d", resp.StatusCode)
 	}
 }

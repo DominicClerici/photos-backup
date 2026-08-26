@@ -14,7 +14,8 @@
 #
 #   sudo install -m 0755 deploy/photobackup-admin /usr/local/bin/
 #
-# Usage: photobackup-admin <pair|devices|ca|verify|export|reindex|geocode|import|reset|migrate> [args...]
+# Usage: photobackup-admin <pair|devices|ca|passkey|recovery|web|verify|export|
+#                          reindex|geocode|import|reset|migrate> [args...]
 #        photobackup-admin redeploy [--src DIR] [--no-db] [--dry-run]
 #
 # `redeploy` is the one subcommand that is not a photobackup subcommand. It
@@ -52,17 +53,21 @@ UNITS_CHANGED=
 
 redeploy_usage() {
 	cat >&2 <<'EOF'
-usage: photobackup-admin redeploy [--src DIR] [--no-db] [--dry-run]
+usage: photobackup-admin redeploy [--src DIR] [--no-db] [--no-web] [--dry-run]
 
-Rebuild photod and photobackup from the source tree, sync the systemd units,
-cycle the Postgres container, apply any pending database migrations, and
-restart photod. Everything is built before anything is stopped, so a tree that
-does not compile leaves the running service exactly where it was.
+Rebuild photod, photobackup and the gallery from the source tree, sync the
+systemd units, cycle the Postgres container, apply any pending database
+migrations, and restart photod and photoweb. Everything is built before
+anything is stopped, so a tree that does not compile leaves the running
+services exactly where they were.
 
   --src DIR   repository to build from. Defaults to $PHOTOBACKUP_SRC, then to
               the repository containing the current directory.
   --no-db     leave the database alone. For a Postgres that this compose file
               does not own, or a deploy that must not interrupt it.
+  --no-web    leave the gallery alone. Skipped automatically on a machine that
+              has not deployed it, so this is for skipping a slow npm build on
+              one that has.
   --dry-run   print what would happen and change nothing.
 EOF
 }
@@ -126,22 +131,45 @@ install_atomic() {
 	run sudo mv -f "$_dest.new" "$_dest"
 }
 
-# The read-only listener answers /health without a token, which makes it the
-# one check that proves photod came back up rather than merely started.
+# /health is unauthenticated — the phone pings a remembered address to see
+# whether it still answers, which it must be able to do before it has a token
+# and after one has been revoked. That makes it the one check proving photod
+# came back up rather than merely started.
+#
+# It used to read PLAINTEXT_ADDR and default to 127.0.0.1:8788. Both were gone:
+# Phase 17 removed the plaintext listener along with the shared gallery
+# password, and the setting with it. Nothing has listened on 8788 since, so this
+# spent fifteen seconds polling a closed port and then failed every successful
+# deploy. It is one origin now, the same one everything else uses.
 health_addr() {
-	addr=$(sudo awk -F= '/^[[:space:]]*PLAINTEXT_ADDR[[:space:]]*=/ {
+	addr=$(sudo awk -F= '/^[[:space:]]*LISTEN_ADDR[[:space:]]*=/ {
 		gsub(/[[:space:]]/, "", $2); print $2; exit }' "$ENV_FILE" 2>/dev/null || true)
-	[ -n "$addr" ] || addr=127.0.0.1:8788
+	[ -n "$addr" ] || addr=127.0.0.1:8787
 	case $addr in
 	:*) addr=127.0.0.1$addr ;;
+	# 0.0.0.0 and [::] are bind addresses, not places to dial.
+	0.0.0.0:*) addr=127.0.0.1:${addr#*:} ;;
+	\[::\]:*) addr=127.0.0.1:${addr##*:} ;;
 	esac
 	printf '%s\n' "$addr"
 }
 
+# https now, and verified rather than skipped: photod's certificate is issued by
+# its own CA, which is exactly the CA sitting in TLS_DIR. Reading it needs root
+# because that directory is 0700 photod, and sudo is already cached by here.
+tls_dir() {
+	dir=$(sudo awk -F= '/^[[:space:]]*TLS_DIR[[:space:]]*=/ {
+		gsub(/[[:space:]]/, "", $2); print $2; exit }' "$ENV_FILE" 2>/dev/null || true)
+	[ -n "$dir" ] || dir=/var/lib/photod/tls
+	printf '%s\n' "$dir"
+}
+
 wait_healthy() {
+	_ca=$(tls_dir)/ca.crt
 	i=0
 	while [ "$i" -lt 30 ]; do
-		if curl -sf --max-time 2 "http://$1/health" >/dev/null 2>&1; then
+		if sudo curl -sf --max-time 2 --cacert "$_ca" \
+			"https://$1/health" >/dev/null 2>&1; then
 			return 0
 		fi
 		i=$((i + 1))
@@ -257,6 +285,195 @@ db_failed() {
 	echo "    photobackup-admin migrate && sudo systemctl start photod" >&2
 }
 
+# --------------------------------------------------------------- the gallery ---
+
+# The Next bundle, which is deployed the way photo-ml's venv is not: it is small,
+# it is built from this same tree, and it goes stale in lockstep with the API it
+# calls. So unlike the 4GB venv, rebuilding it on every redeploy is cheap enough
+# to be the default.
+#
+# It builds as the invoking user for the reason the Go binaries do — the npm
+# cache belongs to that user, and photoweb has no shell, no toolchain and no
+# read access to the repository.
+WEB_DEST=/opt/photoweb
+NO_WEB=
+WEB_STAGE=
+
+# Resolved before anything is stopped, like db_detect and for the same reason: a
+# missing toolchain should cost nothing but the time it took to find out.
+#
+# Every path out of here is a skip rather than a failure. A machine that never
+# installed the gallery is the normal case — photod serves the API alone
+# perfectly well, and frontdoor.go degrades to exactly that — so redeploy
+# replaces a deployment here too, it does not perform the first one.
+web_detect() {
+	if [ -n "$NO_WEB" ]; then
+		return 0
+	fi
+	if [ ! -d "$1/web" ]; then
+		echo "  note: no $1/web — leaving the gallery alone" >&2
+		return 0
+	fi
+	if [ ! -d "$WEB_DEST" ]; then
+		echo "  note: $WEB_DEST does not exist — the gallery has not been deployed here" >&2
+		echo "        run deploy/photoweb-deploy once to create it, then redeploy" >&2
+		NO_WEB=yes
+		return 0
+	fi
+	if ! command -v npm >/dev/null 2>&1; then
+		echo "  note: npm is not on PATH — leaving the gallery alone" >&2
+		NO_WEB=yes
+		return 0
+	fi
+	if ! command -v rsync >/dev/null 2>&1; then
+		echo "  note: rsync is not on PATH — leaving the gallery alone" >&2
+		NO_WEB=yes
+		return 0
+	fi
+
+}
+
+# photod finds the gallery through WEB_APP_URL and the gallery binds PORT, and
+# nothing else makes the two agree. When they disagree photod does not error —
+# it either reverse-proxies whatever else happens to be on that port, from the
+# archive's own origin behind the archive's own session, or it answers 502 for
+# a gallery that was never there. An unrelated dev server on 3000 is the first;
+# a WEB_APP_URL pointed at a port nothing listens on is the second.
+#
+# Deliberately not part of web_detect's skip chain. It was, and that was
+# backwards: the check got suppressed precisely when the gallery was not
+# deployed, which is exactly the case where WEB_APP_URL is most likely to be
+# pointing at nothing. A misconfigured URL is worth reporting whether or not
+# there is a gallery to go with it.
+web_check_url() {
+	# -n rather than a prompt, for the reason db_detect gives: this runs before
+	# sudo -v on a --dry-run, and a dry run must not start asking for passwords.
+	if ! sudo -n test -r "$ENV_FILE" 2>/dev/null; then
+		# Say nothing rather than something wrong. Reporting "WEB_APP_URL is
+		# unset" when the file simply could not be opened is the more expensive
+		# mistake — it is the one setting that silently points photod at
+		# another process entirely.
+		return 0
+	fi
+	_want=$(web_port "$1")
+	_have=$(sudo -n awk -F= '/^[[:space:]]*WEB_APP_URL[[:space:]]*=/ {
+		gsub(/[[:space:]]/, "", $2); print $2; exit }' "$ENV_FILE" 2>/dev/null || true)
+	case $_have in
+	*:"$_want")
+		# Agreed on the port. Whether anything is actually listening there is
+		# web_healthy's question, after the restart.
+		;;
+	"")
+		# Not "no gallery". config.FromEnv falls back to
+		# http://127.0.0.1:3000 when this is unset or empty, so an
+		# unconfigured photod proxies whatever is on 3000 — which on a machine
+		# somebody writes code on is whichever dev server started first, served
+		# from the archive's own origin behind the archive's own session.
+		echo "  warning: WEB_APP_URL is not set in $ENV_FILE" >&2
+		echo "           photod falls back to http://127.0.0.1:3000, not to serving no gallery." >&2
+		echo "           fix: add WEB_APP_URL=http://127.0.0.1:$_want" >&2
+		;;
+	*)
+		echo "  warning: photoweb.service binds $_want, but WEB_APP_URL is $_have" >&2
+		echo "           photod will proxy whatever is on that port, or 502 if nothing is." >&2
+		echo "           fix: WEB_APP_URL=http://127.0.0.1:$_want in $ENV_FILE" >&2
+		;;
+	esac
+}
+
+# Reported apart from photod's health because the two failures are not the same
+# size: photod is the archive, and a gallery that will not start is a browser
+# with nothing to draw rather than a phone that cannot back up.
+web_healthy() {
+	if [ -n "$NO_WEB" ] || [ -n "$DRY" ]; then
+		return 0
+	fi
+	_port=$(web_port "$1")
+	if ! command -v curl >/dev/null 2>&1; then
+		step "gallery restarted (curl not found, health not checked)"
+		return 0
+	fi
+	i=0
+	while [ "$i" -lt 30 ]; do
+		if curl -sf --max-time 2 -o /dev/null "http://127.0.0.1:$_port/"; then
+			step "gallery is up on 127.0.0.1:$_port"
+			return 0
+		fi
+		i=$((i + 1))
+		sleep 0.5
+	done
+	echo >&2
+	echo "photobackup-admin: the gallery did not answer http://127.0.0.1:$_port/" >&2
+	echo "  photod is up and serving the API; the gallery is what is down." >&2
+	sudo journalctl -u photoweb --no-pager --lines=30 >&2 || true
+	return 1
+}
+
+# web_port reads the number out of the unit rather than repeating it, so the
+# port lives in exactly one place. photod finds the same process through
+# WEB_APP_URL; the two disagreeing is the failure this avoids.
+web_port() {
+	_p=$(sed -n 's/^Environment=PORT=\([0-9][0-9]*\)$/\1/p' "$1/deploy/photoweb.service" | head -1)
+    [ -n "$_p" ] || _p=8790
+	printf '%s\n' "$_p"
+}
+
+# web_build runs before anything is stopped. next build with output:
+# "standalone" traces the server's imports into .next/standalone, but leaves the
+# client assets where they were — so .next/static has to be carried across by
+# hand. A gallery deployed without it renders once and then loads no JavaScript
+# and no CSS at all, which looks like a broken app rather than a broken deploy.
+web_build() {
+	if [ -n "$NO_WEB" ]; then
+		return 0
+	fi
+	step "building the gallery"
+	WEB_STAGE=$2/web
+	if [ -n "$DRY" ]; then
+		printf '  would: npm --prefix %s/web run build\n' "$1"
+		# Staged so the rsync a dry run prints is the one it would run.
+		mkdir -p "$WEB_STAGE" && : >"$WEB_STAGE/server.js"
+		return 0
+	fi
+	( cd "$1/web" && npm run build ) || return 1
+
+	[ -f "$1/web/.next/standalone/server.js" ] ||
+		die "redeploy: no standalone server was produced — is output: \"standalone\" still set in web/next.config.ts?"
+
+	mkdir -p "$WEB_STAGE/.next"
+	cp -a "$1/web/.next/standalone/." "$WEB_STAGE/"
+	cp -a "$1/web/.next/static" "$WEB_STAGE/.next/static"
+	[ -d "$1/web/public" ] && cp -a "$1/web/public" "$WEB_STAGE/public"
+	return 0
+}
+
+# web_install swaps the tree and restarts. Deliberately after photod is up: the
+# gallery failing must not hold the API down with it, and photod answers 502
+# through frontdoor.go while this is between versions rather than failing.
+web_install() {
+	if [ -n "$NO_WEB" ]; then
+		return 0
+	fi
+	# Never a bare "$WEB_STAGE/" without this. An unset stage expands to "/",
+	# which would make the line below an rsync --delete of the root filesystem
+	# into $WEB_DEST. It cannot happen on the path web_build takes today; it is
+	# one early return away from happening, and the blast radius is the whole
+	# machine, so the invariant is asserted rather than reasoned about.
+	[ -n "$WEB_STAGE" ] && [ -f "$WEB_STAGE/server.js" ] ||
+		die "redeploy: the gallery was never staged — refusing to sync $WEB_DEST"
+
+	step "installing the gallery"
+	# --delete so a file that stopped being part of the build stops being
+	# served; the cache is excluded because it is the one thing under there
+	# the running process owns.
+	run sudo rsync -a --delete --exclude '.next/cache' "$WEB_STAGE/" "$WEB_DEST/"
+	run sudo chown -R photoweb:photoweb "$WEB_DEST"
+	run sudo install -d -o photoweb -g photoweb -m 0755 "$WEB_DEST/.next/cache"
+
+	step "restarting the gallery"
+	run sudo systemctl restart photoweb
+}
+
 redeploy() {
 	src=${PHOTOBACKUP_SRC:-}
 
@@ -273,6 +490,10 @@ redeploy() {
 			;;
 		--no-db)
 			NO_DB=yes
+			shift
+			;;
+		--no-web)
+			NO_WEB=yes
 			shift
 			;;
 		--dry-run)
@@ -308,6 +529,8 @@ redeploy() {
 	[ -n "$DRY" ] || sudo -v
 
 	db_detect "$src"
+	web_detect "$src"
+	web_check_url "$src"
 
 	stage=$(mktemp -d) || die "redeploy: cannot create a build directory"
 	trap 'rm -rf "$stage"' EXIT INT TERM
@@ -316,6 +539,10 @@ redeploy() {
 	step "building"
 	go build -C "$src/server" -o "$stage/photod" ./cmd/photod
 	go build -C "$src/server" -o "$stage/photobackup" ./cmd/photobackup
+
+	# Same contract as the Go build above: before the stop, so a gallery that
+	# does not compile costs nothing but the time it took to find out.
+	web_build "$src" "$stage" || die "redeploy: the gallery did not build — nothing was changed"
 
 	step "syncing units"
 	sync_unit "$src/deploy/photod.service" "$UNIT_DIR/photod.service"
@@ -327,6 +554,7 @@ redeploy() {
 	# § photo-ml — because rebuilding a 4GB venv is not something a two-second
 	# photod redeploy should do on every run.
 	sync_unit "$src/deploy/photo-ml.service" "$UNIT_DIR/photo-ml.service"
+	sync_unit "$src/deploy/photoweb.service" "$UNIT_DIR/photoweb.service"
 	sync_unit "$src/deploy/photobackup.avahi.service" "$AVAHI_SERVICE"
 
 	step "stopping photod"
@@ -371,26 +599,31 @@ redeploy() {
 	run sudo systemctl start photod
 
 	if [ -n "$DRY" ]; then
+		web_install
 		step "dry run: nothing changed"
 		return 0
 	fi
 
 	addr=$(health_addr)
 	if command -v curl >/dev/null 2>&1; then
-		if wait_healthy "$addr"; then
-			step "photod is up on $addr ($rev)"
-			return 0
+		if ! wait_healthy "$addr"; then
+			echo >&2
+			echo "photobackup-admin: photod did not answer https://$addr/health" >&2
+			sudo systemctl --no-pager --lines=0 status photod >&2 || true
+			sudo journalctl -u photod --no-pager --lines=30 >&2 || true
+			return 1
 		fi
-		echo >&2
-		echo "photobackup-admin: photod did not answer http://$addr/health" >&2
-		sudo systemctl --no-pager --lines=0 status photod >&2 || true
-		sudo journalctl -u photod --no-pager --lines=30 >&2 || true
-		return 1
+		step "photod is up on $addr ($rev)"
+	else
+		sudo systemctl is-active --quiet photod ||
+			die "redeploy: photod is not running — journalctl -u photod -n 30"
+		step "photod is running ($rev; curl not found, health not checked)"
 	fi
 
-	sudo systemctl is-active --quiet photod ||
-		die "redeploy: photod is not running — journalctl -u photod -n 30"
-	step "photod is running ($rev; curl not found, health not checked)"
+	# The gallery last, once the API it calls is already answering.
+	web_install || return 1
+	web_healthy "$src" || return 1
+	return 0
 }
 
 # ---------------------------------------------------------------- dispatch ---

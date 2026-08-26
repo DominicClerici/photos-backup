@@ -5,8 +5,10 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -34,7 +36,10 @@ import (
 	"github.com/dominicclerici/photos-backup/server/internal/uploads"
 	"github.com/dominicclerici/photos-backup/server/internal/vault"
 	"github.com/dominicclerici/photos-backup/server/internal/video"
+	"github.com/dominicclerici/photos-backup/server/internal/webauth"
 	"github.com/dominicclerici/photos-backup/server/internal/worker"
+
+	lib "github.com/go-webauthn/webauthn/webauthn"
 )
 
 func main() {
@@ -108,6 +113,35 @@ func run(log *slog.Logger) error {
 	staging := uploads.New(filepath.Join(root, "incoming"))
 	paired := devices.New(store.Pool())
 
+	browser := webauth.New(store.Pool())
+	browser.Idle, browser.Lifetime = cfg.WebIdle, cfg.WebLifetime
+
+	// The relying party, built from WEB_ORIGIN. Without it there is no browser
+	// sign-in: the endpoints answer 503 and the archive is readable only by a
+	// paired device. That is a degradation rather than a hole, and it is the
+	// only honest thing to do — a passkey is bound to an origin, and guessing
+	// which one from an inbound Host header is how a relying party becomes
+	// phishable.
+	var relyingParty *lib.WebAuthn
+	if cfg.WebOrigin != "" {
+		rpID, err := hostOf(cfg.WebOrigin)
+		if err != nil {
+			return fmt.Errorf("WEB_ORIGIN is not a usable origin: %w", err)
+		}
+		if relyingParty, err = lib.New(&lib.Config{
+			RPID:          rpID,
+			RPDisplayName: "photobackup",
+			RPOrigins:     []string{cfg.WebOrigin},
+		}); err != nil {
+			return fmt.Errorf("configure webauthn: %w", err)
+		}
+		log.Info("browser sign-in enabled", "origin", cfg.WebOrigin, "rp_id", rpID,
+			"idle", cfg.WebIdle, "lifetime", cfg.WebLifetime)
+	} else {
+		log.Warn("no WEB_ORIGIN; the browser gallery cannot sign in and only paired devices can read the archive",
+			"hint", "set WEB_ORIGIN=https://<this host> and restart")
+	}
+
 	// The encrypted trees mirror the plaintext ones, one per disk. Hiding a
 	// photograph must not quietly move a 500MB video off the archive drive and
 	// onto the SSD the derivatives live on, so the originals' vault sits beside
@@ -154,6 +188,9 @@ func run(log *slog.Logger) error {
 		Queue:        queue,
 		Uploads:      staging,
 		Devices:      paired,
+		Web:          browser,
+		WebAuthn:     relyingParty,
+		Ceremonies:   webauth.NewCeremonies(webauth.CeremonyTTL),
 		Vault:        vaults,
 		ML:           ml,
 		// What the status page needs to tell a degraded server from a busy one.
@@ -163,6 +200,7 @@ func run(log *slog.Logger) error {
 	}
 
 	go sweepUploads(ctx, log, staging, cfg.UploadSessionTTL)
+	go sweepWebAuth(ctx, log, browser, cfg.PurgeInterval)
 
 	if cfg.PurgeDisabled {
 		log.Warn("the trash sweep is disabled; deleted items will wait indefinitely")
@@ -291,9 +329,23 @@ func run(log *slog.Logger) error {
 	errs := make(chan error, 2)
 	var servers []*http.Server
 
+	// One listener, one origin, one guard. Until this phase there were two: this
+	// one, and an unauthenticated plaintext listener the browser gallery read
+	// the whole archive through. That one is gone — see internal/api/frontdoor.go
+	// for why everything now arrives from the same place.
+	var appURL *url.URL
+	if cfg.WebAppURL != "" {
+		if appURL, err = url.Parse(cfg.WebAppURL); err != nil {
+			return fmt.Errorf("WEB_APP_URL is not a usable address: %w", err)
+		}
+		log.Info("serving the gallery", "app", appURL.String(), "sign_in", api.SignInPath)
+	} else {
+		log.Warn("no WEB_APP_URL; photod is serving the API only and the gallery will not load")
+	}
+
 	apiSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           srv.Handler(),
+		Handler:           srv.FrontDoor(appURL),
 		ReadHeaderTimeout: 10 * time.Second,
 		// No write timeout: a large original on a slow phone connection is a
 		// normal upload, not a stalled one.
@@ -311,23 +363,6 @@ func run(log *slog.Logger) error {
 		// what lets a reissued leaf take effect without a restart.
 		serveErr(errs, apiSrv.ListenAndServeTLS("", ""))
 	}()
-
-	// The read-only plaintext listener. The gallery and the maintenance CLI live
-	// on this machine and would otherwise have to trust a private CA to read a
-	// thumbnail; the write path is not served here at all.
-	if cfg.PlaintextAddr != "" && !cfg.TLSDisabled {
-		plain := &http.Server{
-			Addr:              cfg.PlaintextAddr,
-			Handler:           srv.PlaintextHandler(),
-			ReadHeaderTimeout: 10 * time.Second,
-		}
-		servers = append(servers, plain)
-		go func() {
-			log.Info("serving the gallery read path in the clear", "addr", cfg.PlaintextAddr,
-				"note", "no pairing and no upload endpoints are reachable here")
-			serveErr(errs, plain.ListenAndServe())
-		}()
-	}
 
 	select {
 	case err := <-errs:
@@ -356,6 +391,27 @@ func visionPoolSize(ml *mlclient.Client, configured int) int {
 	return configured
 }
 
+// hostOf reduces an origin to the bare host a WebAuthn relying party is
+// identified by: no scheme, no port.
+//
+// The port is dropped because the spec says the RP ID is a domain and a domain
+// has none — a credential registered on :8787 and offered on :443 is the same
+// credential, and including the port would quietly break the day this moves
+// behind the standard port.
+func hostOf(origin string) (string, error) {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme != "https" && u.Hostname() != "localhost" {
+		return "", fmt.Errorf("must be https (got %q); a passkey is only offered on a secure origin", origin)
+	}
+	if u.Hostname() == "" {
+		return "", fmt.Errorf("no host in %q", origin)
+	}
+	return u.Hostname(), nil
+}
+
 func serveErr(errs chan<- error, err error) {
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		errs <- err
@@ -382,6 +438,39 @@ func sweepUploads(ctx context.Context, log *slog.Logger, staging *uploads.Store,
 
 	sweep()
 	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
+}
+
+// sweepWebAuth tidies the browser credentials: sessions that can never be used
+// again, and enrollment codes that can never be redeemed again.
+//
+// Housekeeping rather than correctness — requireAuth already refuses every row
+// this removes, and a spent enrollment code is inert — but a table that only
+// grows is a table somebody eventually has to explain.
+func sweepWebAuth(ctx context.Context, log *slog.Logger, web *webauth.Store, every time.Duration) {
+	sweep := func() {
+		if n, err := web.Sweep(ctx); err != nil {
+			log.Warn("could not sweep browser sessions", "error", err)
+		} else if n > 0 {
+			log.Info("swept dead browser sessions", "count", n)
+		}
+		if n, err := web.SweepEnrollments(ctx); err != nil {
+			log.Warn("could not sweep enrollment codes", "error", err)
+		} else if n > 0 {
+			log.Info("swept spent enrollment codes", "count", n)
+		}
+	}
+
+	sweep()
+	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
 		select {

@@ -82,12 +82,12 @@ func digestOf(body []byte) string {
 
 // The whole point of the endpoint: a browser with no device token, on the
 // listener that refuses every other write, can still put a photograph in.
-func TestGalleryUploadNeedsNoToken(t *testing.T) {
+func TestGalleryUploadNeedsNoDeviceToken(t *testing.T) {
 	h := newHarness(t)
-	plain := h.plaintext(t)
+	gallery := h.gallery(t)
 	content := loadFixture(t)
 
-	resp := h.galleryUpload(t, plain, content, nil)
+	resp := h.galleryUpload(t, gallery, content, nil)
 	if resp.StatusCode != http.StatusCreated {
 		raw, _ := io.ReadAll(resp.Body)
 		t.Fatalf("gallery upload returned %d: %s", resp.StatusCode, raw)
@@ -130,11 +130,11 @@ func TestGalleryUploadNeedsNoToken(t *testing.T) {
 // the page draws as a duplicate rather than a failure.
 func TestGalleryUploadReportsDuplicate(t *testing.T) {
 	h := newHarness(t)
-	plain := h.plaintext(t)
+	gallery := h.gallery(t)
 	content := loadFixture(t)
 
-	first := decodeUpload(t, h.galleryUpload(t, plain, content, nil))
-	second := decodeUpload(t, h.galleryUpload(t, plain, content, nil))
+	first := decodeUpload(t, h.galleryUpload(t, gallery, content, nil))
+	second := decodeUpload(t, h.galleryUpload(t, gallery, content, nil))
 
 	if !second.Duplicate {
 		t.Error("duplicate = false on re-upload of identical bytes")
@@ -151,9 +151,9 @@ func TestGalleryUploadReportsDuplicate(t *testing.T) {
 // something else gets nothing archived.
 func TestGalleryUploadVerifiesDeclaredDigest(t *testing.T) {
 	h := newHarness(t)
-	plain := h.plaintext(t)
+	gallery := h.gallery(t)
 
-	resp := h.galleryUpload(t, plain, loadFixture(t), map[string]string{
+	resp := h.galleryUpload(t, gallery, loadFixture(t), map[string]string{
 		"X-Photo-Sha256": strings.Repeat("a", 64),
 	})
 	if resp.StatusCode != http.StatusUnprocessableEntity {
@@ -169,9 +169,9 @@ func TestGalleryUploadVerifiesDeclaredDigest(t *testing.T) {
 
 func TestGalleryUploadRejectsMalformedDigest(t *testing.T) {
 	h := newHarness(t)
-	plain := h.plaintext(t)
+	gallery := h.gallery(t)
 
-	resp := h.galleryUpload(t, plain, loadFixture(t), map[string]string{"X-Photo-Sha256": "not-a-digest"})
+	resp := h.galleryUpload(t, gallery, loadFixture(t), map[string]string{"X-Photo-Sha256": "not-a-digest"})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("malformed sha256 returned %d, want 400", resp.StatusCode)
 	}
@@ -181,16 +181,16 @@ func TestGalleryUploadRejectsMalformedDigest(t *testing.T) {
 // body that was cut short.
 func TestGalleryUploadWithoutDigestStillChecksLength(t *testing.T) {
 	h := newHarness(t)
-	plain := h.plaintext(t)
+	gallery := h.gallery(t)
 	content := loadFixture(t)
 
-	resp := h.galleryUpload(t, plain, content, map[string]string{"X-Photo-Sha256": ""})
+	resp := h.galleryUpload(t, gallery, content, map[string]string{"X-Photo-Sha256": ""})
 	if resp.StatusCode != http.StatusCreated {
 		raw, _ := io.ReadAll(resp.Body)
 		t.Fatalf("upload with no digest returned %d: %s", resp.StatusCode, raw)
 	}
 
-	short := h.galleryUpload(t, plain, content, map[string]string{
+	short := h.galleryUpload(t, gallery, content, map[string]string{
 		"X-Photo-Sha256": "",
 		"X-Photo-Size":   fmt.Sprint(len(content) + 1),
 	})
@@ -203,9 +203,9 @@ func TestGalleryUploadWithoutDigestStillChecksLength(t *testing.T) {
 // a web page is not automatically a photograph.
 func TestGalleryUploadRefusesUnrecognisedFile(t *testing.T) {
 	h := newHarness(t)
-	plain := h.plaintext(t)
+	gallery := h.gallery(t)
 
-	resp := h.galleryUpload(t, plain, []byte("id,name\n1,Ada\n"), map[string]string{
+	resp := h.galleryUpload(t, gallery, []byte("id,name\n1,Ada\n"), map[string]string{
 		"X-Photo-Filename": "budget.csv",
 		"X-Photo-Sha256":   digestOf([]byte("id,name\n1,Ada\n")),
 		"X-Photo-Size":     fmt.Sprint(len("id,name\n1,Ada\n")),
@@ -222,10 +222,10 @@ func TestGalleryUploadRefusesUnrecognisedFile(t *testing.T) {
 // the case that keeps the 415 above from being a filename whitelist.
 func TestGalleryUploadAcceptsUnnamedButRecognisableFile(t *testing.T) {
 	h := newHarness(t)
-	plain := h.plaintext(t)
+	gallery := h.gallery(t)
 	content := loadNamedFixture(t, "photo.jpg")
 
-	resp := h.galleryUpload(t, plain, content, map[string]string{"X-Photo-Filename": "IMG_0001"})
+	resp := h.galleryUpload(t, gallery, content, map[string]string{"X-Photo-Filename": "IMG_0001"})
 	if resp.StatusCode != http.StatusCreated {
 		raw, _ := io.ReadAll(resp.Body)
 		t.Fatalf("extensionless jpeg returned %d: %s", resp.StatusCode, raw)
@@ -237,17 +237,17 @@ func TestGalleryUploadAcceptsUnnamedButRecognisableFile(t *testing.T) {
 // content the archive has never seen.
 func TestGalleryCheckFindsArchivedContent(t *testing.T) {
 	h := newHarness(t)
-	plain := h.plaintext(t)
+	gallery := h.gallery(t)
 	content := loadFixture(t)
 	sha := digestOf(content)
 
-	if known := h.galleryCheck(t, plain, sha); len(known) != 0 {
+	if known := h.galleryCheck(t, gallery, sha); len(known) != 0 {
 		t.Fatalf("check knew %v before anything was uploaded", known)
 	}
 
-	up := decodeUpload(t, h.galleryUpload(t, plain, content, nil))
+	up := decodeUpload(t, h.galleryUpload(t, gallery, content, nil))
 
-	known := h.galleryCheck(t, plain, sha, strings.Repeat("b", 64))
+	known := h.galleryCheck(t, gallery, sha, strings.Repeat("b", 64))
 	if len(known) != 1 {
 		t.Fatalf("check returned %d matches, want 1: %v", len(known), known)
 	}
@@ -266,7 +266,7 @@ func TestGalleryCheckFindsArchivedContent(t *testing.T) {
 		t.Fatalf("trash returned %d: %s", resp.StatusCode, raw)
 	}
 
-	known = h.galleryCheck(t, plain, sha)
+	known = h.galleryCheck(t, gallery, sha)
 	if len(known) != 1 || known[0].Where != "trash" {
 		t.Errorf("after a delete the check said %v, want one trash match", known)
 	}
@@ -274,15 +274,15 @@ func TestGalleryCheckFindsArchivedContent(t *testing.T) {
 
 func TestGalleryCheckRejectsMalformedDigest(t *testing.T) {
 	h := newHarness(t)
-	plain := h.plaintext(t)
+	gallery := h.gallery(t)
 
-	req, err := http.NewRequest(http.MethodPost, plain.URL+"/v1/gallery/uploads/check",
+	req, err := http.NewRequest(http.MethodPost, gallery.URL+"/v1/gallery/uploads/check",
 		strings.NewReader(`{"sha256":["nope"]}`))
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := plain.Client().Do(req)
+	resp, err := gallery.Client().Do(req)
 	if err != nil {
 		t.Fatalf("check: %v", err)
 	}
