@@ -1,15 +1,12 @@
-import { Empty, Screen } from '../../../src/ui';
+import { Collections } from '../../../src/collections';
 
 /**
- * Empty on purpose. Albums, people and categories arrive in Phase 5.
+ * Albums, people, categories, and the four places a photograph is put rather
+ * than a slice of the library it belongs to.
  *
- * An empty screen that says nothing is indistinguishable from one that failed
- * to load, which is the whole reason this file has any content at all.
+ * The whole index is one request — albums and people are counted in tens, not
+ * thousands — so there is nothing here that loads as it scrolls.
  */
 export default function CollectionsRoute() {
-  return (
-    <Screen title="Collections" scrolls={false}>
-      <Empty icon="folder" title="Nothing here yet" />
-    </Screen>
-  );
+  return <Collections />;
 }

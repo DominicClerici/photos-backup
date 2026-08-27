@@ -7,6 +7,7 @@ import {
   type ThumbSize,
   type TimelineItem,
 } from '@photobackup/core';
+import { Feather } from '@expo/vector-icons';
 import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import { Image } from 'expo-image';
@@ -23,7 +24,7 @@ import Animated, {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { color, radius, space } from '../theme';
-import { Text } from '../ui';
+import { Text, type Action } from '../ui';
 
 const OPEN_MS = 220;
 const CLOSE_MS = 160;
@@ -34,6 +35,8 @@ const LARGE: ThumbSize = THUMB_SIZES[THUMB_SIZES.length - 1];
 
 export interface PeekTarget {
   item: TimelineItem;
+  /** Which position in the timeline it is, which is what Select picks. */
+  index: number;
   /** Where the tile is on screen right now, so the photograph grows out of it. */
   from: { x: number; y: number; size: number };
 }
@@ -49,11 +52,16 @@ export interface PeekTarget {
  * pointer resting on a tile starts its motion after 120ms — a gesture a phone
  * does not have, and one whose touch equivalent is a trap: `pointerenter` fires
  * for a tap and `pointerleave` often does not, which is a video left playing
- * under a finger that has moved on. A hold is unambiguous, and it is the same
- * hold the multi-select grows out of. Phase 5 hangs Select, Add to album,
- * Archive, Hide and Delete underneath this, which is why the photograph lifts
- * towards the top of the screen rather than into the middle of it: the room
- * below is where those go.
+ * under a finger that has moved on. A hold is unambiguous, and Phase 5 hung
+ * Select, Add to album, Archive, Hide and Delete underneath it — which is why
+ * the photograph lifts towards the top of the screen rather than into the
+ * middle of it. The room below was left for them.
+ *
+ * The hold means the same thing whether or not the grid is picking: it peeks.
+ * What changes is the first row under the photograph, which says Select while
+ * the grid is browsing and Deselect once this photograph is in the selection.
+ * Picking a run of them is a horizontal drag across the grid — see the pan in
+ * `Grid` — and this row is the way in for anyone who has not found that yet.
  *
  * The still stays mounted underneath the video for the browser's reason — the
  * dissolve is then between two pictures of the same moment, and never lets the
@@ -61,9 +69,16 @@ export interface PeekTarget {
  */
 export function Peek({
   target,
+  actions = [],
   onClose,
 }: {
   target: PeekTarget | null;
+  /**
+   * What can be done to this one photograph. Every one of them closes the peek
+   * on the way, because several open a sheet — and a sheet is drawn by the app,
+   * not by this `Modal`, so one opened from in here would come up behind it.
+   */
+  actions?: Action[];
   onClose: () => void;
 }) {
   const { width, height } = useWindowDimensions();
@@ -72,17 +87,27 @@ export function Peek({
   const playing = useSharedValue(0);
 
   // Held past the moment the parent lets go, so the photograph can shrink back
-  // into the square it came from instead of vanishing out of a blur.
+  // into the square it came from instead of vanishing out of a blur. The rows
+  // are held with it and for the same reason: the grid computes them from the
+  // open target, so letting them empty on the way out would resize the
+  // photograph halfway through the animation putting it back.
   const [held, setHeld] = useState<PeekTarget | null>(null);
+  const [rows, setRows] = useState<Action[]>([]);
+  const [armed, setArmed] = useState<string | null>(null);
   const [broken, setBroken] = useState(false);
 
   useEffect(() => {
     if (!target) return;
     setHeld(target);
+    setRows(actions);
+    setArmed(null);
     setBroken(false);
     playing.value = 0;
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     open.value = withTiming(1, { duration: OPEN_MS, easing: Easing.out(Easing.cubic) });
+    // `actions` is read here and deliberately not depended on: the rows are
+    // computed from `target`, so re-running on their identity would only reset
+    // a row somebody has armed.
   }, [target, open, playing]);
 
   const dismiss = useCallback(() => {
@@ -95,8 +120,13 @@ export function Peek({
   const item = held?.item ?? null;
 
   // A square, because a square is what the grid holds: the stored thumbnail is
-  // a centre crop, and the full frame is the viewer's business in Phase 4.
-  const side = Math.min(width - MARGIN * 2, height * 0.55);
+  // a centre crop, and the full frame is the viewer's business.
+  //
+  // Smaller when there are actions under it, and by enough that the last of
+  // them is never the one off the bottom of a small screen. The photograph is
+  // the thing you are already looking at; the rows are the thing you opened
+  // this to reach.
+  const side = Math.min(width - MARGIN * 2, height * (rows.length > 0 ? 0.42 : 0.55));
   const to = useMemo(
     () => ({ x: (width - side) / 2, y: insets.top + space.xl, size: side }),
     [width, side, insets.top],
@@ -195,11 +225,8 @@ export function Peek({
         ) : null}
       </Animated.View>
 
-      <Animated.View
-        style={[styles.caption, { top: to.y + side }, captionStyle]}
-        pointerEvents="none"
-      >
-        <Text variant="small" tone="muted">
+      <Animated.View style={[styles.below, { top: to.y + side }, captionStyle]}>
+        <Text variant="small" tone="muted" style={styles.caption}>
           {new Date(item.taken_at).toLocaleString(undefined, {
             weekday: 'short',
             day: 'numeric',
@@ -209,6 +236,55 @@ export function Peek({
             minute: '2-digit',
           })}
         </Text>
+
+        {rows.length > 0 ? (
+          <View style={styles.actions}>
+            {rows.map((action) => {
+              const live = armed === action.key;
+              const tint = action.disabled
+                ? color.faint
+                : action.tone === 'destructive'
+                  ? color.destructive
+                  : color.foreground;
+              return (
+                <Pressable
+                  key={action.key}
+                  accessibilityRole="button"
+                  accessibilityLabel={action.label}
+                  accessibilityState={{ disabled: !!action.disabled }}
+                  disabled={action.disabled}
+                  onPress={() => {
+                    // Two taps for the one thing here that cannot be taken
+                    // back by tapping again, and the second is in the same
+                    // place as the first — which is the whole argument for
+                    // arming a row rather than raising an alert over a modal.
+                    if (action.armed && !live) {
+                      setArmed(action.key);
+                      return;
+                    }
+                    setArmed(null);
+                    action.onPress?.();
+                  }}
+                  style={({ pressed }) => [
+                    styles.action,
+                    live && styles.armed,
+                    pressed && styles.actionPressed,
+                  ]}
+                >
+                  <Feather name={live ? 'alert-triangle' : action.icon} size={17} color={tint} />
+                  <Text variant="body" numberOfLines={1} style={[styles.actionLabel, { color: tint }]}>
+                    {live ? `Tap again to ${action.label.toLowerCase()}` : action.label}
+                  </Text>
+                  {action.note && action.disabled ? (
+                    <Text variant="caption" tone="faint">
+                      {action.note}
+                    </Text>
+                  ) : null}
+                </Pressable>
+              );
+            })}
+          </View>
+        ) : null}
       </Animated.View>
     </Modal>
   );
@@ -224,11 +300,28 @@ const styles = StyleSheet.create({
     borderRadius: radius.xl,
     backgroundColor: color.tile,
   },
-  caption: {
+  // Sized to its contents rather than stretched to the bottom edge, so a tap
+  // in the space under the last row still dismisses the peek.
+  below: {
     position: 'absolute',
-    left: 0,
-    right: 0,
-    alignItems: 'center',
+    left: space.xl,
+    right: space.xl,
     paddingTop: space.lg,
   },
+  caption: { textAlign: 'center' },
+  actions: { marginTop: space.lg, gap: space.sm },
+  action: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space.md,
+    minHeight: 48,
+    paddingHorizontal: space.md,
+    borderRadius: radius.lg,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: 'rgba(22,22,26,0.86)',
+  },
+  armed: { borderColor: color.destructive },
+  actionLabel: { flex: 1 },
+  actionPressed: { opacity: 0.7 },
 });

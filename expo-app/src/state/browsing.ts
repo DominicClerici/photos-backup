@@ -1,5 +1,6 @@
 import type { TimelineState } from '@photobackup/core/react';
-import { useEffect, useSyncExternalStore } from 'react';
+import { useIsFocused } from 'expo-router';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 
 /**
  * The timeline somebody is looking into, for the screen that is looking *at* one
@@ -23,9 +24,22 @@ import { useEffect, useSyncExternalStore } from 'react';
  * signal the viewer needs to notice that the photograph it is waiting for has
  * arrived.
  *
- * Phase 5's collections publish their own here before pushing the same route.
+ * Phase 5's collections and the search results publish their own here, which is
+ * what makes the same viewer page over an album or a ranking. It is also what
+ * forced the claim below: three screens can be mounted at once.
  */
 let held: TimelineState | null = null;
+/**
+ * Which screen the published timeline belongs to.
+ *
+ * A phone keeps every tab it has visited mounted behind the one on top, so the
+ * library's grid is still rendering — and would still be republishing — while
+ * somebody is inside an album. The claim is taken on *becoming* focused rather
+ * than held while focused, because the viewer is a route above the grid it was
+ * opened from: that blurs the grid, and a grid that stopped publishing there
+ * would stop telling the viewer that the page it is waiting for has landed.
+ */
+let owner: symbol | null = null;
 const listeners = new Set<() => void>();
 
 function subscribe(listener: () => void): () => void {
@@ -57,15 +71,30 @@ function publish(next: TimelineState | null): void {
  * is told there is nothing to look at.
  */
 export function useBrowsing(timeline: TimelineState): void {
+  // One identity per mounted screen, made once. A lazy initialiser rather than
+  // a ref written during render, which is the shape the React Compiler — on for
+  // this app and off for the browser — is entitled to be unhappy about.
+  const [id] = useState(() => Symbol('browsing'));
+  const focused = useIsFocused();
+
+  // Claimed on the way in, and never taken back by a screen going quiet — see
+  // `owner`. Declared before the publish below so that a screen arriving owns
+  // the store by the time it first publishes.
   useEffect(() => {
-    publish(timeline);
+    if (focused) owner = id;
+  }, [focused, id]);
+
+  useEffect(() => {
+    if (owner === id) publish(timeline);
   });
 
   useEffect(
     () => () => {
+      if (owner !== id) return;
+      owner = null;
       publish(null);
     },
-    [],
+    [id],
   );
 }
 

@@ -1,4 +1,5 @@
 import { Feather } from '@expo/vector-icons';
+import { router } from 'expo-router';
 import type { BottomTabBarProps } from 'expo-router/tabs';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Animated, Pressable, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
@@ -37,6 +38,11 @@ interface Pill {
  *
  * There is no blur behind it. `expo-blur` would be a sixth native dependency
  * for one surface, and a solid card at this contrast is the same picture.
+ *
+ * The search button is beside the row rather than in it, and it is a button
+ * rather than a fourth tab because a search is a question rather than a
+ * destination — the same reading the browser's bar makes. Its own circle, so
+ * that nothing about the tabs moves when it appears.
  */
 export function TabBar({ state, navigation }: BottomTabBarProps) {
   const insets = useSafeAreaInsets();
@@ -90,6 +96,15 @@ export function TabBar({ state, navigation }: BottomTabBarProps) {
       pointerEvents="box-none"
       style={[styles.dock, { bottom: insets.bottom + space.md }]}
     >
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Search"
+        onPress={() => router.push('/search')}
+        style={({ pressed }) => [styles.search, pressed && styles.pressed]}
+      >
+        <Feather name="search" size={18} color={color.mutedForeground} />
+      </Pressable>
+
       <View style={styles.row}>
         {current && (
           <Animated.View
@@ -127,7 +142,12 @@ export function TabBar({ state, navigation }: BottomTabBarProps) {
                 size={18}
                 color={on ? color.primary : color.mutedForeground}
               />
-              <Text variant="small" tone={on ? 'default' : 'muted'} style={styles.label}>
+              <Text
+                variant="small"
+                tone={on ? 'default' : 'muted'}
+                numberOfLines={1}
+                style={styles.label}
+              >
                 {meta.label}
               </Text>
             </Pressable>
@@ -141,12 +161,19 @@ export function TabBar({ state, navigation }: BottomTabBarProps) {
 const styles = StyleSheet.create({
   dock: {
     position: 'absolute',
-    left: 0,
-    right: 0,
+    left: space.sm,
+    right: space.sm,
+    flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
+    gap: space.sm,
     zIndex: 30,
   },
+  // The tabs shrink before the search button does. On a narrow phone the
+  // labels are what give, and a tab that has lost a letter is still a tab you
+  // can hit; a search button that has been squeezed to nothing is not.
   row: {
+    flexShrink: 1,
     flexDirection: 'row',
     alignItems: 'center',
     gap: space.xs,
@@ -173,11 +200,28 @@ const styles = StyleSheet.create({
   },
   tab: {
     height: 40,
+    flexShrink: 1,
     flexDirection: 'row',
     alignItems: 'center',
     gap: space.sm,
-    paddingHorizontal: space.md + 2,
+    paddingHorizontal: space.md,
     borderRadius: radius.pill,
   },
-  label: { fontWeight: '500' },
+  label: { fontWeight: '500', flexShrink: 1 },
+  search: {
+    width: 52,
+    height: 52,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radius.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: color.border,
+    backgroundColor: color.card,
+    shadowColor: '#000',
+    shadowOpacity: 0.4,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 8,
+  },
+  pressed: { opacity: 0.7 },
 });

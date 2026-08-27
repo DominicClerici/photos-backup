@@ -340,11 +340,23 @@ export function useSelection(): SelectionState {
  *
  * What makes the floating control appear on the pages that have a gallery and
  * nowhere else, and what drops a selection when one is navigated away from.
+ *
+ * @param active Whether this grid is the one being looked at. The browser has
+ * no use for it — a page that has been navigated away from is unmounted, so
+ * "on screen" and "mounted" are the same statement there — but a phone keeps
+ * every tab it has visited mounted behind the one on top. Without this the
+ * library's grid would still be claiming the selection from underneath an
+ * album, and the floating control would appear over the collections list.
  */
-export function useSelectionScope(actions: SelectionActions): void {
+export function useSelectionScope(actions: SelectionActions, active = true): void {
   const { register, provide } = useSelection();
-  useEffect(register, [register]);
-  useEffect(() => provide(actions), [provide, actions]);
+  useEffect(() => {
+    if (!active) return;
+    return register();
+  }, [register, active]);
+  useEffect(() => {
+    if (active) provide(actions);
+  }, [provide, actions, active]);
 }
 
 function settle(model: Model): Ranges {

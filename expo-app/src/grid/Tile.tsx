@@ -35,6 +35,8 @@ export const Tile = memo(function Tile({
   thumb,
   places,
   z,
+  selecting = false,
+  selected = false,
 }: {
   item: TimelineItem;
   box: number;
@@ -42,6 +44,9 @@ export const Tile = memo(function Tile({
   /** Where this tile sits at each zoom level. See grid/geometry. */
   places: Places;
   z: SharedValue<number>;
+  /** Whether the grid is picking rather than browsing. */
+  selecting?: boolean;
+  selected?: boolean;
 }) {
   const [missing, setMissing] = useState<ThumbSize[]>([]);
 
@@ -87,7 +92,12 @@ export const Tile = memo(function Tile({
 
   return (
     <Animated.View style={[styles.tile, { width: box, height: box }, style]}>
-      <View style={styles.chrome}>
+      {/* The picture is drawn back from its cell when it is picked, which is
+          what `chrome` was left as a separate node for: the zoom writes a
+          transform to the box above and this inset must not fight it. The gap
+          it opens is the tile colour, so a wall of selected photographs reads
+          as a grid of separate things rather than one dimmed sheet. */}
+      <View style={[styles.chrome, selected && styles.picked]}>
         {attempt && source ? (
           <Image
             style={styles.picture}
@@ -124,6 +134,18 @@ export const Tile = memo(function Tile({
             <RNText style={styles.durationText}>{formatDuration(item.duration)}</RNText>
           </View>
         ) : null}
+
+        {/* Top right, because the bottom right is a video's length and the top
+            left is the Live mark. An unpicked tile in selection mode gets the
+            empty ring rather than nothing at all: without it there is no way to
+            tell a grid that is picking from one that is browsing except by
+            finding a selected tile, and at the start of a selection there is
+            not one. */}
+        {selecting ? (
+          <View style={[styles.tick, selected && styles.tickOn]}>
+            {selected ? <Feather name="check" size={12} color={color.primaryForeground} /> : null}
+          </View>
+        ) : null}
       </View>
     </Animated.View>
   );
@@ -148,10 +170,19 @@ export const Skeleton = memo(function Skeleton({
   box,
   places,
   z,
+  selecting = false,
+  selected = false,
 }: {
   box: number;
   places: Places;
   z: SharedValue<number>;
+  /**
+   * A square with no photograph in it yet is still a position, and a drag that
+   * crosses it selects it — the selection is runs of indices precisely so that
+   * it can cover ground nobody has downloaded. So it draws the tick too.
+   */
+  selecting?: boolean;
+  selected?: boolean;
 }) {
   const style = useAnimatedStyle(() => {
     const r = rectAt(places, z.value);
@@ -162,7 +193,13 @@ export const Skeleton = memo(function Skeleton({
 
   return (
     <Animated.View style={[styles.tile, { width: box, height: box }, style]}>
-      <View style={styles.chrome} />
+      <View style={[styles.chrome, selected && styles.picked]}>
+        {selecting ? (
+          <View style={[styles.tick, selected && styles.tickOn]}>
+            {selected ? <Feather name="check" size={12} color={color.primaryForeground} /> : null}
+          </View>
+        ) : null}
+      </View>
     </Animated.View>
   );
 });
@@ -194,6 +231,7 @@ const styles = StyleSheet.create({
   // selection can draw the tile back from its cell without fighting the
   // transform the zoom loop writes to the node above.
   chrome: { flex: 1, overflow: 'hidden', backgroundColor: color.tile },
+  picked: { padding: 3 },
   picture: { flex: 1 },
   // A derivative that has not been generated yet, and one that cannot be drawn
   // at all. Both are squares rather than spinners: a screenful at the smallest
@@ -206,6 +244,21 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: color.tileSheen,
   },
+
+  tick: {
+    position: 'absolute',
+    top: 4,
+    right: 4,
+    width: 18,
+    height: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radius.pill,
+    borderWidth: 1.4,
+    borderColor: 'rgba(255,255,255,0.85)',
+    backgroundColor: 'rgba(8,8,10,0.28)',
+  },
+  tickOn: { borderColor: color.primary, backgroundColor: color.primary },
 
   live: { position: 'absolute', top: 5, left: 5, width: 14, height: 14 },
   liveOuter: {

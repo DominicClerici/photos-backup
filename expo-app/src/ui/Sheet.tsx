@@ -4,6 +4,7 @@ import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
   Easing,
   runOnJS,
+  useAnimatedKeyboard,
   useAnimatedStyle,
   useSharedValue,
   withTiming,
@@ -44,6 +45,18 @@ const MOST = 0.68;
  * so a second window would only add a second animation going the other way —
  * the reason `grid/Peek.tsx` gives for needing one does not apply here.
  *
+ * Phase 5 gave it three more callers — the album picker, the sort-and-filter
+ * panel and `ActionSheet` — and none of them changed its shape. What they did
+ * add is the keyboard: two of them have a text field in them, and a panel
+ * anchored to the bottom edge is anchored to exactly where the keyboard comes
+ * up. See `keyboard` below.
+ *
+ * One rule about where it is mounted, and it is not optional: a sheet fills the
+ * screen with `absoluteFill`, so one rendered inside a `ScrollView` fills the
+ * scroll content instead. Every caller here is mounted outside one — which is
+ * why `Collections` draws its album menu beside its screen rather than inside
+ * the grid that opens it.
+ *
  * The sheet is drawn over the photograph rather than shrinking it into the
  * space above, which is the one thing it does differently from the browser's
  * panel. There the photo is given back the width the sidebar takes; here the
@@ -72,6 +85,16 @@ export function Sheet({
   const [mounted, setMounted] = useState(open);
   const shown = useSharedValue(0);
   const drag = useSharedValue(0);
+  /**
+   * How much of the screen the keyboard has taken.
+   *
+   * A sheet is anchored to the bottom edge, which is precisely where the
+   * keyboard comes up — so two of Phase 5's three callers, the album picker's
+   * search box and the create-album form, would otherwise be typing into a
+   * panel they cannot see. It is added to the same transform the entrance and
+   * the drag already write, so the three compose instead of fighting.
+   */
+  const keyboard = useAnimatedKeyboard();
 
   useEffect(() => {
     if (open) {
@@ -106,7 +129,9 @@ export function Sheet({
 
   const scrim = useAnimatedStyle(() => ({ opacity: shown.value * 0.55 }));
   const panel = useAnimatedStyle(() => ({
-    transform: [{ translateY: (1 - shown.value) * height + drag.value }],
+    transform: [
+      { translateY: (1 - shown.value) * height + drag.value - keyboard.height.value },
+    ],
   }));
 
   if (!mounted) return null;
@@ -123,7 +148,11 @@ export function Sheet({
       </Animated.View>
 
       <Animated.View
-        style={[styles.panel, { maxHeight: height * MOST, paddingBottom: insets.bottom + space.lg }, panel]}
+        style={[
+          styles.panel,
+          { maxHeight: height * MOST, paddingBottom: insets.bottom + space.lg },
+          panel,
+        ]}
       >
         <GestureDetector gesture={pan}>
           <View style={styles.grip}>

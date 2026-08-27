@@ -620,7 +620,12 @@ export function fetchSearch(
   offset: number,
   signal?: AbortSignal,
 ): Promise<SearchPage> {
-  const query = new URLSearchParams(params);
+  // Copied through its spelling rather than handed to the constructor.
+  // React Native's `URLSearchParams` is its own small implementation, and its
+  // object branch would read the own properties of the instance it was given —
+  // producing one parameter called `_searchParams` holding "[object Map]".
+  // A string is the one argument both implementations agree about.
+  const query = new URLSearchParams(params.toString());
   query.set("limit", String(limit));
   if (offset > 0) query.set("offset", String(offset));
   return get<SearchPage>(`/v1/search?${query}`, signal);

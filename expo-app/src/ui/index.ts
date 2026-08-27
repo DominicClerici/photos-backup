@@ -8,13 +8,18 @@
  * this directory names a colour.
  *
  * `Sheet` arrived in Phase 4, written against the viewer's metadata panel — its
- * only caller, and the reason its API is what it is rather than a guess.
- * `ContextMenu` is still absent for the same reason it was: nothing asks for
- * one until the actions on a selection, in Phase 5.
+ * only caller, and the reason its API is what it is rather than a guess. Phase 5
+ * gave it three more callers, and one of them is `ActionSheet` — which is what
+ * the browser's context menu and the panel above its selection pill both become
+ * here. There is no pointer to right-click with and no room to float a
+ * 240-point panel over a floating tab bar, and "what can I do with this"
+ * already has one gesture on a phone.
  */
+export { ActionSheet, type Action } from './ActionSheet';
 export { Button, type ButtonVariant } from './Button';
 export { Card, Count, Counts, Row } from './Card';
 export { Field } from './Field';
+export { ListRow, ROW_ICON_SIZE, RowList } from './ListRow';
 export { Pill } from './Pill';
 export { Sheet } from './Sheet';
 export { Empty, Screen, TAB_BAR_CLEARANCE } from './Screen';

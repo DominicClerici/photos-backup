@@ -320,23 +320,70 @@ const RECENTS_KEY = "photos.search.recent";
 const RECENTS_MAX = 6;
 
 /**
- * The last few sentences somebody typed, newest first.
+ * Somewhere to keep the last few questions, whichever client is asking.
  *
- * In localStorage rather than on the server, because it is a convenience of
- * this browser rather than a fact about the archive — and because a list of
- * what somebody went looking for is the kind of thing worth not writing down
- * anywhere it would outlive them clearing their history.
+ * A list of what somebody went looking for is a convenience of the device
+ * rather than a fact about the archive, so it is never sent to the server —
+ * which leaves each client to say where "on this device" is. The browser has
+ * `localStorage` and is the default below; the phone has no such thing and
+ * hands over a file, exactly as `grid/zoomStore.ts` already does for the zoom.
+ *
+ * Synchronous on purpose: the blank search screen draws this on its first
+ * frame, and a list that arrives a tick later is a list that appears under
+ * somebody's thumb.
  */
+export interface RecentsStore {
+  read(): string[];
+  write(list: string[]): void;
+}
+
+/**
+ * `localStorage`, where there is one. Where there is not — a phone, a server
+ * render — it is a store that remembers nothing, which is the honest answer
+ * rather than a crash.
+ */
+const browserRecents: RecentsStore = {
+  read(): string[] {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = window.localStorage?.getItem(RECENTS_KEY);
+      const held: unknown = raw ? JSON.parse(raw) : [];
+      return Array.isArray(held) ? (held as unknown[]).filter(isSentence) : [];
+    } catch {
+      // A refusal, or something else's key at this name. Neither is worth
+      // breaking a search box over.
+      return [];
+    }
+  },
+  write(list: string[]): void {
+    if (typeof window === "undefined") return;
+    try {
+      // An empty list is the absence of one rather than a stored `[]`, so
+      // clearing the history leaves nothing behind under this key.
+      if (list.length === 0) window.localStorage.removeItem(RECENTS_KEY);
+      else window.localStorage.setItem(RECENTS_KEY, JSON.stringify(list));
+    } catch {
+      // See above.
+    }
+  },
+};
+
+let recents: RecentsStore = browserRecents;
+
+/** Installed once at startup by a client that has somewhere better to keep it. */
+export function installRecents(store: RecentsStore): void {
+  recents = store;
+}
+
+function isSentence(entry: unknown): entry is string {
+  return typeof entry === "string" && entry !== "";
+}
+
+/** The last few sentences somebody typed, newest first. */
 export function recentSearches(): string[] {
-  if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage?.getItem(RECENTS_KEY);
-    const held: unknown = raw ? JSON.parse(raw) : [];
-    if (!Array.isArray(held)) return [];
-    return held.filter((entry): entry is string => typeof entry === "string" && entry !== "");
+    return recents.read().filter(isSentence).slice(0, RECENTS_MAX);
   } catch {
-    // A refusal, or something else's key at this name. Neither is worth
-    // breaking a search box over.
     return [];
   }
 }
@@ -344,19 +391,18 @@ export function recentSearches(): string[] {
 /** Files a query at the top of the list, moving it there if it is already in it. */
 export function rememberSearch(text: string): void {
   const query = text.trim();
-  if (!query || typeof window === "undefined") return;
+  if (!query) return;
   const next = [query, ...recentSearches().filter((held) => held !== query)].slice(0, RECENTS_MAX);
   try {
-    window.localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
+    recents.write(next);
   } catch {
-    // See above.
+    // A convenience that did not get written down is not worth a notice.
   }
 }
 
 export function forgetSearches(): void {
-  if (typeof window === "undefined") return;
   try {
-    window.localStorage.removeItem(RECENTS_KEY);
+    recents.write([]);
   } catch {
     // See above.
   }

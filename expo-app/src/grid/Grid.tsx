@@ -1,6 +1,7 @@
 import {
   dayAt,
   dayIndexOf,
+  describeAction,
   fetchStates,
   frameAt,
   headless,
@@ -8,16 +9,25 @@ import {
   layoutLevel,
   MAX_ZOOM,
   metricsFor,
+  nounFor,
   thumbSizeFor,
   visibleItems,
   ZOOM_LEVELS,
   type Day,
   type ItemRange,
   type LevelLayout,
+  type TimelineFilter,
 } from '@photobackup/core';
-import type { TimelineState } from '@photobackup/core/react';
+import {
+  useSelection,
+  useSelectionScope,
+  useViewScope,
+  type SelectionActions,
+  type TimelineState,
+} from '@photobackup/core/react';
 import { BlurView } from 'expo-blur';
-import { router } from 'expo-router';
+import { router, useIsFocused } from 'expo-router';
+import * as Haptics from 'expo-haptics';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { StyleSheet, useWindowDimensions, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
@@ -35,8 +45,9 @@ import Animated, {
 } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { askToFile } from '../actions';
 import { color, radius, space } from '../theme';
-import { Button, TAB_BAR_CLEARANCE, Text } from '../ui';
+import { Button, TAB_BAR_CLEARANCE, Text, type Action } from '../ui';
 import { DatePill } from './DatePill';
 import {
   cellsOf,
@@ -88,6 +99,19 @@ const ZOOM_STEP = 0.1;
 /** One step of zoom, matching lib/zoom's ZOOM_MS so both apps settle alike. */
 const SETTLE_MS = 300;
 
+/**
+ * How deep the bands at the top and bottom of the grid are, and how fast a
+ * finger held at the very edge of one drags the timeline past itself.
+ *
+ * A drag-selection has to be able to cover more than a screenful, and the only
+ * hand doing the dragging is the one that would otherwise be scrolling. So the
+ * edges pull, in proportion to how far into them the finger has gone — which
+ * is what makes a slow crawl through the band controllable and a shove into
+ * the corner fast.
+ */
+const EDGE_BAND = 110;
+const EDGE_SPEED = 22;
+
 /** The margin the grid keeps at each side, and what the day headings hang on. */
 const GUTTER = space.md;
 
@@ -100,6 +124,10 @@ interface Env {
   days: Day[];
   total: number;
   height: number;
+  /** The whole timeline's height at each level, for clamping an auto-scroll. */
+  heights: number[];
+  padTop: number;
+  padBottom: number;
 }
 
 /**
@@ -119,7 +147,49 @@ interface Env {
  * down the rail is two thirds of the way down the archive, not two thirds of
  * the way down whatever happened to load.
  */
-export function Grid({ timeline }: { timeline: TimelineState }) {
+export function Grid({
+  timeline,
+  filter,
+  actions,
+  sortable = true,
+  immersive = true,
+  empty,
+}: {
+  timeline: TimelineState;
+  /**
+   * Which collection this grid is of, or undefined for the library. Published
+   * to the sort-and-filter control, which uses it to decide what there is left
+   * to filter by — inside the Videos category every item is a video, and inside
+   * an album nothing is in no album. See core's `facetsFor`.
+   */
+  filter?: TimelineFilter;
+  /**
+   * What can be done to a selection made here. Published for as long as this
+   * grid is mounted, which is what makes the floating control appear on the
+   * screens that have a gallery and nowhere else, and what drops a selection
+   * when one is navigated away from.
+   */
+  actions: SelectionActions;
+  /**
+   * Whether this grid claims the sort and the filters. The search results do
+   * not: the order there is the ranking and the filter is the query, so a
+   * control offering "Newest" over a relevance ranking would be one that either
+   * does nothing or throws the answer away.
+   */
+  sortable?: boolean;
+  /**
+   * Whether this grid owns the top of the screen.
+   *
+   * The library tab does: photographs run under the clock and the battery, the
+   * way a photo app's do, which is what the blurred strip at the top is for. A
+   * collection and the search results have a header above them instead, so
+   * there is nothing passing behind anything and the room under the status bar
+   * has already been taken.
+   */
+  immersive?: boolean;
+  /** What to say when the timeline is empty. */
+  empty?: string;
+}) {
   const insets = useSafeAreaInsets();
   const { width: screenWidth } = useWindowDimensions();
   const { days, total, ready, loading, error, retry, at: itemAt, request, patch } = timeline;
@@ -131,7 +201,7 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
   // which is drawn over the content rather than beside it. These two are the
   // only conversion between what `layout.ts` says and where things are on
   // screen: board y = scroll offset − padTop, and board x = screen x − GUTTER.
-  const padTop = insets.top + TOP_ROOM;
+  const padTop = (immersive ? insets.top : 0) + TOP_ROOM;
   const padBottom = insets.bottom + TAB_BAR_CLEARANCE + space.lg;
 
   // A timeline with no days reserves no room for the headings it will not draw,
@@ -156,7 +226,15 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
   const z = useSharedValue(savedLevel());
   const scrollY = useSharedValue(0);
 
-  const env = useRef<Env>({ levels, days, total, height: 0 });
+  const env = useRef<Env>({
+    levels,
+    days,
+    total,
+    height: 0,
+    heights: [],
+    padTop: 0,
+    padBottom: 0,
+  });
   /** Where the board's top edge has scrolled to, in board coordinates. */
   const top = useRef(0);
   const zoom = useRef(z.value);
@@ -174,7 +252,7 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
   // event arriving between renders never measures against a day table that has
   // been replaced. The browser's Timeline keeps its `env` the same way.
   useLayoutEffect(() => {
-    env.current = { levels, days, total, height: viewport };
+    env.current = { levels, days, total, height: viewport, heights, padTop, padBottom };
   });
 
   /**
@@ -195,6 +273,45 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
   const [pinching, setPinching] = useState(false);
   const [peek, setPeek] = useState<PeekTarget | null>(null);
   const [pinned, setPinned] = useState({ label: '', visible: false });
+
+  // ── The selection ──────────────────────────────────────────────────────────
+  //
+  // The state machine is core's, unchanged and shared with the browser: runs of
+  // indices, a drag that is always the run between where it began and where the
+  // finger is *now* — which is the whole of how dragging back the way you came
+  // undoes what you just picked, without anything having to remember the tiles
+  // the gesture touched on its way out. What is written here is the part that
+  // turns a point on the screen into an index.
+  const { active: picking, selected, enter, toggle, beginDrag, moveDrag, endDrag } =
+    useSelection();
+
+  /**
+   * Whether this is the grid being looked at.
+   *
+   * The browser needs no such question: a page navigated away from is
+   * unmounted. A phone keeps every tab it has visited mounted behind the one on
+   * top, so without this the library's grid would go on claiming the selection
+   * from underneath an album, and the floating controls would appear over the
+   * collections list — which has no grid in it at all.
+   *
+   * Blurred is not the same as gone: the viewer is a route above this one, so
+   * opening a photograph blurs the grid it came out of. What that costs is a
+   * selection, and a selection cannot be open at the time — a tap in selection
+   * mode picks rather than opens.
+   */
+  const focused = useIsFocused();
+  useSelectionScope(actions, focused);
+
+  // Read from inside gesture callbacks, which are created once per gesture and
+  // would otherwise close over whatever `picking` was at the time. Written in a
+  // layout effect rather than during render, for the reason `env` is: a gesture
+  // cannot begin before the frame it is answering has been committed, and a ref
+  // written during render is the one shape the React Compiler — on for this app
+  // and off for the browser — is entitled to be unhappy about.
+  const pickingNow = useRef(picking);
+  useLayoutEffect(() => {
+    pickingNow.current = picking;
+  });
 
   /**
    * Where a tile sits at every level, computed once and kept.
@@ -230,6 +347,35 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
       return built;
     };
   }, [levels]);
+
+  /**
+   * Puts a position at the top of the viewport — what jumping to a date is.
+   *
+   * The day's heading rather than the tile itself, so a jump lands on "March
+   * 2019" rather than a third of the way into it with the label off screen.
+   */
+  const jump = useCallback(
+    (index: number) => {
+      const e = env.current;
+      if (e.total === 0 || e.days.length === 0 || e.height === 0) return;
+      const day = dayIndexOf(e.days, clamp(index, 0, e.total - 1));
+      const limit = Math.max(0, valueAt(e.heights, zoom.current) + e.padTop + e.padBottom - e.height);
+      const to = clamp(valueAt(tops(day), zoom.current) + e.padTop - TOP_ROOM, 0, limit);
+      scroller.current?.scrollTo({ y: to, animated: false });
+      top.current = to - e.padTop;
+    },
+    [tops, scroller],
+  );
+
+  // What this grid is, said to the floating sort-and-filter control. Null from
+  // a grid that does not claim it, which is the search results — see the
+  // `sortable` prop.
+  useViewScope(
+    useMemo(
+      () => (sortable && focused ? { filter, days, loading, jump } : null),
+      [sortable, focused, filter, days, loading, jump],
+    ),
+  );
 
   /** What the grid is looking at, in item indices, at the zoom it is looking at it. */
   const rangeFor = useCallback((overscan: number): ItemRange => {
@@ -440,38 +586,51 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
 
   const boardStyle = useAnimatedStyle(() => ({ height: valueAt(heights, z.value) }));
 
-  // ── The tap and the hold ───────────────────────────────────────────────────
+  // ── The tap, the hold and the drag ─────────────────────────────────────────
 
   /**
-   * The photograph under a point on the screen, or nothing.
+   * The position under a point on the screen, or −1.
    *
    * `itemAtPoint` answers with the *nearest* tile, which is what a zoom wants —
-   * it has to anchor to something wherever the fingers land. A tap and a hold
-   * are the other case: they have to land *on* a photograph to mean one, and the
-   * gaps between tiles and the day headings above them are not photographs. So
-   * the square it names is checked rather than assumed.
-   *
-   * A square whose photograph has not been fetched yet names nothing either: the
-   * position is real, but there is no asset to enlarge and nothing for a viewer
-   * opened onto it to show.
+   * it has to anchor to something wherever the fingers land. A tap, a hold and
+   * a drag are the other case: they have to land *on* a photograph to mean one,
+   * and the gaps between tiles and the day headings above them are not
+   * photographs. So the square it names is checked rather than assumed.
    */
-  const photoAt = useCallback(
+  const positionAt = useCallback(
     (x: number, y: number) => {
       const e = env.current;
-      if (e.total === 0 || e.days.length === 0) return null;
+      if (e.total === 0 || e.days.length === 0) return -1;
       const at = frameAt(e.levels, zoom.current);
       const bx = x - GUTTER;
       const by = top.current + y;
       const index = itemAtPoint(e.days, e.total, at, bx, by);
+      const rect = rectAt(places(index), zoom.current);
+      if (bx < rect.x || bx > rect.x + rect.size) return -1;
+      if (by < rect.y || by > rect.y + rect.size) return -1;
+      return index;
+    },
+    [places],
+  );
+
+  /**
+   * The photograph under a point, as opposed to the position under it.
+   *
+   * A square whose photograph has not been fetched yet names a position and no
+   * asset: there is nothing to enlarge and nothing for a viewer opened onto it
+   * to show. A selection is the other way round — it is runs of indices
+   * precisely so that it can cover ground nobody has downloaded — which is why
+   * `positionAt` above stops short of asking the store.
+   */
+  const photoAt = useCallback(
+    (x: number, y: number) => {
+      const index = positionAt(x, y);
+      if (index < 0) return null;
       const item = itemAt(index);
       if (!item) return null;
-
-      const rect = rectAt(places(index), zoom.current);
-      if (bx < rect.x || bx > rect.x + rect.size) return null;
-      if (by < rect.y || by > rect.y + rect.size) return null;
-      return { index, item, rect };
+      return { index, item, rect: rectAt(places(index), zoom.current) };
     },
-    [itemAt, places],
+    [itemAt, places, positionAt],
   );
 
   const openPeek = useCallback(
@@ -480,6 +639,7 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
       if (!found) return;
       setPeek({
         item: found.item,
+        index: found.index,
         from: {
           x: found.rect.x + GUTTER,
           y: found.rect.y - top.current,
@@ -507,6 +667,271 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
     [photoAt],
   );
 
+  /**
+   * A tap, which means one of two things depending on what the grid is doing.
+   *
+   * Browsing, it opens the photograph. Picking, it picks or unpicks the one
+   * under the finger — and never opens the viewer, because a grid in selection
+   * mode that could still be navigated out of by a mis-tap is a selection
+   * somebody loses by accident.
+   */
+  const onTap = useCallback(
+    (x: number, y: number) => {
+      if (coasting.current) return;
+      if (!pickingNow.current) {
+        openViewer(x, y);
+        return;
+      }
+      const index = positionAt(x, y);
+      if (index < 0) return;
+      toggle(index);
+      void Haptics.selectionAsync();
+    },
+    [openViewer, positionAt, toggle],
+  );
+
+  // ── The drag that picks ────────────────────────────────────────────────────
+  //
+  // Sideways to start, then wherever you like: the grid only ever scrolls
+  // vertically, so a horizontal movement is a gesture nothing else wants and
+  // the one unambiguous way to begin picking without first going somewhere to
+  // turn picking on. Once it has begun, moving up or down runs the selection
+  // through the tiles on the way — and into the band at either edge, which
+  // pulls the timeline past the finger so a drag can cover more than a screen.
+  //
+  // This is iOS Photos' gesture, and it is the reason the hold is left alone to
+  // go on meaning "show me this one".
+
+  /** True from the moment the pan claims the gesture until it lets go. */
+  const painting = useRef(false);
+  /** Where the finger is, in screen coordinates, for the edge bands to read. */
+  const finger = useRef({ x: 0, y: 0 });
+  /** The last position picked, so crossing into a new tile can tick once. */
+  const lastPainted = useRef(-1);
+  const pulling = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [dragging, setDragging] = useState(false);
+
+  const paintAt = useCallback(
+    (x: number, y: number) => {
+      const index = positionAt(x, y);
+      if (index < 0 || index === lastPainted.current) return;
+      lastPainted.current = index;
+      moveDrag(index);
+      void Haptics.selectionAsync();
+    },
+    [positionAt, moveDrag],
+  );
+
+  /**
+   * One tick of the edge pull.
+   *
+   * The scroll offset is written here as well as read, because the handler that
+   * normally keeps `top` current is the scroll view's own and does not run
+   * until the frame after — and the selection this tick lays down is measured
+   * against where the grid is *now*.
+   */
+  const pull = useCallback(() => {
+    const e = env.current;
+    const { x, y } = finger.current;
+    if (e.height === 0) return;
+
+    const into =
+      y < EDGE_BAND ? -(1 - y / EDGE_BAND) : y > e.height - EDGE_BAND ? 1 - (e.height - y) / EDGE_BAND : 0;
+    if (into === 0) return;
+
+    const extent = valueAt(e.heights, zoom.current) + e.padTop + e.padBottom;
+    const limit = Math.max(0, extent - e.height);
+    const now = clamp(top.current + e.padTop + into * EDGE_SPEED, 0, limit);
+    if (now === top.current + e.padTop) return;
+
+    scroller.current?.scrollTo({ y: now, animated: false });
+    top.current = now - e.padTop;
+    paintAt(x, y);
+  }, [paintAt, scroller]);
+
+  const beginPaint = useCallback(
+    (x: number, y: number) => {
+      const index = positionAt(x, y);
+      if (index < 0) return;
+      painting.current = true;
+      finger.current = { x, y };
+      lastPainted.current = index;
+      setDragging(true);
+      // A drag that begins outside selection mode turns it on, which is the
+      // whole point of the gesture: it is the way in, not merely a faster way
+      // of doing what the pill already offers.
+      if (!pickingNow.current) enter();
+      beginDrag(index);
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      pulling.current ??= setInterval(pull, 16);
+    },
+    [positionAt, enter, beginDrag, pull],
+  );
+
+  const movePaint = useCallback(
+    (x: number, y: number) => {
+      if (!painting.current) return;
+      finger.current = { x, y };
+      paintAt(x, y);
+    },
+    [paintAt],
+  );
+
+  const endPaint = useCallback(() => {
+    if (pulling.current) {
+      clearInterval(pulling.current);
+      pulling.current = null;
+    }
+    if (!painting.current) return;
+    painting.current = false;
+    lastPainted.current = -1;
+    setDragging(false);
+    endDrag();
+  }, [endDrag]);
+
+  // A grid that unmounts mid-drag would otherwise leave the interval running.
+  useEffect(() => endPaint, [endPaint]);
+
+  const paint = useMemo(
+    () =>
+      Gesture.Pan()
+        // Sideways to claim it, and a vertical start hands it straight back to
+        // the scroll view. Fourteen points is far enough that a thumb drifting
+        // on its way to a flick never trips it.
+        .activeOffsetX([-14, 14])
+        .failOffsetY([-14, 14])
+        // The gesture only activates once the finger has already moved, so the
+        // tile it began on is where it was before that movement — not where it
+        // is now, which is a cell or two along.
+        .onStart((e) => {
+          runOnJS(beginPaint)(e.x - e.translationX, e.y - e.translationY);
+        })
+        .onUpdate((e) => {
+          runOnJS(movePaint)(e.x, e.y);
+        })
+        // Finalize rather than end: a gesture cancelled by a second finger
+        // coming down still has to commit the run it laid and stop pulling.
+        .onFinalize(() => {
+          runOnJS(endPaint)();
+        }),
+    [beginPaint, movePaint, endPaint],
+  );
+
+  /**
+   * What the hold offers, for the one photograph it lifted.
+   *
+   * Every row closes the peek first, and two of them have to: the album picker
+   * and the create-album form are sheets drawn by the app, and the peek is a
+   * `Modal` drawn over it — a sheet opened from in here would come up behind
+   * the very thing that asked for it. See src/actions/filing.
+   *
+   * Which rows there are is the scope's to decide, exactly as it is for the
+   * selection sheet: in the library a photograph can be filed, archived, hidden
+   * or deleted; in Recently Deleted it can come back or go for good; in the
+   * vault it can only come back out. Archive and Hide are drawn and inert until
+   * Phase 6 brings the gate that would let them run.
+   */
+  const peekActions = useMemo<Action[]>(() => {
+    if (!peek) return [];
+    const { item, index } = peek;
+    const noun = nounFor(item.kind);
+    const one = { kind: 'items', count: 1, noun } as const;
+    const target = { ids: [item.id] };
+    const picked = selected(index);
+    const shut = () => setPeek(null);
+
+    const rows: Action[] = [
+      {
+        key: 'select',
+        label: picked ? 'Deselect' : 'Select',
+        icon: picked ? 'x-circle' : 'check-circle',
+        onPress: () => {
+          shut();
+          if (!pickingNow.current) enter();
+          toggle(index);
+        },
+      },
+    ];
+
+    if (actions.scope === 'trash' || actions.scope === 'vault') {
+      rows.push({
+        key: 'restore',
+        label:
+          actions.scope === 'vault'
+            ? describeAction(actions.bucket === 'hidden' ? 'Unhide' : 'Unarchive', one)
+            : 'Restore',
+        icon: 'rotate-ccw',
+        onPress: () => {
+          shut();
+          void actions.restore(target, noun);
+        },
+      });
+    }
+
+    if (actions.scope !== 'trash') {
+      rows.push({
+        key: 'file',
+        label: 'Add to album',
+        icon: 'folder-plus',
+        onPress: () => {
+          shut();
+          askToFile({ target, noun, assetId: item.id });
+        },
+      });
+    }
+
+    if (actions.scope === 'library') {
+      rows.push(
+        {
+          key: 'archive',
+          label: describeAction('Archive', one),
+          icon: 'archive',
+          disabled: true,
+          note: 'Phase 6',
+        },
+        {
+          key: 'hide',
+          label: describeAction('Hide', one),
+          icon: 'eye-off',
+          disabled: true,
+          note: 'Phase 6',
+        },
+      );
+    }
+
+    const album = actions.scope === 'trash' ? undefined : actions.album;
+    if (album) {
+      rows.push({
+        key: 'unfile',
+        label: `${describeAction('Remove', one)} from album`,
+        icon: 'folder-minus',
+        armed: true,
+        onPress: () => {
+          shut();
+          void actions.unfile(album, target, noun);
+        },
+      });
+    }
+
+    if (actions.scope !== 'vault') {
+      rows.push({
+        key: 'delete',
+        label: describeAction(actions.scope === 'trash' ? 'Delete forever' : 'Delete', one),
+        icon: 'trash-2',
+        tone: 'destructive',
+        armed: true,
+        onPress: () => {
+          shut();
+          void (actions.scope === 'trash'
+            ? actions.purge(target, noun)
+            : actions.remove(target, noun));
+        },
+      });
+    }
+
+    return rows;
+  }, [peek, actions, selected, enter, toggle]);
+
   const hold = useMemo(
     () =>
       Gesture.LongPress()
@@ -523,14 +948,18 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
   const tap = useMemo(
     () =>
       Gesture.Tap().onEnd((e, ok) => {
-        if (ok) runOnJS(openViewer)(e.x, e.y);
+        if (ok) runOnJS(onTap)(e.x, e.y);
       }),
-    [openViewer],
+    [onTap],
   );
 
-  // Whichever wins: two fingers is a zoom, one finger held still is a peek, one
-  // finger down and up is a photograph opened, and no gesture is ever two.
-  const gestures = useMemo(() => Gesture.Race(pinch, hold, tap), [pinch, hold, tap]);
+  // Whichever wins: two fingers is a zoom, one finger dragged sideways picks a
+  // run, one finger held still is a peek, one finger down and up is a
+  // photograph opened or chosen, and no gesture is ever two.
+  const gestures = useMemo(
+    () => Gesture.Race(pinch, paint, hold, tap),
+    [pinch, paint, hold, tap],
+  );
 
   // ── Fetching ───────────────────────────────────────────────────────────────
 
@@ -635,9 +1064,9 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
           }}
           scrollEventThrottle={16}
           // A deceleration still running underneath the zoom would be fighting
-          // it for the same number: the anchor writes the scroll offset every
-          // frame to keep one photograph still.
-          scrollEnabled={!pinching && peek === null}
+          // it for the same number, and the scroll view's own pan would be
+          // fighting the drag that picks for the same finger.
+          scrollEnabled={!pinching && !dragging && peek === null}
           showsVerticalScrollIndicator={false}
           contentContainerStyle={{
             paddingTop: padTop,
@@ -663,9 +1092,18 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
                   thumb={thumb}
                   places={places(index)}
                   z={z}
+                  selecting={picking}
+                  selected={picking && selected(index)}
                 />
               ) : (
-                <Skeleton key={`@${index}`} box={box} places={places(index)} z={z} />
+                <Skeleton
+                  key={`@${index}`}
+                  box={box}
+                  places={places(index)}
+                  z={z}
+                  selecting={picking}
+                  selected={picking && selected(index)}
+                />
               ),
             )}
           </Animated.View>
@@ -677,14 +1115,20 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
           read as passing behind something; under nothing they read as broken.
           It is the same strip iOS puts there itself, and the reason expo-blur
           is a dependency at all. */}
-      <BlurView
-        intensity={28}
-        tint="dark"
-        style={[styles.statusScrim, { height: insets.top }]}
-        pointerEvents="none"
-      />
+      {immersive ? (
+        <BlurView
+          intensity={28}
+          tint="dark"
+          style={[styles.statusScrim, { height: insets.top }]}
+          pointerEvents="none"
+        />
+      ) : null}
 
-      <DatePill label={pinned.label} visible={pinned.visible} top={insets.top + space.xs} />
+      <DatePill
+        label={pinned.label}
+        visible={pinned.visible}
+        top={(immersive ? insets.top : 0) + space.xs}
+      />
 
       <Scrubber
         scroller={scroller}
@@ -694,7 +1138,7 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
         chrome={padTop + padBottom}
         viewport={viewport}
         label={pinned.label}
-        top={insets.top + space.xxl}
+        top={(immersive ? insets.top : 0) + space.xxl}
         bottom={padBottom}
       />
 
@@ -713,13 +1157,13 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
           the one worth making. */}
       {ready && !loading && total === 0 && !error ? (
         <View style={styles.empty} pointerEvents="none">
-          <Text variant="small" tone="muted">
-            Nothing here yet. Run a backup from the Backup tab.
+          <Text variant="small" tone="muted" style={styles.emptyText}>
+            {empty ?? 'Nothing here yet. Run a backup from the Backup tab.'}
           </Text>
         </View>
       ) : null}
 
-      <Peek target={peek} onClose={() => setPeek(null)} />
+      <Peek target={peek} actions={peekActions} onClose={() => setPeek(null)} />
     </View>
   );
 }
@@ -803,6 +1247,8 @@ const styles = StyleSheet.create({
     position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
     alignItems: 'center',
     justifyContent: 'center',
+    paddingHorizontal: space.xl,
     paddingBottom: TAB_BAR_CLEARANCE,
   },
+  emptyText: { textAlign: 'center' },
 });
