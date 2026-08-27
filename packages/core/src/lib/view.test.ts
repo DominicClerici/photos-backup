@@ -9,10 +9,12 @@ import assert from "node:assert/strict";
 
 import {
   byDuration,
+  collectionKey,
   DEFAULT_VIEW,
   describeView,
   facetsFor,
   facetsOn,
+  filterKey,
   isDefault,
   isFiltered,
   pickSort,
@@ -168,4 +170,32 @@ test("the pill says the shortest true thing", () => {
     describeView({ sort: "longest", media: "video", favorites: true, unalbumed: true }),
     "Longest · 3 filters",
   );
+});
+
+test("collectionKey separates the collection from the order it is read in", () => {
+  const newest: View = { sort: "newest" };
+  const oldest: View = { sort: "oldest" };
+
+  assert.equal(collectionKey(undefined, newest), collectionKey(undefined, { sort: "newest" }));
+  assert.notEqual(collectionKey(undefined, newest), collectionKey(undefined, oldest));
+
+  // Two albums share nothing, and neither is the library.
+  assert.notEqual(
+    collectionKey({ kind: "albums", value: "3" }, newest),
+    collectionKey({ kind: "albums", value: "4" }, newest),
+  );
+  assert.notEqual(collectionKey({ kind: "albums", value: "3" }, newest), collectionKey(undefined, newest));
+
+  // A bucket browsed inside a person is not that person browsed in the library,
+  // and it is not the bucket either.
+  const hidden = collectionKey({ kind: "vault", bucket: "hidden" }, newest);
+  const within = collectionKey(
+    { kind: "vault", bucket: "hidden", within: { kind: "people", value: "9" } },
+    newest,
+  );
+  assert.notEqual(hidden, within);
+  assert.notEqual(within, collectionKey({ kind: "people", value: "9" }, newest));
+  assert.notEqual(hidden, collectionKey({ kind: "vault", bucket: "archive" }, newest));
+
+  assert.equal(filterKey({ kind: "trash" }), "trash");
 });

@@ -31,6 +31,38 @@ export function viewKey(view: View): string {
   ].join("|");
 }
 
+/**
+ * A stable string for the collection itself, as opposed to how it is being
+ * looked at. Undefined is the library.
+ *
+ * Every field is in it, because two filters that differ anywhere are two
+ * different timelines: album 3 and album 4 share nothing, and the Hidden bucket
+ * browsed inside a person is not that person browsed in the library.
+ */
+export function filterKey(filter?: TimelineFilter): string {
+  if (!filter) return "library";
+  if (filter.kind === "trash") return "trash";
+  if (filter.kind === "vault") {
+    return filter.within
+      ? `vault:${filter.bucket}:${filter.within.kind}:${filter.within.value}`
+      : `vault:${filter.bucket}`;
+  }
+  return `${filter.kind}:${filter.value}`;
+}
+
+/**
+ * The whole address of a grid: which collection, in which order, narrowed how.
+ *
+ * What an offline cache is keyed by, and the reason it is keyed by both halves.
+ * A day table describes one collection read one way — index 2 of an album
+ * sorted oldest-first is a different photograph from index 2 of the same album
+ * sorted newest-first — so a cache that keyed on the collection alone would
+ * hand a reorder somebody else's geometry. See WEB_TO_MOBILE § 3.6.
+ */
+export function collectionKey(filter: TimelineFilter | undefined, view: View): string {
+  return `${filterKey(filter)}#${viewKey(view)}`;
+}
+
 /** Whether this is the timeline a grid opens as: newest first, nothing hidden. */
 export function isDefault(view: View): boolean {
   return view.sort === "newest" && !isFiltered(view);

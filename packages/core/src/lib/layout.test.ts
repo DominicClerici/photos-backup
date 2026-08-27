@@ -20,6 +20,7 @@ import {
   thumbSizeFallbacks,
   thumbSizeFor,
   tileRect,
+  tileRectAt,
   visibleItems,
   DEFAULT_ZOOM,
   MAX_ZOOM,
@@ -389,4 +390,39 @@ test("thumbSizeFallbacks offers every size exactly once", () => {
     assert.equal(new Set(chain).size, THUMB_SIZES.length);
     assert.equal(chain[0], size);
   }
+});
+
+test("tileRectAt is the settled level tileRect blends between", () => {
+  const days = daysFrom([
+    { day: "2024-05-02", count: 7 },
+    { day: "2024-05-01", count: 3 },
+  ]);
+  const levels = [64, 160, 384].map((cap) => layoutLevel(days, metricsFor(800, cap)));
+
+  // A frame parked exactly on a level is that level, and every tile in it sits
+  // precisely where the level put it — which is what lets the phone place a
+  // tile from a table of per-level rects and never consult the day model again.
+  for (let i = 0; i < levels.length - 1; i++) {
+    const frame = frameAt(levels, i);
+    for (const [day, offset] of [
+      [0, 0],
+      [0, 6],
+      [1, 2],
+    ] as const) {
+      assert.deepEqual(tileRect(frame, day, offset), tileRectAt(levels[i], day, offset));
+    }
+  }
+});
+
+test("a tile's place is the lerp of its two level rects", () => {
+  const days = daysFrom([{ day: "2024-05-02", count: 40 }]);
+  const levels = [96, 256].map((cap) => layoutLevel(days, metricsFor(390, cap)));
+
+  const a = tileRectAt(levels[0], 0, 17);
+  const b = tileRectAt(levels[1], 0, 17);
+  const half = tileRect(frameAt(levels, 0.5), 0, 17);
+
+  assert.ok(Math.abs(half.x - (a.x + b.x) / 2) < 1e-9);
+  assert.ok(Math.abs(half.y - (a.y + b.y) / 2) < 1e-9);
+  assert.ok(Math.abs(half.size - (a.size + b.size) / 2) < 1e-9);
 });

@@ -1,37 +1,25 @@
-import { StyleSheet } from 'react-native';
+import { useTimeline } from '@photobackup/core/react';
 
-import { useArchive } from '../../src/state/archive';
-import { formatCount } from '../../src/stats/format';
-import { Empty, Screen, Text } from '../../src/ui';
+import { Grid } from '../../src/grid';
 
 /**
- * Empty on purpose. The timeline arrives in Phase 3.
+ * The timeline.
  *
- * The one thing it can honestly say now is how much there is to draw, which it
- * knows because `ArchiveProvider` asks photod for the archive's totals as soon
- * as there is an address and a token. That number is the evidence the transport
- * seam from Phase 1 is working end to end on the phone — the same evidence the
- * gallery-access check in settings gives, without having to be pressed.
+ * `useTimeline` is core's, unmodified: the sparse-array-over-a-day-table store
+ * with its own fetch scheduler, which is the most load-bearing thing in the
+ * gallery and touches nothing but `fetch`, `AbortController` and refs. The
+ * browser mounts the same hook against the same endpoints; what differs is the
+ * transport underneath it, installed once in `src/archive.ts`, and the fact
+ * that every rendition here carries the device token in a header rather than a
+ * cookie. See WEB_TO_MOBILE § 3.2.
+ *
+ * No filter and no view: this is the library, newest first. The sort-and-filter
+ * control and the collections that would pass a filter are Phase 5. The third
+ * argument — the offline store — is the seam WEB_TO_MOBILE § 3.6 asks to be
+ * built now and filled in Phase 6; passing nothing is exactly what the browser
+ * does, and is why nothing about the hook's behaviour changed when it grew.
  */
 export default function GalleryRoute() {
-  const { stats } = useArchive();
-  const assets = stats?.stats.archive.assets ?? null;
-
-  return (
-    <Screen title="Gallery" scrolls={false}>
-      <Empty icon="image" title="The timeline lands in Phase 3">
-        <Text variant="small" tone="faint" style={styles.centred}>
-          {assets === null
-            ? 'The archive has not answered yet.'
-            : `${formatCount(assets)} items are waiting in the archive.`}
-        </Text>
-      </Empty>
-    </Screen>
-  );
+  const timeline = useTimeline();
+  return <Grid timeline={timeline} />;
 }
-
-// React Native does not cascade `textAlign`, so a paragraph inside a centred
-// column still sets its own.
-const styles = StyleSheet.create({
-  centred: { textAlign: 'center' },
-});

@@ -6,11 +6,12 @@ import {
   fetchTimeline,
   fetchTimelineDays,
   fetchTimelineIndex,
+  type DayTable,
   type TimelineFilter,
   type TimelineItem,
   type View,
 } from "../wire/api.ts";
-import { DEFAULT_VIEW, viewKey } from "../lib/view.ts";
+import { collectionKey, DEFAULT_VIEW, viewKey } from "../lib/view.ts";
 import {
   countOf,
   dayIndexOf,
@@ -48,6 +49,41 @@ const MAX_IN_FLIGHT = 3;
  * browser tab pinned at 100%.
  */
 const MAX_RESYNCS = 3;
+
+/**
+ * Somewhere to keep a timeline between one launch and the next.
+ *
+ * The browser has no offline story and needs none: it is on the machine's
+ * network or it is not open. A phone is routinely out of reach of the archive,
+ * and a gallery that is a blank screen on the train is not a gallery. So this
+ * is a seam rather than a feature — the store is optional, everything works
+ * without it, and what it buys is that the geometry and the ground already
+ * walked are there before the network answers.
+ *
+ * Every method is keyed by `collectionKey`, which names the collection *and*
+ * the order it was read in: index 2 of an album sorted oldest-first is a
+ * different photograph from index 2 of the same album sorted newest-first, so a
+ * cache keyed on the collection alone would hand a reorder somebody else's
+ * geometry.
+ *
+ * Reads may answer null for anything — a miss, an expiry, a store that failed
+ * to open — and must not reject; a cache that can throw is a cache that can
+ * take the gallery down with it. Writes are fire-and-forget for the same
+ * reason. Nothing here is ever merged: see WEB_TO_MOBILE § 3.6 on why
+ * invalidation is a whole-key drop.
+ */
+export interface TimelineStore {
+  /** The day table last seen for this collection, or null. */
+  days(key: string): Promise<DayTable | null>;
+  /**
+   * A page of items, numbered from zero and `PAGE_SIZE` wide — the same
+   * granularity the fetch scheduler uses, so a cached page and a fetched one
+   * are never the same stretch of timeline under two different offsets.
+   */
+  page(key: string, page: number): Promise<TimelineItem[] | null>;
+  saveDays(key: string, table: DayTable): void;
+  savePage(key: string, page: number, items: TimelineItem[]): void;
+}
 
 export interface TimelineState {
   /** Every heading the collection will draw, with its size and its position. */
@@ -123,8 +159,17 @@ export interface TimelineState {
  * object, so that an equal view spelled twice does not refetch the archive.
  * Everything else about a reorder is a reload, which is what the day table
  * already knows how to be.
+ *
+ * `store` is the offline seam and defaults to nothing, which is exactly what
+ * the browser passes. When one is given, the table and the pages are read
+ * through it: whichever answers first is drawn, and the network always replaces
+ * what the cache painted. See TimelineStore.
  */
-export function useTimeline(filter?: TimelineFilter, view: View = DEFAULT_VIEW): TimelineState {
+export function useTimeline(
+  filter?: TimelineFilter,
+  view: View = DEFAULT_VIEW,
+  store: TimelineStore | null = null,
+): TimelineState {
   // The React Compiler is on in the mobile app and off in web, and once core's
   // hooks resolved to a path outside node_modules the app's Babel started
   // compiling them. This hook is the one shape a compiler should not touch: it
@@ -155,6 +200,10 @@ export function useTimeline(filter?: TimelineFilter, view: View = DEFAULT_VIEW):
   asked.current = filter;
   const looking = useRef(view);
   looking.current = view;
+  // Read the same way and for the same reason: a cache handed in as a prop is
+  // the app's, not this hook's, and swapping one must not refetch the archive.
+  const kept = useRef(store);
+  kept.current = store;
   const key = viewKey(view);
 
   const items = useRef<(TimelineItem | undefined)[]>([]);
@@ -204,23 +253,27 @@ export function useTimeline(filter?: TimelineFilter, view: View = DEFAULT_VIEW):
    * Writes a page into its slots, unless it does not belong in them. Returns
    * whether it was kept.
    */
+  /** Writes a page into its slots, with no opinion about whether it belongs. */
+  const write = useCallback((page: number, fetched: TimelineItem[]) => {
+    const start = page * PAGE_SIZE;
+    for (let n = 0; n < fetched.length; n++) {
+      items.current[start + n] = fetched[n];
+      byID.current.set(fetched[n].id, start + n);
+    }
+  }, []);
+
   const accept = useCallback(
     (page: number, fetched: TimelineItem[]): boolean => {
-      const start = page * PAGE_SIZE;
-
       // Dropped only if starting over is still on the table. With the budget
       // spent it is written where it landed instead: a page that keeps being
       // rejected is a page that keeps being refetched, and a grid that is a
       // little wrong beats one that never stops asking.
-      if (misplaced(model.current, start, fetched) && stale()) return false;
+      if (misplaced(model.current, page * PAGE_SIZE, fetched) && stale()) return false;
 
-      for (let n = 0; n < fetched.length; n++) {
-        items.current[start + n] = fetched[n];
-        byID.current.set(fetched[n].id, start + n);
-      }
+      write(page, fetched);
       return true;
     },
-    [stale],
+    [stale, write],
   );
 
   /**
@@ -278,6 +331,22 @@ export function useTimeline(filter?: TimelineFilter, view: View = DEFAULT_VIEW):
       const controller = new AbortController();
       inFlight.current.set(page, controller);
 
+      const cache = kept.current;
+      const where = collectionKey(asked.current, looking.current);
+
+      // Served *while* the request is in flight rather than instead of it, and
+      // never marked done: a scroll back through ground already visited shows
+      // the photographs again immediately, and the answer that replaces them a
+      // moment later is the one from the archive. A page the table no longer
+      // agrees with is dropped in silence — a stale cache is not the timeline
+      // changing underneath us, so it must not spend a resync.
+      cache?.page(where, page).then((held) => {
+        if (!held || !inFlight.current.has(page) || done.current.has(page)) return;
+        if (misplaced(model.current, page * PAGE_SIZE, held)) return;
+        write(page, held);
+        bump((n) => n + 1);
+      });
+
       // A cursor when the page before this one handed us one, which is every
       // page reached by scrolling down; a row offset only for a page nothing
       // has walked to. See PageStart in lib/api.
@@ -290,6 +359,7 @@ export function useTimeline(filter?: TimelineFilter, view: View = DEFAULT_VIEW):
           inFlight.current.delete(page);
           if (!accept(page, fetched.items)) return;
           done.current.add(page);
+          cache?.savePage(where, page, fetched.items);
           if (fetched.next_cursor && fetched.items.length === PAGE_SIZE) {
             cursors.current.set(page + 1, fetched.next_cursor);
           }
@@ -323,23 +393,56 @@ export function useTimeline(filter?: TimelineFilter, view: View = DEFAULT_VIEW):
     setError(null);
     setRefreshing(true);
 
+    const cache = kept.current;
+    const where = collectionKey(asked.current, looking.current);
+    /** Whichever table is on screen, so the archive's can be compared to it. */
+    let painted: DayTable | null = null;
+    let answered = false;
+
+    const adopt = (table: DayTable) => {
+      painted = table;
+      model.current = daysFrom(table.days);
+      setDays(model.current);
+      setTotal(table.total);
+      setReady(true);
+      bump((n) => n + 1);
+      pump();
+    };
+
+    // Geometry before connectivity. A table held from last time is the whole
+    // shape of the collection — every heading, every count — so the grid is
+    // laid out at full size and scrollable before the archive has said a word,
+    // and the pages start arriving into squares that are already in the right
+    // places. `refreshing` stays true throughout: a table is still in flight,
+    // and anything reading a position out of this one has to know that.
+    cache?.days(where).then((held) => {
+      if (!held || answered || controller.signal.aborted) return;
+      items.current = new Array(held.total);
+      adopt(held);
+    });
+
     fetchTimelineDays(asked.current, looking.current, controller.signal)
       .then((table) => {
         if (controller.signal.aborted) return;
-        const built = daysFrom(table.days);
-        model.current = built;
-        items.current = new Array(table.total);
-        setDays(built);
-        setTotal(table.total);
-        setReady(true);
+        answered = true;
+        // A cached table the archive still agrees with is one whose pages are
+        // still good, and throwing them away to refetch what is already on
+        // screen is the one thing the cache exists to avoid. Any other is a
+        // timeline nobody is looking at, and everything drawn from it goes.
+        if (!painted || !sameTable(painted, table)) {
+          if (painted) clear();
+          items.current = new Array(table.total);
+        }
+        adopt(table);
         setRefreshing(false);
-        bump((n) => n + 1);
-        pump();
+        cache?.saveDays(where, table);
       })
       .catch((err: unknown) => {
         if (controller.signal.aborted) return;
         // Fatal in a way a missing page is not: with no table there is no grid
-        // to put placeholders in, so this is the one error worth stopping for.
+        // to put placeholders in, so this is the one error worth stopping for
+        // — unless a cached one is already drawn, in which case what is on
+        // screen is last time's archive and the notice says the rest.
         setError(err instanceof Error ? err.message : "could not load the timeline");
         setReady(true);
         setRefreshing(false);
@@ -416,6 +519,24 @@ export function useTimeline(filter?: TimelineFilter, view: View = DEFAULT_VIEW):
     }),
     [days, total, ready, refreshing, error, retry, at, indexOf, locate, request, patch, version],
   );
+}
+
+/**
+ * Whether two day tables describe the same timeline.
+ *
+ * Element-wise, because that is what "the pages drawn from the old one are
+ * still in the right squares" actually means: a run that gained a photograph
+ * shifts every index after it, and a total that happens to match says nothing
+ * about where the headings fell. One walk of a few thousand entries, once per
+ * load, against the alternative of refetching a screenful that was already
+ * correct.
+ */
+function sameTable(a: DayTable, b: DayTable): boolean {
+  if (a.total !== b.total || a.days.length !== b.days.length) return false;
+  for (let i = 0; i < a.days.length; i++) {
+    if (a.days[i].day !== b.days[i].day || a.days[i].count !== b.days[i].count) return false;
+  }
+  return true;
 }
 
 /**

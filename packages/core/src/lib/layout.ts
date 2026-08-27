@@ -302,7 +302,18 @@ export function frameAt(levels: LevelLayout[], z: number): Frame {
   };
 }
 
-function placeIn(layout: LevelLayout, day: number, offset: number): Rect {
+/**
+ * Where one tile sits at a single settled level, before any blending.
+ *
+ * Exported because it is the whole of what a caller needs to place a tile
+ * without holding the day model: the seven rects a tile can occupy are seven
+ * calls to this, and from then on its position is a lerp between two of them
+ * and nothing else. The browser has no use for that — it recomputes from the
+ * frame on every pass of its own loop — but the phone runs the zoom on a
+ * separate thread from React, where a table of numbers crosses cheaply and a
+ * day model of ten thousand entries does not. See expo-app/src/grid/geometry.
+ */
+export function tileRectAt(layout: LevelLayout, day: number, offset: number): Rect {
   const m = layout.metrics;
   const step = m.cellSize + m.gap;
   const row = Math.floor(offset / m.columns);
@@ -316,8 +327,8 @@ function placeIn(layout: LevelLayout, day: number, offset: number): Rect {
 
 /** Where one tile sits, given its day and its position inside that day. */
 export function tileRect(frame: Frame, day: number, offset: number): Rect {
-  const a = placeIn(frame.a, day, offset);
-  const b = placeIn(frame.b, day, offset);
+  const a = tileRectAt(frame.a, day, offset);
+  const b = tileRectAt(frame.b, day, offset);
   return {
     x: lerp(a.x, b.x, frame.f),
     y: lerp(a.y, b.y, frame.f),
