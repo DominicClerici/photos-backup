@@ -2,6 +2,7 @@
   "expo": {
     "name": "photobackup",
     "slug": "photobackup",
+    "scheme": "photobackup",
     "version": "0.1.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -36,7 +37,10 @@
         }
       ],
       "expo-sqlite",
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-router",
+      "expo-image",
+      "expo-video"
     ],
     "experiments": {
       "reactCompiler": true

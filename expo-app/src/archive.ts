@@ -1,4 +1,4 @@
-import { configure, installNotifier, rearmUnauthorized } from '@photobackup/core';
+import { configure, rearmUnauthorized } from '@photobackup/core';
 
 /**
  * Where the archive is, from this phone, and what proves it is this phone.
@@ -79,19 +79,9 @@ configure({
   },
 });
 
-/**
- * Somewhere for core's hooks to report a failed write.
- *
- * The console until Phase 2 gives the app a Toast to put them in. A no-op would
- * have done — core's default is one — but a delete that fails silently during
- * the port is exactly the thing worth being able to see in the Metro log.
+/*
+ * The notifier that used to be installed here — the one that wrote a failed
+ * delete to the console because there was nowhere else to put it — is gone.
+ * `src/ui/toast.ts` installs the real one now, and `app/_layout.tsx` calls it
+ * before the first screen mounts. Nothing else about this file changed.
  */
-installNotifier({
-  add: (notice) => {
-    const body = [notice.title, notice.description].filter(Boolean).join(' — ');
-    if (notice.type === 'error') console.warn(`[archive] ${body}`);
-    else console.log(`[archive] ${body}`);
-    return '';
-  },
-  close: () => {},
-});
