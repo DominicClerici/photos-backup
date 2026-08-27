@@ -8,7 +8,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import type { ParsedQuery } from "./api.ts";
+import type { ParsedQuery } from "../wire/api.ts";
 import {
   asks,
   askFor,

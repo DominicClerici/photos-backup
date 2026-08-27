@@ -20,7 +20,7 @@ import {
   viewKey,
   withinFacets,
 } from "./view.ts";
-import type { TimelineFilter, View } from "./api.ts";
+import type { TimelineFilter, View } from "../wire/api.ts";
 
 const EVERYWHERE = { media: true, favorites: true, unalbumed: true };
 

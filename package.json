@@ -1,0 +1,10 @@
+{
+  "name": "photos-backup",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "pnpm --filter photos-backup-web run build",
+    "test": "pnpm --recursive run test",
+    "typecheck": "pnpm --filter @photobackup/core run typecheck && pnpm --filter photos-backup-web run lint && pnpm --filter photobackup run typecheck"
+  }
+}

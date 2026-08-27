@@ -28,7 +28,7 @@ import {
   type Day,
   type LevelLayout,
 } from "./layout.ts";
-import type { DayRun } from "./api.ts";
+import type { DayRun } from "../wire/api.ts";
 
 /**
  * The day model a server table of these run lengths produces, newest first.

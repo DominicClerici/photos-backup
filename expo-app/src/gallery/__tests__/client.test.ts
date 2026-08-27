@@ -1,3 +1,5 @@
+import { configure } from '@photobackup/core';
+
 import { isUnauthorized, SyncError } from '../../sync/types';
 import { checkGalleryAccess } from '../check';
 import { GalleryClient } from '../client';
@@ -45,7 +47,23 @@ function bytes(length: number, contentType: string): Response {
   });
 }
 
+/**
+ * A client, and the shared transport pointed at the same archive.
+ *
+ * src/archive does this for the app, from module state discovery and pairing
+ * write into. Here the two are one function because every test that has a
+ * client also has an access check behind it, and the fourth step of that check
+ * reads through @photobackup/core rather than through the client — an
+ * unconfigured transport would fail it with "configure has not been called"
+ * rather than with whatever the test is about.
+ */
 function clientWith(token: string | null, base = 'https://server.local:8787') {
+  configure({
+    baseUrl: () => base,
+    headers: (): Record<string, string> =>
+      token ? { authorization: `Bearer ${token}` } : {},
+    onUnauthorized: () => {},
+  });
   return new GalleryClient(
     () => base,
     () => token
@@ -179,14 +197,31 @@ describe('the access check', () => {
     state: 'ready',
   };
 
-  /** photod since Phase 6: reads on the TLS listener want a token. */
+  const dayTable = { tz: 'Europe/London', total: 1, days: [{ day: '2026-08-01', count: 1 }] };
+
+  /**
+   * photod since Phase 6: reads on the TLS listener want a token.
+   *
+   * The day table is listed first everywhere both appear, because fakeFetch
+   * routes on a substring and "/v1/timeline" is a prefix of
+   * "/v1/timeline/days" — the timeline route would answer both and the check's
+   * fourth step would get a page where it asked for a table.
+   */
+  const guardedDays: Route = [
+    '/v1/timeline/days',
+    (call) => (authorization(call) ? json(dayTable) : json({ error: 'no token' }, 401)),
+  ];
   const guardedTimeline: Route = [
     '/v1/timeline',
     (call) => (authorization(call) ? json({ items: [item] }) : json({ error: 'no token' }, 401)),
   ];
 
   test('passes when reads are authorized and anonymous reads are refused', async () => {
-    fakeFetch([['/thumb', () => bytes(12_800, 'image/webp')], guardedTimeline]);
+    fakeFetch([
+      ['/thumb', () => bytes(12_800, 'image/webp')],
+      guardedDays,
+      guardedTimeline,
+    ]);
 
     const result = await checkGalleryAccess(clientWith('pbk_good'));
 
@@ -194,7 +229,9 @@ describe('the access check', () => {
       ['Read the timeline', true],
       ['Fetch a thumbnail', true],
       ['Refuse the same read without the token', true],
+      ['Read the timeline through the shared client', true],
     ]);
+    expect(result.steps[3].detail).toContain('1 items over 1 days');
     expect(result.ok).toBe(true);
     expect(result.unauthorized).toBe(false);
   });
@@ -204,6 +241,7 @@ describe('the access check', () => {
   test('fails when the server answers an unpaired caller', async () => {
     fakeFetch([
       ['/thumb', () => bytes(12_800, 'image/webp')],
+      ['/v1/timeline/days', () => json(dayTable)],
       ['/v1/timeline', () => json({ items: [item] })],
     ]);
 
@@ -214,7 +252,7 @@ describe('the access check', () => {
   });
 
   test('flags a revoked pairing rather than blaming the network', async () => {
-    fakeFetch([guardedTimeline]);
+    fakeFetch([guardedDays, guardedTimeline]);
 
     const result = await checkGalleryAccess(clientWith(null));
 
@@ -228,6 +266,7 @@ describe('the access check', () => {
   test('does not mistake a missing derivative for a refusal', async () => {
     fakeFetch([
       ['/thumb', () => json({ error: 'derivative not generated yet' }, 404)],
+      guardedDays,
       guardedTimeline,
     ]);
 
@@ -239,6 +278,13 @@ describe('the access check', () => {
 
   test('reports an empty archive as a pass, not a failure', async () => {
     fakeFetch([
+      [
+        '/v1/timeline/days',
+        (call) =>
+          authorization(call)
+            ? json({ tz: 'Europe/London', total: 0, days: [] })
+            : json({ error: 'no token' }, 401),
+      ],
       [
         '/v1/timeline',
         (call) => (authorization(call) ? json({ items: [] }) : json({ error: 'no token' }, 401)),

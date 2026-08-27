@@ -9,9 +9,24 @@ photod is the front door. Start it, and open **its** address — not this app's.
 
 ```sh
 cd ../server && go run ./cmd/photod    # HTTPS on :8787
-pnpm install
+pnpm install                           # from the repo root — see below
 pnpm dev                               # 127.0.0.1:3000, reached only through photod
 ```
+
+**Install from the repo root, not from here.** This app is one of three packages
+in a pnpm workspace: it shares `@photobackup/core` with `expo-app`, and there is
+one lockfile, at the root. Running an install in this directory alone will not
+link the shared package.
+
+`@photobackup/core` holds the wire client and the pure modules — the grid
+geometry, the sort-and-filter rules, selections as ranges, the zoom, query
+parsing, the formatters — plus the portable hooks under
+`@photobackup/core/react`. `src/lib/api.ts` and the files in `src/hooks` are
+re-exports of it; what is genuinely this app's is `src/lib/archive.ts`, which
+installs the transport (`/api`, the cookie, and a 401 that goes to the sign-in
+page), `src/lib/notify.ts`, which hands core's hooks this app's toast, and the
+three things in `api.ts` only a browser can do: the XHR upload, the WebAuthn
+ceremony, and signing out.
 
 | variable | default | meaning |
 |---|---|---|

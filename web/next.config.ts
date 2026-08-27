@@ -1,3 +1,5 @@
+import path from "node:path"
+
 import type { NextConfig } from "next"
 
 // photod is the front door, and this app sits behind it.
@@ -30,6 +32,21 @@ const nextConfig: NextConfig = {
   // under ProtectSystem=strict with one writable path, and what keeps a
   // redeploy from needing a package manager on the archive machine at all.
   output: "standalone",
+
+  // @photobackup/core lives above this directory, so tracing has to start at
+  // the repo root or the shared package is left out of the standalone tree.
+  //
+  // The cost is that the build nests: the app is written under its path
+  // relative to this root, so the server lands at
+  // .next/standalone/web/server.js with a hoisted node_modules beside it rather
+  // than at .next/standalone/server.js. deploy/photobackup-admin's web_build
+  // absorbs that when it stages, so /opt/photoweb's layout, the unit file and
+  // web_install's guard are all unchanged.
+  outputFileTracingRoot: path.join(import.meta.dirname, ".."),
+
+  // core ships TypeScript source rather than a build — there is no compile step
+  // in the package, because both consumers already have one. This is Next's.
+  transpilePackages: ["@photobackup/core"],
 }
 
 export default nextConfig

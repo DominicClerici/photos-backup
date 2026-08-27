@@ -1,3 +1,5 @@
+import { ApiError, fetchTimeline, fetchTimelineDays, media } from '@photobackup/core';
+
 import { errorText, isUnauthorized, SyncError } from '../sync/types';
 import type { GalleryClient } from './client';
 
@@ -34,9 +36,16 @@ export type CheckResult = {
  *     needs no signed URLs.
  *  3. The same request without the token is refused — so step 1 passing means
  *     the pairing is doing the work, not that the door is open.
+ *  4. The client both apps share reads the same timeline, and its day table,
+ *     through the transport installed in src/archive.
  *
  * Step 3 is the one worth keeping once the real gallery lands. A read path that
- * quietly stopped checking tokens would leave the other two green.
+ * quietly stopped checking tokens would leave the other three green.
+ *
+ * Step 4 is the last one of Phase 1 and the first of everything after it: the
+ * grid is built on `fetchTimelineDays` returning an exact total before a single
+ * photograph has been fetched, so proving the phone can get one is proving the
+ * geometry has something to be exact about.
  */
 export async function checkGalleryAccess(client: GalleryClient): Promise<CheckResult> {
   const steps: CheckStep[] = [];
@@ -88,6 +97,10 @@ export async function checkGalleryAccess(client: GalleryClient): Promise<CheckRe
 
   steps.push(await checkAnonymousReadIsRefused(client));
 
+  const shared = await checkSharedClientReads();
+  unauthorized = unauthorized || shared.unauthorized;
+  steps.push(shared.step);
+
   return { steps, ok: steps.every((step) => step.ok), unauthorized };
 }
 
@@ -127,4 +140,55 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * The same archive, read through @photobackup/core.
+ *
+ * Nothing here passes an address or a token: both are the transport installed
+ * in src/archive, which core reads per request. That is the whole of what this
+ * step is checking — that the shared client, which knows nothing about phones,
+ * reaches photod with the device token from the keychain on it.
+ *
+ * The day table comes back with a total the grid will use for its scroll height
+ * before it has fetched anything, and the page is logged rather than only
+ * counted, because in Phase 1 the Metro console is the only screen there is.
+ */
+async function checkSharedClientReads(): Promise<{ step: CheckStep; unauthorized: boolean }> {
+  const label = 'Read the timeline through the shared client';
+  try {
+    const [days, page] = await Promise.all([
+      fetchTimelineDays(),
+      fetchTimeline({ skip: 0 }, 60),
+    ]);
+
+    const first = page.items[0];
+    console.log(
+      `[core] day table: ${days.total} items over ${days.days.length} days, filed in ${days.tz}`
+    );
+    console.log(
+      `[core] timeline: ${page.items.length} items` +
+        (first
+          ? `, newest ${first.id.slice(0, 8)} (${first.kind}, ${first.taken_at}, ${first.state})` +
+            `, thumb at ${media(first.id, 'thumb').uri}`
+          : ' — the archive is empty')
+    );
+
+    return {
+      step: {
+        label,
+        ok: true,
+        detail: `${days.total} items over ${days.days.length} days in ${days.tz}; read ${page.items.length}`,
+      },
+      unauthorized: false,
+    };
+  } catch (e) {
+    // core speaks ApiError, not SyncError: it does not know what a sync engine
+    // is and should not. `isUnauthorized` is the engine's word for the same
+    // thing and would quietly answer false here.
+    return {
+      step: { label, ok: false, detail: errorText(e) },
+      unauthorized: e instanceof ApiError && e.status === 401,
+    };
+  }
 }

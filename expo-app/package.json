@@ -4,6 +4,7 @@
   "main": "index.ts",
   "packageManager": "pnpm@11.5.2",
   "dependencies": {
+    "@photobackup/core": "workspace:*",
     "expo": "~57.0.11",
     "expo-battery": "^57.0.1",
     "expo-dev-client": "~57.0.10",

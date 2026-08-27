@@ -423,6 +423,22 @@ web_port() {
 # client assets where they were — so .next/static has to be carried across by
 # hand. A gallery deployed without it renders once and then loads no JavaScript
 # and no CSS at all, which looks like a broken app rather than a broken deploy.
+#
+# Since the gallery started importing @photobackup/core, which lives above web/,
+# tracing has to start at the repo root — and Next writes the app under its path
+# relative to that root. So the tree it produces is two levels rather than one:
+#
+#   .next/standalone/web/server.js       the app, with its own node_modules
+#   .next/standalone/node_modules/.pnpm  the hoisted store the app links into
+#
+# Both halves are needed and exactly one link crosses between them, so the tree
+# is staged whole rather than flattened: flattening would mean rewriting that
+# link, and a link left pointing two directories above the stage points at /opt
+# on the archive machine. What absorbs the nesting instead is the last line —
+# a relative symlink at the stage root, so /opt/photoweb/server.js still exists,
+# web_install's guard still finds it, and photoweb.service's ExecStart is
+# unchanged. node resolves it to its real path, so the app still runs with
+# __dirname inside web/ where its .next is.
 web_build() {
 	if [ -n "$NO_WEB" ]; then
 		return 0
@@ -437,13 +453,14 @@ web_build() {
 	fi
 	( cd "$1/web" && npm run build ) || return 1
 
-	[ -f "$1/web/.next/standalone/server.js" ] ||
+	[ -f "$1/web/.next/standalone/web/server.js" ] ||
 		die "redeploy: no standalone server was produced — is output: \"standalone\" still set in web/next.config.ts?"
 
-	mkdir -p "$WEB_STAGE/.next"
+	mkdir -p "$WEB_STAGE/web/.next"
 	cp -a "$1/web/.next/standalone/." "$WEB_STAGE/"
-	cp -a "$1/web/.next/static" "$WEB_STAGE/.next/static"
-	[ -d "$1/web/public" ] && cp -a "$1/web/public" "$WEB_STAGE/public"
+	cp -a "$1/web/.next/static" "$WEB_STAGE/web/.next/static"
+	[ -d "$1/web/public" ] && cp -a "$1/web/public" "$WEB_STAGE/web/public"
+	ln -sfn web/server.js "$WEB_STAGE/server.js"
 	return 0
 }
 

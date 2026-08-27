@@ -1,0 +1,16 @@
+# One workspace over both clients and the package they share.
+#
+# It has to be here rather than in expo-app/, where it used to live to carry the
+# allowBuilds entry below. A resolver walking up from expo-app/ finds the first
+# pnpm-workspace.yaml it meets and calls that directory the root — so a file
+# down there would have Metro watching expo-app/ alone, never seeing
+# packages/core, and saying nothing about it. Expo's getDefaultConfig reads this
+# file (through resolve-workspace-root) to set its watch folders and module
+# paths, which is why expo-app needs no metro.config.js.
+packages:
+  - web
+  - expo-app
+  - packages/*
+
+allowBuilds:
+  unrs-resolver: set this to true or false

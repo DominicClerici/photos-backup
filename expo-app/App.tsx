@@ -12,6 +12,13 @@ import {
   View,
 } from 'react-native';
 
+import {
+  archiveAddress,
+  archiveToken,
+  onCredentialLost,
+  setArchiveAddress,
+  setArchiveToken,
+} from './src/archive';
 import { DEFAULT_MAX_ITEMS, loadConfig, saveConfig, type Config } from './src/config';
 import { resolveServer, type ServerResolution } from './src/discovery';
 import { checkGalleryAccess, type CheckResult } from './src/gallery/check';
@@ -109,10 +116,22 @@ export default function App() {
   const [statsStale, setStatsStale] = useState(false);
   const [loadingStats, setLoadingStats] = useState(false);
 
-  // The transport reads both of these on every request, so a re-resolved address
-  // or a fresh pairing takes effect without rebuilding the engine mid-run.
-  const serverUrl = useRef<string>(config.serverUrl);
-  const deviceToken = useRef<string | null>(null);
+  // The address and the token live in src/archive, which reads them on every
+  // request, so a re-resolved address or a fresh pairing takes effect without
+  // rebuilding the engine mid-run. They are module state rather than the two
+  // refs they used to be, because @photobackup/core's transport is installed
+  // against them as well and there is one archive.
+  //
+  // Seeded once, from the address typed into settings; discovery replaces it
+  // the moment it resolves one. Once rather than on every render, which is what
+  // useRef's initial value gave for free — repeating it would overwrite a
+  // resolved address with the typed-in one on the next state change.
+  const seeded = useRef(false);
+  if (!seeded.current) {
+    seeded.current = true;
+    setArchiveAddress(config.serverUrl);
+  }
+
   const engine = useRef<SyncEngine | null>(null);
 
   // A ref rather than state, because the run reads it from inside a closure that
@@ -122,18 +141,24 @@ export default function App() {
 
   // Built once and kept, for the same reason the transport is: it reads the
   // address and the token per request, so it survives both changing under it.
-  const gallery = useRef(
-    new GalleryClient(
-      () => serverUrl.current,
-      () => deviceToken.current
-    )
-  );
+  const gallery = useRef(new GalleryClient(archiveAddress, archiveToken));
+
+  // What core does when photod refuses the token: the address stays, the
+  // credential goes, and the screen falls back to the pairing form it already
+  // shows an unpaired phone. Phase 2 makes this a route.
+  useEffect(() => {
+    onCredentialLost(() => {
+      setCredential(null);
+      setGalleryCheck(null);
+      setRunError('the archive no longer accepts this device — pair it again');
+    });
+  }, []);
 
   useEffect(() => {
     loadCredential()
       .then((found) => {
         setCredential(found);
-        deviceToken.current = found?.token ?? null;
+        setArchiveToken(found?.token ?? null);
       })
       .finally(() => setCredentialChecked(true));
   }, []);
@@ -175,7 +200,7 @@ export default function App() {
    * last known figures up rather than blanking it.
    */
   const refreshStats = useCallback(async () => {
-    if (!serverUrl.current || !deviceToken.current) return;
+    if (!archiveAddress() || !archiveToken()) return;
     setLoadingStats(true);
     try {
       const entry = { fetchedAt: Date.now(), stats: await gallery.current.stats() };
@@ -209,7 +234,7 @@ export default function App() {
       setServer(resolution);
       if (!resolution.url) return;
 
-      serverUrl.current = resolution.url;
+      setArchiveAddress(resolution.url);
       if (resolution.url !== config.lastServerUrl) {
         const next = { ...config, lastServerUrl: resolution.url };
         setConfig(next);
@@ -230,17 +255,17 @@ export default function App() {
   }, [findServer]);
 
   const submitPairing = useCallback(async () => {
-    if (!serverUrl.current) return;
+    if (!archiveAddress()) return;
     setPairing(true);
     setPairError(null);
     try {
       const paired = await pair({
-        serverUrl: serverUrl.current,
+        serverUrl: archiveAddress(),
         code: pairingCode,
         deviceName,
       });
       setCredential(paired);
-      deviceToken.current = paired.token;
+      setArchiveToken(paired.token);
       setPairingCode('');
       setRunError(null);
     } catch (e) {
@@ -253,7 +278,7 @@ export default function App() {
   const unpair = useCallback(async () => {
     await clearCredential();
     setCredential(null);
-    deviceToken.current = null;
+    setArchiveToken(null);
     setGalleryCheck(null);
 
     // The cached figures belong to the device that was just forgotten. Left up,
@@ -440,7 +465,7 @@ export default function App() {
           // held by the source: enumeration happens once per run, and a run
           // already going should finish the set it was started on.
           media: new PhotoKitMediaSource({ albumIds: chosenIds }),
-          transport: new HttpTransport(() => serverUrl.current, () => deviceToken.current, log),
+          transport: new HttpTransport(archiveAddress, archiveToken, log),
           clock: systemClock,
           onProgress: setProgress,
           onLog: log,
@@ -518,7 +543,7 @@ export default function App() {
   );
 
   const canStart =
-    Boolean(store) && granted && Boolean(serverUrl.current) && Boolean(credential) && !running;
+    Boolean(store) && granted && Boolean(archiveAddress()) && Boolean(credential) && !running;
 
   return (
     <SafeAreaView style={styles.screen}>
@@ -590,9 +615,9 @@ export default function App() {
                   maxLength={9}
                 />
                 <Pressable
-                  style={[styles.button, (pairing || !serverUrl.current) && styles.buttonDisabled]}
+                  style={[styles.button, (pairing || !archiveAddress()) && styles.buttonDisabled]}
                   onPress={() => void submitPairing()}
-                  disabled={pairing || !serverUrl.current}
+                  disabled={pairing || !archiveAddress()}
                 >
                   <Text style={styles.buttonText}>{pairing ? 'Pairing…' : 'Pair'}</Text>
                 </Pressable>

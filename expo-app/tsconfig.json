@@ -2,6 +2,10 @@
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
     "strict": true,
-    "types": ["jest", "react"]
+    "types": ["jest", "react"],
+    // @photobackup/core's own relative imports carry their extensions, because
+    // `node --test` runs its tests by stripping types and nothing else, and
+    // node will not resolve an extensionless relative specifier.
+    "allowImportingTsExtensions": true
   }
 }
