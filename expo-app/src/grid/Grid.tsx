@@ -17,6 +17,7 @@ import {
 } from '@photobackup/core';
 import type { TimelineState } from '@photobackup/core/react';
 import { BlurView } from 'expo-blur';
+import { router } from 'expo-router';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { StyleSheet, useWindowDimensions, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
@@ -159,6 +160,15 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
   /** Where the board's top edge has scrolled to, in board coordinates. */
   const top = useRef(0);
   const zoom = useRef(z.value);
+  /**
+   * Whether the grid is still moving under its own momentum.
+   *
+   * A tap that lands during a fling is somebody stopping the grid, not somebody
+   * choosing a photograph — the scroll view takes it as a brake and would
+   * otherwise also have opened whatever happened to be under the finger at the
+   * moment it stopped.
+   */
+  const coasting = useRef(false);
 
   // Refreshed after every render and before the screen paints, so a scroll
   // event arriving between renders never measures against a day table that has
@@ -430,37 +440,71 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
 
   const boardStyle = useAnimatedStyle(() => ({ height: valueAt(heights, z.value) }));
 
-  // ── The hold ───────────────────────────────────────────────────────────────
+  // ── The tap and the hold ───────────────────────────────────────────────────
 
-  const openPeek = useCallback(
+  /**
+   * The photograph under a point on the screen, or nothing.
+   *
+   * `itemAtPoint` answers with the *nearest* tile, which is what a zoom wants —
+   * it has to anchor to something wherever the fingers land. A tap and a hold
+   * are the other case: they have to land *on* a photograph to mean one, and the
+   * gaps between tiles and the day headings above them are not photographs. So
+   * the square it names is checked rather than assumed.
+   *
+   * A square whose photograph has not been fetched yet names nothing either: the
+   * position is real, but there is no asset to enlarge and nothing for a viewer
+   * opened onto it to show.
+   */
+  const photoAt = useCallback(
     (x: number, y: number) => {
       const e = env.current;
-      if (e.total === 0 || e.days.length === 0) return;
+      if (e.total === 0 || e.days.length === 0) return null;
       const at = frameAt(e.levels, zoom.current);
       const bx = x - GUTTER;
       const by = top.current + y;
       const index = itemAtPoint(e.days, e.total, at, bx, by);
       const item = itemAt(index);
-      // A square whose photograph has not been fetched yet names nothing: the
-      // position is real, but there is no asset to enlarge, and nothing the
-      // menu this grows into could act on.
-      if (!item) return;
+      if (!item) return null;
 
-      // `itemAtPoint` answers with the nearest tile, which is what a zoom wants
-      // — it has to anchor to something wherever the fingers land. A hold is
-      // the other case: it has to land *on* a photograph to mean one, and the
-      // gaps between tiles and the day headings above them are not
-      // photographs. So the square it names is checked rather than assumed.
       const rect = rectAt(places(index), zoom.current);
-      if (bx < rect.x || bx > rect.x + rect.size) return;
-      if (by < rect.y || by > rect.y + rect.size) return;
-
-      setPeek({
-        item,
-        from: { x: rect.x + GUTTER, y: rect.y - top.current, size: rect.size },
-      });
+      if (bx < rect.x || bx > rect.x + rect.size) return null;
+      if (by < rect.y || by > rect.y + rect.size) return null;
+      return { index, item, rect };
     },
     [itemAt, places],
+  );
+
+  const openPeek = useCallback(
+    (x: number, y: number) => {
+      const found = photoAt(x, y);
+      if (!found) return;
+      setPeek({
+        item: found.item,
+        from: {
+          x: found.rect.x + GUTTER,
+          y: found.rect.y - top.current,
+          size: found.rect.size,
+        },
+      });
+    },
+    [photoAt],
+  );
+
+  /**
+   * Opening the viewer, by position rather than by id.
+   *
+   * The position is what the viewer pages over and what the timeline is
+   * addressed by, so handing it the index is handing it everything — the store
+   * it reads is the one this screen published, and the photograph tapped is
+   * already in it.
+   */
+  const openViewer = useCallback(
+    (x: number, y: number) => {
+      if (coasting.current) return;
+      const found = photoAt(x, y);
+      if (found) router.push(`/viewer/${found.index}`);
+    },
+    [photoAt],
   );
 
   const hold = useMemo(
@@ -476,9 +520,17 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
     [openPeek],
   );
 
-  // Whichever wins: two fingers is a zoom, one finger held still is a peek, and
-  // neither is ever both.
-  const gestures = useMemo(() => Gesture.Race(pinch, hold), [pinch, hold]);
+  const tap = useMemo(
+    () =>
+      Gesture.Tap().onEnd((e, ok) => {
+        if (ok) runOnJS(openViewer)(e.x, e.y);
+      }),
+    [openViewer],
+  );
+
+  // Whichever wins: two fingers is a zoom, one finger held still is a peek, one
+  // finger down and up is a photograph opened, and no gesture is ever two.
+  const gestures = useMemo(() => Gesture.Race(pinch, hold, tap), [pinch, hold, tap]);
 
   // ── Fetching ───────────────────────────────────────────────────────────────
 
@@ -574,7 +626,13 @@ export function Grid({ timeline }: { timeline: TimelineState }) {
           // may be one it declined to mention. These two are ungated, so what
           // is mounted is always settled against where the grid actually is.
           onScrollEndDrag={(e) => onScrolled(e.nativeEvent.contentOffset.y)}
-          onMomentumScrollEnd={(e) => onScrolled(e.nativeEvent.contentOffset.y)}
+          onMomentumScrollBegin={() => {
+            coasting.current = true;
+          }}
+          onMomentumScrollEnd={(e) => {
+            coasting.current = false;
+            onScrolled(e.nativeEvent.contentOffset.y);
+          }}
           scrollEventThrottle={16}
           // A deceleration still running underneath the zoom would be fighting
           // it for the same number: the anchor writes the scroll offset every

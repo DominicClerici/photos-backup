@@ -7,15 +7,16 @@
  * component library, it is `src/theme.ts`, and the rule that nothing outside
  * this directory names a colour.
  *
- * Deliberately absent, and not for want of the plan naming them: `Sheet` and
- * `ContextMenu`. Neither has a caller until the viewer's metadata panel
- * (Phase 4) and the actions on a selection (Phase 5), and a primitive written
- * before its first use is a guess at an API rather than one.
+ * `Sheet` arrived in Phase 4, written against the viewer's metadata panel — its
+ * only caller, and the reason its API is what it is rather than a guess.
+ * `ContextMenu` is still absent for the same reason it was: nothing asks for
+ * one until the actions on a selection, in Phase 5.
  */
 export { Button, type ButtonVariant } from './Button';
 export { Card, Count, Counts, Row } from './Card';
 export { Field } from './Field';
 export { Pill } from './Pill';
+export { Sheet } from './Sheet';
 export { Empty, Screen, TAB_BAR_CLEARANCE } from './Screen';
 export { TabBar } from './TabBar';
 export { Subheading, Text, type TextTone, type TextVariant } from './Text';

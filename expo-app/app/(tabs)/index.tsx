@@ -1,6 +1,7 @@
 import { useTimeline } from '@photobackup/core/react';
 
 import { Grid } from '../../src/grid';
+import { useBrowsing } from '../../src/state/browsing';
 
 /**
  * The timeline.
@@ -18,8 +19,13 @@ import { Grid } from '../../src/grid';
  * argument — the offline store — is the seam WEB_TO_MOBILE § 3.6 asks to be
  * built now and filled in Phase 6; passing nothing is exactly what the browser
  * does, and is why nothing about the hook's behaviour changed when it grew.
+ *
+ * `useBrowsing` announces it as the timeline being browsed, which is how the
+ * viewer — a route, and so a sibling of this screen rather than a child — reads
+ * the same store instead of mounting a second one. See `src/state/browsing.ts`.
  */
 export default function GalleryRoute() {
   const timeline = useTimeline();
+  useBrowsing(timeline);
   return <Grid timeline={timeline} />;
 }

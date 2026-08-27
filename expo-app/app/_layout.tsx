@@ -73,6 +73,22 @@ function Gate() {
         <Stack.Protected guard={paired}>
           <Stack.Screen name="(tabs)" />
           <Stack.Screen name="settings" options={{ presentation: 'modal' }} />
+          {/* Transparent, and faded rather than slid up: the viewer draws its
+              own backdrop, and a drag towards dismissing it thins that backdrop
+              until the grid the photograph came out of shows through. A modal
+              with a background of its own would be an opaque card sliding down
+              over the same grid, which is a different gesture wearing the same
+              clothes. Full screen either way — it is a root route, so it is
+              above the tab navigator and covers the floating bar. */}
+          <Stack.Screen
+            name="viewer/[index]"
+            options={{
+              presentation: 'transparentModal',
+              animation: 'fade',
+              animationDuration: 180,
+              contentStyle: { backgroundColor: 'transparent' },
+            }}
+          />
         </Stack.Protected>
 
         <Stack.Protected guard={!paired}>

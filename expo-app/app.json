@@ -32,7 +32,7 @@
         "expo-media-library",
         {
           "photosPermission": "photobackup reads your photo library to back it up.",
-          "savePhotosPermission": "photobackup does not save photos; this is unused.",
+          "savePhotosPermission": "photobackup saves a photograph from your archive back to this phone when you ask it to.",
           "isAccessMediaLocationEnabled": true
         }
       ],
