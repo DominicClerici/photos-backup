@@ -1,16 +1,23 @@
 # One workspace over both clients and the package they share.
 #
-# It has to be here rather than in expo-app/, where it used to live to carry the
-# allowBuilds entry below. A resolver walking up from expo-app/ finds the first
-# pnpm-workspace.yaml it meets and calls that directory the root — so a file
-# down there would have Metro watching expo-app/ alone, never seeing
-# packages/core, and saying nothing about it. Expo's getDefaultConfig reads this
-# file (through resolve-workspace-root) to set its watch folders and module
-# paths, which is why expo-app needs no metro.config.js.
+# It has to be here rather than in expo-app/, where it used to live. A resolver
+# walking up from expo-app/ finds the first pnpm-workspace.yaml it meets and
+# calls that directory the root — so a file down there would have Metro watching
+# expo-app/ alone, never seeing packages/core, and saying nothing about it.
+# Expo's getDefaultConfig reads this file (through resolve-workspace-root) to
+# set its watch folders and module paths, which is why expo-app needs no
+# metro.config.js.
 packages:
   - web
   - expo-app
   - packages/*
 
-allowBuilds:
-  unrs-resolver: set this to true or false
+# pnpm 11 reads its own settings from this file, not from .npmrc. The setting
+# below has to live here for that reason: a peer dependency is the consumer's
+# to provide, and here that matters more than usual. packages/core lists react
+# as a peer, and an auto-installed copy under packages/core/node_modules is the
+# one Metro resolves from the hooks — giving the phone react 19.2.8 while the
+# app itself runs 19.2.3, which is two Reacts and an "invalid hook call" on the
+# first render. Both apps declare react themselves, so there is nothing to
+# install on their behalf.
+autoInstallPeers: false

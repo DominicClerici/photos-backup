@@ -7,6 +7,10 @@ services:
     # and switching from the alpine image means every text index was built under
     # musl's collation and has to be rebuilt under glibc's. See deploy/README.md.
     image: pgvector/pgvector:pg18
+    # photod hard-fails at startup if it cannot ping the database, and systemd
+    # brings it up at boot with no ordering against Docker. Without this the
+    # container stays exited after a reboot and photod crash-loops forever.
+    restart: unless-stopped
     environment:
       POSTGRES_USER: photobackup
       POSTGRES_PASSWORD: photobackup
