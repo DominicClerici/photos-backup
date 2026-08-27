@@ -16,6 +16,7 @@ import Animated, {
   type SharedValue,
 } from 'react-native-reanimated';
 
+import type { MediaCache } from '../gallery/cache';
 import { color, radius, space } from '../theme';
 import { Button, Text } from '../ui';
 import { saveOriginal } from './save';
@@ -66,6 +67,7 @@ export function Page({
   pressed,
   chrome,
   full,
+  cache,
   onFit,
 }: {
   /** Undefined while the page holding this position is still being fetched. */
@@ -85,6 +87,16 @@ export function Page({
   chrome: boolean;
   /** Somebody has zoomed past what the preview can answer; fetch the original. */
   full: boolean;
+  /**
+   * How long these bytes may be kept.
+   *
+   * `memory` for a photograph out of the vault, and it is the whole of what
+   * this app does differently there: a decrypted preview written to
+   * `expo-image`'s disk cache would still be sitting in the sandbox, in the
+   * clear, after the server had re-locked — which is the one thing the vault
+   * exists to prevent. See src/vault.
+   */
+  cache: MediaCache;
   onFit: (width: number, height: number) => void;
 }) {
   const { scrollX, scale, tx, ty, dismiss } = stage;
@@ -113,6 +125,7 @@ export function Page({
           plain={Boolean(detail?.has_overlay) && !overlayOn}
           controls={chrome}
           filename={detail?.filename ?? ''}
+          cache={cache}
         />
       ) : (
         <PhotoStage
@@ -123,6 +136,7 @@ export function Page({
           pressed={pressed}
           chrome={chrome}
           full={full}
+          cache={cache}
           onFit={onFit}
         />
       )}
@@ -161,6 +175,7 @@ function PhotoStage({
   pressed,
   chrome,
   full,
+  cache,
   onFit,
 }: {
   item: TimelineItem;
@@ -170,6 +185,7 @@ function PhotoStage({
   pressed: boolean;
   chrome: boolean;
   full: boolean;
+  cache: MediaCache;
   onFit: (width: number, height: number) => void;
 }) {
   const live = active && item.live === 'ready';
@@ -220,13 +236,13 @@ function PhotoStage({
 
   return (
     <>
-      <Image style={StyleSheet.absoluteFill} source={thumb} contentFit="contain" cachePolicy="memory-disk" transition={0} />
+      <Image style={StyleSheet.absoluteFill} source={thumb} contentFit="contain" cachePolicy={cache} transition={0} />
 
       <Image
         style={StyleSheet.absoluteFill}
         source={preview}
         contentFit="contain"
-        cachePolicy="memory-disk"
+        cachePolicy={cache}
         transition={FADE_MS}
         // What the pan limits are measured against. A photograph drawn
         // `contain` occupies less than the screen in one axis, and panning it
@@ -248,7 +264,7 @@ function PhotoStage({
             style={StyleSheet.absoluteFill}
             source={bare}
             contentFit="contain"
-            cachePolicy="memory-disk"
+            cachePolicy={cache}
             transition={0}
           />
         </Animated.View>
@@ -260,7 +276,7 @@ function PhotoStage({
             style={StyleSheet.absoluteFill}
             source={original}
             contentFit="contain"
-            cachePolicy="memory-disk"
+            cachePolicy={cache}
             transition={0}
             onLoad={() => setSharp(true)}
             // A rendition the archive holds and this phone cannot decode is a
@@ -365,12 +381,14 @@ function VideoStage({
   plain,
   controls,
   filename,
+  cache,
 }: {
   item: TimelineItem;
   active: boolean;
   plain: boolean;
   controls: boolean;
   filename: string;
+  cache: MediaCache;
 }) {
   if (item.playback_state !== 'ready') {
     return <Unplayable item={item} filename={filename} />;
@@ -384,7 +402,7 @@ function VideoStage({
         style={StyleSheet.absoluteFill}
         source={media(item.id, thumbVariant())}
         contentFit="contain"
-        cachePolicy="memory-disk"
+        cachePolicy={cache}
         transition={0}
       />
     );

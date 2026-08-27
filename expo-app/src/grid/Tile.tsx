@@ -12,6 +12,7 @@ import { memo, useCallback, useMemo, useState } from 'react';
 import { StyleSheet, Text as RNText, View } from 'react-native';
 import Animated, { useAnimatedStyle, type SharedValue } from 'react-native-reanimated';
 
+import type { MediaCache } from '../gallery/cache';
 import { color, radius, space, text } from '../theme';
 import { rectAt, type Places } from './geometry';
 
@@ -35,6 +36,7 @@ export const Tile = memo(function Tile({
   thumb,
   places,
   z,
+  cache,
   selecting = false,
   selected = false,
 }: {
@@ -44,6 +46,12 @@ export const Tile = memo(function Tile({
   /** Where this tile sits at each zoom level. See grid/geometry. */
   places: Places;
   z: SharedValue<number>;
+  /**
+   * How long these bytes may be kept. `memory-disk` everywhere but the vault,
+   * where a decrypted thumbnail written to disk would outlive the password that
+   * decrypted it — see `src/gallery/cache.ts`.
+   */
+  cache: MediaCache;
   /** Whether the grid is picking rather than browsing. */
   selecting?: boolean;
   selected?: boolean;
@@ -107,7 +115,9 @@ export const Tile = memo(function Tile({
             // cache is what makes scrolling back through a year of photographs
             // free. WEB_TO_MOBILE § 3.6 is about the day table and the pages
             // for exactly this reason: the thumbnails already have a cache.
-            cachePolicy="memory-disk"
+            //
+            // Except inside the vault, which is the one grid that keeps nothing.
+            cachePolicy={cache}
             // Short enough to read as the picture arriving rather than as an
             // animation, and it covers the swap when a zoom changes the size.
             transition={120}

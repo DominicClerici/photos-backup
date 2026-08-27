@@ -67,6 +67,25 @@ export function SelectionPill() {
     askToFile({ target: { ranges } });
   }, [actions, count, ranges, setSheet]);
 
+  /**
+   * Into the vault, from the library's own grid.
+   *
+   * Neither bucket needs the vault unlocked: putting a photograph in works on a
+   * locked one and creates one that does not exist yet, which is the asymmetry
+   * the whole feature rests on. The two cases that *do* need a password —
+   * there is no vault, or there is and it is shut — are handed to the gate by
+   * `useTrashActions` rather than to a notice, so there is nothing to report
+   * here and nothing to check before calling.
+   */
+  const hide = useCallback(
+    (bucket: Bucket) => {
+      if (!actions || count === 0) return;
+      void actions.hide(bucket, { ranges });
+      finish();
+    },
+    [actions, count, ranges, finish],
+  );
+
   if (!grid) return null;
 
   return (
@@ -100,6 +119,7 @@ export function SelectionPill() {
         onDestroy={destroy}
         onRestore={restore}
         onFile={file}
+        onHide={hide}
         onUnfile={unfile}
         onDone={finish}
       />
@@ -114,10 +134,6 @@ export function SelectionPill() {
  * the same gesture means "delete" in the library and "restore or destroy" in
  * Recently Deleted, and this is mounted by the root layout and has no idea
  * which grid is on screen. See core's `SelectionActions`.
- *
- * Archive and Hide are drawn and inert. Both write into the vault, whose gate
- * and password are Phase 6, and a sheet that simply omitted them would make the
- * gallery look like it cannot do a thing it is one phase from doing.
  */
 function SelectionSheet({
   open,
@@ -127,6 +143,7 @@ function SelectionSheet({
   onDestroy,
   onRestore,
   onFile,
+  onHide,
   onUnfile,
   onDone,
 }: {
@@ -137,6 +154,7 @@ function SelectionSheet({
   onDestroy: () => void;
   onRestore: () => void;
   onFile: () => void;
+  onHide: (bucket: Bucket) => void;
   onUnfile: (album: AlbumRef) => void;
   onDone: () => void;
 }) {
@@ -176,15 +194,13 @@ function SelectionSheet({
         key: 'archive',
         label: describeAction('Archive', about),
         icon: 'archive',
-        disabled: true,
-        note: 'Phase 6',
+        onPress: () => onHide('archive'),
       },
       {
         key: 'hide',
         label: describeAction('Hide', about),
         icon: 'eye-off',
-        disabled: true,
-        note: 'Phase 6',
+        onPress: () => onHide('hidden'),
       },
     );
   }

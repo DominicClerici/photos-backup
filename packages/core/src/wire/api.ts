@@ -152,8 +152,44 @@ function sessionEnded() {
   unauthorized();
 }
 
+/**
+ * Not a status, because nothing answered with one.
+ *
+ * A `fetch` that never reaches the archive rejects with whatever the runtime
+ * felt like saying — "Failed to fetch" in a browser, "Network request failed"
+ * on a phone — and both of those end up in front of somebody as the whole
+ * explanation of why their photographs are not there. So the rejection is
+ * turned into an ApiError like any other, with a status no server can send and
+ * a sentence about the archive rather than about the runtime.
+ *
+ * It matters most on the phone, which is routinely out of reach of the machine
+ * and now has a cache to draw from while it is: "the archive is out of reach"
+ * is what a grid full of last week's geometry needs to say, and it is not
+ * something the caller should have to guess from a string.
+ */
+export const UNREACHABLE = 0;
+
+/** Whether this is the archive being unreachable rather than refusing. */
+export function unreachable(err: unknown): boolean {
+  return err instanceof ApiError && err.status === UNREACHABLE;
+}
+
+/**
+ * A fetch whose failure to connect is an ApiError rather than a runtime's
+ * choice of words. An abort is passed through untouched — it is not a failure,
+ * and every caller here tells the two apart by asking the signal.
+ */
+async function reach(input: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(input, init);
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") throw err;
+    throw new ApiError(UNREACHABLE, "the archive is out of reach");
+  }
+}
+
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(`${baseUrl()}${path}`, { headers: headers(), signal });
+  const res = await reach(`${baseUrl()}${path}`, { headers: headers(), signal });
   if (!res.ok) throw apiError(res.status, await errorText(res));
   return res.json() as Promise<T>;
 }
@@ -524,7 +560,7 @@ export async function fetchStates(
   signal?: AbortSignal,
 ): Promise<TimelineItem[]> {
   if (ids.length === 0) return [];
-  const res = await fetch(`${baseUrl()}/v1/timeline/states`, {
+  const res = await reach(`${baseUrl()}/v1/timeline/states`, {
     method: "POST",
     headers: { ...headers(), "Content-Type": "application/json" },
     body: JSON.stringify({ ids }),
@@ -769,7 +805,7 @@ function selectionBody(target: Target): Record<string, unknown> {
 }
 
 async function send<T>(path: string, body: unknown, method = "POST"): Promise<T> {
-  const res = await fetch(`${baseUrl()}${path}`, {
+  const res = await reach(`${baseUrl()}${path}`, {
     method,
     headers: { ...headers(), "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -1221,7 +1257,7 @@ export function mergeGroup(group: string, keeper: string): Promise<Merged> {
 
 /** Records that these are different photographs, and stops them being paired again. */
 export async function dismissGroup(group: string): Promise<void> {
-  const res = await fetch(`${baseUrl()}/v1/merges/${group}/dismiss`, {
+  const res = await reach(`${baseUrl()}/v1/merges/${group}/dismiss`, {
     method: "POST",
     headers: headers(),
   });
@@ -1258,7 +1294,7 @@ export function unmergeGroup(group: string): Promise<Unmerged> {
  */
 export async function approveGroup(group: string, approved: boolean): Promise<void> {
   const path = approved ? "approve" : "unapprove";
-  const res = await fetch(`${baseUrl()}/v1/merges/${group}/${path}`, {
+  const res = await reach(`${baseUrl()}/v1/merges/${group}/${path}`, {
     method: "POST",
     headers: headers(),
   });
@@ -1597,7 +1633,7 @@ export async function checkContent(
   sha256: string[],
   signal?: AbortSignal,
 ): Promise<KnownContent[]> {
-  const res = await fetch(`${baseUrl()}/v1/gallery/uploads/check`, {
+  const res = await reach(`${baseUrl()}/v1/gallery/uploads/check`, {
     method: "POST",
     headers: { ...headers(), "Content-Type": "application/json" },
     body: JSON.stringify({ sha256 }),

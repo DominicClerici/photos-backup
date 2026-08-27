@@ -31,17 +31,19 @@ type Glyph = React.ComponentProps<typeof Feather>['name'];
  * in common, which is why the older one keeps the past tense it was imported
  * with and the new one takes the plain noun.
  *
- * The last three are drawn and inert. Their screens — the vault gate, the two
- * buckets, the trash timeline — are Phase 6, and a Collections page that simply
- * omitted Recently Deleted would be a worse account of the archive than one
- * that shows where it is and says it is not ready.
+ * All four lead somewhere now. The last three are root routes rather than
+ * screens in this tab, because each of them is a full-width grid of its own —
+ * see `app/_layout.tsx`.
  */
-const ENTRIES: { key: string; label: string; icon: Glyph; soon?: boolean }[] = [
+const ENTRIES: { key: string; label: string; icon: Glyph }[] = [
   { key: 'archived', label: 'Archived', icon: 'inbox' },
-  { key: 'archive', label: 'Archive', icon: 'archive', soon: true },
-  { key: 'hidden', label: 'Hidden', icon: 'eye-off', soon: true },
-  { key: 'trash', label: 'Recently Deleted', icon: 'trash-2', soon: true },
+  { key: 'archive', label: 'Archive', icon: 'archive' },
+  { key: 'hidden', label: 'Hidden', icon: 'eye-off' },
+  { key: 'trash', label: 'Recently Deleted', icon: 'trash-2' },
 ];
+
+/** The two rows whose count is a fact about the vault rather than about a slice. */
+const SEALED = new Set(['archive', 'hidden']);
 
 /**
  * @param counts How much is in each entry, by key. A key with no count draws no
@@ -64,19 +66,23 @@ export function OtherList({
 }) {
   return (
     <RowList>
-      {ENTRIES.map(({ key, label, icon, soon }) => {
+      {ENTRIES.map(({ key, label, icon }) => {
         const count = counts?.[key];
+        // A locked vault does not say how much is in it — the server withholds
+        // those two counts rather than sending zero — so the row says which of
+        // the two silences this is. "Locked" is the honest word for it, and it
+        // is a fact about the vault rather than about what somebody hid.
+        const shut = SEALED.has(key) && count === undefined;
         return (
           <ListRow
             key={key}
             label={label}
-            disabled={soon}
-            value={soon || count === undefined ? undefined : count.toLocaleString()}
+            value={count === undefined ? undefined : count.toLocaleString()}
             onPress={() => onOpen(key)}
             trailing={
-              soon ? (
+              shut ? (
                 <Text variant="caption" tone="faint">
-                  Soon
+                  Locked
                 </Text>
               ) : undefined
             }

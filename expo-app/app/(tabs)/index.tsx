@@ -1,5 +1,6 @@
-import { useTimeline, useTrashActions, useView } from '@photobackup/core/react';
+import { useTrashActions, useView } from '@photobackup/core/react';
 
+import { useCachedTimeline } from '../../src/gallery/cache';
 import { Grid } from '../../src/grid';
 import { useBrowsing } from '../../src/state/browsing';
 
@@ -18,9 +19,14 @@ import { useBrowsing } from '../../src/state/browsing';
  * control's, held above the router so that it survives the grid re-rendering
  * under it and is dropped when the grid goes away — a view is of one timeline,
  * and "the videos in this album, longest first" is not a thing to still be
- * looking at somewhere else. The third argument to `useTimeline` — the offline
- * store — is the seam WEB_TO_MOBILE § 3.6 asks to be built now and filled in
- * Phase 6; passing nothing is exactly what the browser does.
+ * looking at somewhere else.
+ *
+ * `useCachedTimeline` is `useTimeline` with the third argument filled: the
+ * offline store WEB_TO_MOBILE § 3.6 asked to be built in Phase 3 and filled in
+ * Phase 6. What it buys is that this screen has its geometry and the ground
+ * already walked before the archive has said a word, and something to draw when
+ * it never does. The reload it hands back is the same `retry` plus the drop
+ * that keeps a write from leaving last week's timeline behind it.
  *
  * `useTrashActions` is core's too, and it is what the floating selection
  * control spends: this screen is the only thing that knows which timeline the
@@ -33,8 +39,8 @@ import { useBrowsing } from '../../src/state/browsing';
  */
 export default function GalleryRoute() {
   const { view } = useView();
-  const timeline = useTimeline(undefined, view);
-  const actions = useTrashActions(undefined, timeline.retry, undefined, view);
+  const { timeline, reload } = useCachedTimeline(undefined, view);
+  const actions = useTrashActions(undefined, reload, undefined, view);
   useBrowsing(timeline);
   return <Grid timeline={timeline} actions={actions} />;
 }

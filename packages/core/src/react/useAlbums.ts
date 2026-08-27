@@ -36,6 +36,23 @@ export function albumsChanged(): void {
   for (const listener of listeners) listener();
 }
 
+/**
+ * Subscribes to that broadcast from outside a menu.
+ *
+ * The mobile app keeps an offline copy of the collections index and of the
+ * timelines hanging off it, and every write that changes what albums exist or
+ * what is in them already comes through here. So this is the one place it can
+ * learn that the copy is describing an archive that has moved on — see
+ * `expo-app/src/gallery/cache.ts`. The browser has no such copy and never calls
+ * this.
+ */
+export function onAlbumsChanged(listener: () => void): () => void {
+  listeners = [...listeners, listener];
+  return () => {
+    listeners = listeners.filter((l) => l !== listener);
+  };
+}
+
 export interface AlbumList {
   /** Null until the first read lands. An empty array is an archive with none. */
   albums: Album[] | null;

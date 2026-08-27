@@ -3,19 +3,21 @@ import {
   type Album,
   type Collections as Data,
   type CreatedAlbum,
+  type Person,
 } from '@photobackup/core';
 import { albumsChanged } from '@photobackup/core/react';
 import { router } from 'expo-router';
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { ActivityIndicator, StyleSheet, View } from 'react-native';
 
+import { COLLECTIONS, recall, remember } from '../gallery/cache';
 import { color, space } from '../theme';
 import { Button, Screen, Text } from '../ui';
 import { AlbumGrid, AlbumMenu } from './AlbumGrid';
 import { CategoryList } from './CategoryList';
 import { CreateAlbumSheet, type CreateAlbumRequest } from './CreateAlbumSheet';
 import { OtherList } from './OtherList';
-import { PeopleRow } from './PeopleRow';
+import { PeopleRow, PersonMenu } from './PeopleRow';
 
 /**
  * Google's imported flag, which is a category on the wire and a destination to
@@ -38,12 +40,46 @@ export function Collections() {
   // Held here rather than in the grid, because a `Sheet` positions itself
   // against the screen and the grid is inside a scroller. See AlbumGrid.
   const [menu, setMenu] = useState<Album | null>(null);
+  const [person, setPerson] = useState<Person | null>(null);
+  /**
+   * Whether what is on screen came out of the cache and the archive has not
+   * answered. The same distinction `useTimeline` draws for a day table, for the
+   * same reason: with a copy already painted, an unreachable server is a line
+   * at the top saying so rather than a screen that is only an error message.
+   */
+  const [stale, setStale] = useState(false);
 
   useEffect(() => {
     const abort = new AbortController();
     setError(null);
+    let answered = false;
+
+    // Geometry before connectivity, one screen up from the grid. Every album
+    // behind this list has a week of cached day table, and a Collections tab
+    // that was a spinner and then a failure would be the one thing standing
+    // between somebody and all of it. See src/gallery/cache.
+    void recall<Data>(COLLECTIONS).then((held) => {
+      if (!held || answered || abort.signal.aborted) return;
+      setData(held);
+      setStale(true);
+    });
+
     fetchCollections(abort.signal)
-      .then(setData)
+      .then((fresh) => {
+        if (abort.signal.aborted) return;
+        answered = true;
+        setData(fresh);
+        setStale(false);
+        // Everything except how much is in each bucket. That field is present
+        // only while the vault is unlocked and is a fact about what somebody
+        // hid — "Hidden 41" read off a screen is the number the server withholds
+        // for exactly that reason, and writing it down here would be this app
+        // keeping it after the server had stopped saying it. The two rows fall
+        // back to "Locked", which is what they say before any password anyway.
+        // See src/gallery/cache.
+        const { vault: _sealed, ...rest } = fresh;
+        remember(COLLECTIONS, rest);
+      })
       .catch((err: unknown) => {
         if (abort.signal.aborted) return;
         setError(err instanceof Error ? err.message : 'could not load collections');
@@ -75,8 +111,8 @@ export function Collections() {
     >
       {error ? (
         <View style={styles.notice}>
-          <Text variant="small" tone="destructive" style={styles.grow}>
-            {error}
+          <Text variant="small" tone={stale ? 'muted' : 'destructive'} style={styles.grow}>
+            {stale ? `${error}. Showing what was here last time.` : error}
           </Text>
           <Button label="Try again" onPress={() => retry((n) => n + 1)} />
         </View>
@@ -108,9 +144,10 @@ export function Collections() {
           <Section title="People" count={data.people.length} bleed>
             <PeopleRow
               people={data.people}
-              onOpen={(person) =>
-                router.push(`/collections/people/${encodeURIComponent(person.name)}`)
+              onOpen={(who) =>
+                router.push(`/collections/people/${encodeURIComponent(who.name)}`)
               }
+              onMenu={setPerson}
             />
           </Section>
 
@@ -142,7 +179,9 @@ export function Collections() {
                 hidden: data.vault?.hidden,
               }}
               onOpen={(key) =>
-                key === ARCHIVED ? router.push(`/collections/categories/${ARCHIVED}`) : undefined
+                router.push(
+                  key === ARCHIVED ? `/collections/categories/${ARCHIVED}` : `/${key}`,
+                )
               }
             />
           </Section>
@@ -161,6 +200,11 @@ export function Collections() {
       <AlbumMenu
         album={menu}
         onClose={() => setMenu(null)}
+        onChanged={() => retry((n) => n + 1)}
+      />
+      <PersonMenu
+        person={person}
+        onClose={() => setPerson(null)}
         onChanged={() => retry((n) => n + 1)}
       />
       <CreateAlbumSheet

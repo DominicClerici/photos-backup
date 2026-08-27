@@ -21,6 +21,7 @@ import Animated, {
 } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { mediaCacheFor } from '../gallery/cache';
 import { color, radius, space } from '../theme';
 import { Sheet, Text } from '../ui';
 import { Page, type Stage } from './Page';
@@ -70,7 +71,23 @@ const CONTROL = 34;
  * mounted. It is the same division of labour the grid makes, for the same
  * reason.
  */
-export function Viewer({ timeline, at }: { timeline: TimelineState; at: number }) {
+export function Viewer({
+  timeline,
+  at,
+  sealed = false,
+}: {
+  timeline: TimelineState;
+  at: number;
+  /**
+   * Whether this timeline is inside the vault.
+   *
+   * One thing follows from it and it is not cosmetic: the renditions are kept
+   * in memory rather than written to disk, so a decrypted preview does not
+   * outlive the fifteen minutes the password bought. The panel below already
+   * declines to look anything up for a sealed asset, for its own reasons.
+   */
+  sealed?: boolean;
+}) {
   const { width, height } = useWindowDimensions();
   const insets = useSafeAreaInsets();
   const { total, at: itemAt, request } = timeline;
@@ -107,6 +124,7 @@ export function Viewer({ timeline, at }: { timeline: TimelineState; at: number }
     return out;
   }, [index, total, itemAt, timeline]);
 
+  const cache = mediaCacheFor(sealed);
   const item = pages.find((page) => page.n === index)?.item;
   const hasOverlay = detail?.has_overlay ?? false;
   // A video whose playback rendition is ready owns the horizontal drag: its
@@ -459,6 +477,7 @@ export function Viewer({ timeline, at }: { timeline: TimelineState; at: number }
               pressed={pressed && n === index}
               chrome={chrome}
               full={full && n === index}
+              cache={cache}
               onFit={onFit}
             />
           ))}

@@ -24,10 +24,20 @@ import { Viewer } from '../../src/viewer';
  */
 export default function ViewerRoute() {
   const { index } = useLocalSearchParams<{ index: string }>();
-  const timeline = useBrowsed();
+  const browsed = useBrowsed();
 
-  if (!timeline) return <Redirect href="/" />;
+  if (!browsed) return <Redirect href="/" />;
 
   const at = Number.parseInt(index ?? '', 10);
-  return <Viewer timeline={timeline} at={Number.isFinite(at) ? at : 0} />;
+  return (
+    <Viewer
+      timeline={browsed.timeline}
+      at={Number.isFinite(at) ? at : 0}
+      // Whether this photograph came out of the vault, which travels with the
+      // timeline rather than being asked for here: a route cannot see the
+      // filter the grid was built from. What it buys is that a decrypted
+      // preview is never written to disk — see src/vault.
+      sealed={browsed.sealed}
+    />
+  );
 }

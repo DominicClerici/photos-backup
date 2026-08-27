@@ -23,6 +23,7 @@ import Animated, {
 } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import type { MediaCache } from '../gallery/cache';
 import { color, radius, space } from '../theme';
 import { Text, type Action } from '../ui';
 
@@ -70,9 +71,15 @@ export interface PeekTarget {
 export function Peek({
   target,
   actions = [],
+  cache = 'memory-disk',
   onClose,
 }: {
   target: PeekTarget | null;
+  /**
+   * How long the held photograph's bytes may be kept. `memory` in the vault,
+   * where nothing is written to this phone's disk — see `src/gallery/cache.ts`.
+   */
+  cache?: MediaCache;
   /**
    * What can be done to this one photograph. Every one of them closes the peek
    * on the way, because several open a sheet — and a sheet is drawn by the app,
@@ -206,7 +213,7 @@ export function Peek({
           style={StyleSheet.absoluteFill}
           source={still}
           contentFit="cover"
-          cachePolicy="memory-disk"
+          cachePolicy={cache}
           transition={0}
           onError={() => setBroken(true)}
         />

@@ -1,11 +1,12 @@
 import { fetchAlbum, type Album, type CollectionFilter } from '@photobackup/core';
-import { useTimeline, useTrashActions, useView } from '@photobackup/core/react';
+import { useTrashActions, useView } from '@photobackup/core/react';
 import { Feather } from '@expo/vector-icons';
 import { router } from 'expo-router';
 import { useEffect, useState } from 'react';
 import { Pressable, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { albumKey, recall, remember, useCachedTimeline } from '../gallery/cache';
 import { Grid } from '../grid';
 import { useBrowsing } from '../state/browsing';
 import { color, space } from '../theme';
@@ -28,7 +29,7 @@ import { categoryLabel } from './CategoryList';
 export function CollectionView({ filter }: { filter: CollectionFilter }) {
   const insets = useSafeAreaInsets();
   const { view } = useView();
-  const timeline = useTimeline(filter, view);
+  const { timeline, reload } = useCachedTimeline(filter, view);
   useBrowsing(timeline);
 
   const heading = useHeading(filter);
@@ -37,7 +38,7 @@ export function CollectionView({ filter }: { filter: CollectionFilter }) {
   //
   // The name goes with them too, and only because of the notice: "removed from
   // Iceland 2025" needs a word the filter does not carry.
-  const actions = useTrashActions(filter, timeline.retry, heading.album, view);
+  const actions = useTrashActions(filter, reload, heading.album, view);
 
   return (
     <View style={styles.root}>
@@ -87,6 +88,11 @@ export function CollectionView({ filter }: { filter: CollectionFilter }) {
  * album — addressed by uuid — has to be asked about. That lookup is its own
  * endpoint rather than a scan of the collections index, so opening one album
  * does not cost a count of every other one.
+ *
+ * And it is remembered, because it is the one part of this screen that a cached
+ * timeline cannot supply. A grid of photographs under the word "Album" is a
+ * worse screen than the same grid under "Iceland 2025", and on a phone out of
+ * reach of the archive that would be every album, every time.
  */
 function useHeading(filter: CollectionFilter): {
   title: string;
@@ -100,8 +106,21 @@ function useHeading(filter: CollectionFilter): {
     setAlbum(null);
     if (filter.kind !== 'albums') return;
     const abort = new AbortController();
+    const key = albumKey(filter.value);
+    let answered = false;
+
+    void recall<Album>(key).then((held) => {
+      if (!held || answered || abort.signal.aborted) return;
+      setAlbum(held);
+    });
+
     fetchAlbum(filter.value, abort.signal)
-      .then(setAlbum)
+      .then((fresh) => {
+        if (abort.signal.aborted) return;
+        answered = true;
+        setAlbum(fresh);
+        remember(key, fresh);
+      })
       // A heading that says "Album" is a worse screen than one that says
       // "Iceland 2025", and a better one than no photographs at all.
       .catch(() => {});

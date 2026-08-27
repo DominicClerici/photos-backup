@@ -30,6 +30,24 @@ import { useEffect, useState, useSyncExternalStore } from 'react';
  */
 let held: TimelineState | null = null;
 /**
+ * Whether that timeline is inside the vault.
+ *
+ * Published beside it because the viewer needs it and cannot ask: it is a route
+ * rather than a child of the grid, so the filter that would have told it is two
+ * screens away. What it does with the answer is keep decrypted bytes out of
+ * `expo-image`'s disk cache — see `src/vault/index.ts` for the rule and
+ * `src/gallery/cache.ts` for the other half of it.
+ */
+let sealed = false;
+/**
+ * The published pair, rebuilt only when one of its halves moves.
+ *
+ * `useSyncExternalStore` compares snapshots by identity and re-renders every
+ * subscriber when one changes, so a fresh object per read would be a render
+ * loop rather than a store.
+ */
+let snap: Browsed | null = null;
+/**
  * Which screen the published timeline belongs to.
  *
  * A phone keeps every tab it has visited mounted behind the one on top, so the
@@ -49,17 +67,25 @@ function subscribe(listener: () => void): () => void {
   };
 }
 
-function snapshot(): TimelineState | null {
-  return held;
+function snapshot(): Browsed | null {
+  return snap;
 }
 
-function publish(next: TimelineState | null): void {
+function publish(next: TimelineState | null, shut: boolean): void {
   // `useTimeline` returns a memoized object whose identity changes exactly when
   // something a reader could see has changed, so this is both the cheap check
   // and the correct one.
-  if (held === next) return;
+  if (held === next && sealed === shut) return;
   held = next;
+  sealed = shut;
+  snap = next ? { timeline: next, sealed: shut } : null;
   for (const listener of listeners) listener();
+}
+
+/** What is being browsed, and whether it is sealed. */
+export interface Browsed {
+  timeline: TimelineState;
+  sealed: boolean;
 }
 
 /**
@@ -70,7 +96,7 @@ function publish(next: TimelineState | null): void {
  * re-publish between two renders is never a moment where a viewer already open
  * is told there is nothing to look at.
  */
-export function useBrowsing(timeline: TimelineState): void {
+export function useBrowsing(timeline: TimelineState, sealed = false): void {
   // One identity per mounted screen, made once. A lazy initialiser rather than
   // a ref written during render, which is the shape the React Compiler — on for
   // this app and off for the browser — is entitled to be unhappy about.
@@ -85,24 +111,24 @@ export function useBrowsing(timeline: TimelineState): void {
   }, [focused, id]);
 
   useEffect(() => {
-    if (owner === id) publish(timeline);
+    if (owner === id) publish(timeline, sealed);
   });
 
   useEffect(
     () => () => {
       if (owner !== id) return;
       owner = null;
-      publish(null);
+      publish(null, false);
     },
     [id],
   );
 }
 
 /**
- * The timeline being browsed, or null when nothing is — a deep link straight to
- * the viewer with no gallery behind it, which is a route to send back to the
- * grid rather than a state to draw.
+ * The timeline being browsed and whether it is sealed, or null when nothing is
+ * — a deep link straight to the viewer with no gallery behind it, which is a
+ * route to send back to the grid rather than a state to draw.
  */
-export function useBrowsed(): TimelineState | null {
+export function useBrowsed(): Browsed | null {
   return useSyncExternalStore(subscribe, snapshot);
 }

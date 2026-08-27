@@ -50,10 +50,12 @@ export function ListRow({
   trailing?: ReactNode;
   onPress?: () => void;
   /**
-   * A row that is drawn but cannot be gone into. Phase 5 has three of them —
-   * the two vault buckets and Recently Deleted — because the destinations
-   * arrive in Phase 6 and a list that pretended they did not exist would be a
-   * worse account of the archive than one that says "not yet".
+   * A row that is drawn but cannot be gone into.
+   *
+   * Nothing uses it since Phase 6 gave the two vault buckets and Recently
+   * Deleted the screens they were waiting for. It stays because the shape it
+   * exists for keeps recurring: a list that pretended a destination did not
+   * exist would be a worse account of the archive than one that says "not yet".
    */
   disabled?: boolean;
 }) {

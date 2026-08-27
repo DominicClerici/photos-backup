@@ -403,6 +403,10 @@ export function useSearch(request: URLSearchParams): SearchState {
       total,
       ready,
       loading: refreshing,
+      // A ranking is never cached. It is the answer to a question somebody has
+      // only just asked, and the phone that could not reach the archive to ask
+      // it has nothing to draw either.
+      stale: false,
       error,
       retry: load,
       at,

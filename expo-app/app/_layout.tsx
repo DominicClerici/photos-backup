@@ -7,11 +7,13 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { SelectionProvider, ViewProvider } from '@photobackup/core/react';
 
 import { Controls } from '../src/actions';
+import { installCacheInvalidation } from '../src/gallery/cache';
 import { installSearchRecents } from '../src/search';
 import { ArchiveProvider, useArchive } from '../src/state/archive';
 import { BackupProvider } from '../src/state/backup';
 import { color } from '../src/theme';
 import { installToaster, TAB_BAR_CLEARANCE, Toaster } from '../src/ui';
+import { VaultGate } from '../src/vault';
 
 // Before the first screen mounts, and outside a component, because
 // `@photobackup/core`'s `notify()` is called from inside hooks and from module
@@ -23,6 +25,13 @@ installToaster();
 // on the first frame of the blank search screen, and a list that arrived a tick
 // later would appear under somebody's thumb. See src/search/recents.
 installSearchRecents();
+
+// Likewise once, outside a component, and for the third time in this file the
+// same reason: core broadcasts that the albums changed from inside a hook, and
+// the thing that has to hear it is a SQLite database rather than a screen. What
+// it does about it is drop the offline copy of a timeline that has moved on.
+// See src/gallery/cache.
+installCacheInvalidation();
 
 /**
  * The root of the app: the theme, the providers, the floating controls and the
@@ -99,6 +108,15 @@ function Gate() {
               the side, because backing out of it is going back to where the
               question was asked. */}
           <Stack.Screen name="search" />
+          {/* What has left the library, and what is sealed inside it. Root
+              routes rather than screens in the Collections tab, which is what
+              WEB_TO_MOBILE § 3.3 asks for and what the shape wants: each of
+              them is a full-width grid, and a grid with a floating tab bar over
+              it is the library's screen wearing somebody else's chrome. Their
+              own stacks, so Back inside a bucket goes to the bucket. */}
+          <Stack.Screen name="trash" />
+          <Stack.Screen name="archive" />
+          <Stack.Screen name="hidden" />
           {/* Transparent, and faded rather than slid up: the viewer draws its
               own backdrop, and a drag towards dismissing it thins that backdrop
               until the grid the photograph came out of shows through. A modal
@@ -126,6 +144,12 @@ function Gate() {
           registered — so the collections screen, the backup tab and the pairing
           form never see it. */}
       {paired ? <Controls /> : null}
+
+      {/* Above the router too, and it has to be: archiving a photograph on an
+          archive that has never had a vault asks for a password from the middle
+          of the library's grid, and a locked bucket asks from a screen that has
+          drawn nothing. One prompt, opened from anywhere. See src/vault/Gate. */}
+      {paired ? <VaultGate /> : null}
 
       {/* Above both, so a notice outlives the screen that caused it. The
           clearance is for the floating tab bar, which is drawn over the content

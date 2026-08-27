@@ -46,6 +46,7 @@ import Animated, {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { askToFile } from '../actions';
+import { mediaCacheFor } from '../gallery/cache';
 import { color, radius, space } from '../theme';
 import { Button, TAB_BAR_CLEARANCE, Text, type Action } from '../ui';
 import { DatePill } from './DatePill';
@@ -192,7 +193,10 @@ export function Grid({
 }) {
   const insets = useSafeAreaInsets();
   const { width: screenWidth } = useWindowDimensions();
-  const { days, total, ready, loading, error, retry, at: itemAt, request, patch } = timeline;
+  // Everything in the vault is drawn from memory and never written down. See
+  // `src/gallery/cache.ts`, which owns both halves of that rule.
+  const cache = mediaCacheFor(filter?.kind === 'vault');
+  const { days, total, ready, loading, stale, error, retry, at: itemAt, request, patch } = timeline;
 
   const [viewport, setViewport] = useState(0);
   const inner = Math.max(1, screenWidth - GUTTER * 2);
@@ -828,8 +832,7 @@ export function Grid({
    * Which rows there are is the scope's to decide, exactly as it is for the
    * selection sheet: in the library a photograph can be filed, archived, hidden
    * or deleted; in Recently Deleted it can come back or go for good; in the
-   * vault it can only come back out. Archive and Hide are drawn and inert until
-   * Phase 6 brings the gate that would let them run.
+   * vault it can only come back out.
    */
   const peekActions = useMemo<Action[]>(() => {
     if (!peek) return [];
@@ -880,21 +883,34 @@ export function Grid({
       });
     }
 
+    // Not armed, and not last. Filing something away is undoable from the
+    // notice and reversible from a screen one tap away; only the delete below
+    // is buying two taps with the thing it cannot buy back. The order says so.
+    //
+    // Neither needs the vault unlocked. Putting a photograph in works on a
+    // locked vault and creates one that does not exist yet — which is the whole
+    // asymmetry the feature rests on, and why this is a menu row rather than a
+    // password prompt. `useTrashActions` hands the two states that do need a
+    // password to the gate instead of to a notice; see core's `needsVault`.
     if (actions.scope === 'library') {
       rows.push(
         {
           key: 'archive',
           label: describeAction('Archive', one),
           icon: 'archive',
-          disabled: true,
-          note: 'Phase 6',
+          onPress: () => {
+            shut();
+            void actions.hide('archive', target, noun);
+          },
         },
         {
           key: 'hide',
           label: describeAction('Hide', one),
           icon: 'eye-off',
-          disabled: true,
-          note: 'Phase 6',
+          onPress: () => {
+            shut();
+            void actions.hide('hidden', target, noun);
+          },
         },
       );
     }
@@ -1092,6 +1108,7 @@ export function Grid({
                   thumb={thumb}
                   places={places(index)}
                   z={z}
+                  cache={cache}
                   selecting={picking}
                   selected={picking && selected(index)}
                 />
@@ -1142,10 +1159,20 @@ export function Grid({
         bottom={padBottom}
       />
 
+      {/* Two different sentences, and the difference is whether there is a
+          grid behind this one. With a cached day table painted, an archive out
+          of reach is not a failure to report in red — the geometry is right,
+          the ground already walked is drawn, and what is missing is only
+          whatever has changed since. Without one there is nothing on screen at
+          all, and that is the error it has always been. */}
       {error ? (
         <View style={[styles.notice, { bottom: padBottom }]}>
-          <Text variant="small" tone="destructive" style={styles.noticeText}>
-            {error}
+          <Text
+            variant="small"
+            tone={stale ? 'muted' : 'destructive'}
+            style={styles.noticeText}
+          >
+            {stale ? `${error}. Showing what was here last time.` : error}
           </Text>
           <Button label="Retry" onPress={retry} />
         </View>
@@ -1163,7 +1190,7 @@ export function Grid({
         </View>
       ) : null}
 
-      <Peek target={peek} actions={peekActions} onClose={() => setPeek(null)} />
+      <Peek target={peek} actions={peekActions} cache={cache} onClose={() => setPeek(null)} />
     </View>
   );
 }

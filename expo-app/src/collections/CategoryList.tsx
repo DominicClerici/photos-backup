@@ -46,16 +46,20 @@ export const categoryLabel = (key: string) => look(key).label;
  * The named slices of a scope, as rows rather than as a grid.
  *
  * @param onOpen where a row leads. The library's categories go to
- * `/collections/categories/…`; a bucket's will go to `/archive` or `/hidden`
- * over exactly the same keys — a hidden screenshot is a screenshot — which is
- * why this takes a callback rather than growing a second component in Phase 6.
+ * `/collections/categories/…` and a bucket's to `/archive/categories/…` or
+ * `/hidden/categories/…`, over exactly the same keys — a hidden screenshot is a
+ * screenshot. Which is why this takes a callback rather than having grown a
+ * second component for the vault.
  */
 export function CategoryList({
   categories,
   onOpen,
+  sealed = false,
 }: {
   categories: Category[];
   onOpen: (key: string) => void;
+  /** Whether these are a bucket's categories, whose covers are decrypted. */
+  sealed?: boolean;
 }) {
   return (
     <RowList>
@@ -69,7 +73,12 @@ export function CategoryList({
             onPress={() => onOpen(category.key)}
             leading={
               <View style={styles.badge}>
-                <Cover id={category.cover_id} size={BASE_THUMB_SIZE} style={styles.cover} />
+                <Cover
+                  id={category.cover_id}
+                  size={BASE_THUMB_SIZE}
+                  sealed={sealed}
+                  style={styles.cover}
+                />
                 {/* The glyph is what makes the row scannable; the photograph
                     behind it is what makes the list look like the library
                     rather than a settings screen. Dimming it keeps both

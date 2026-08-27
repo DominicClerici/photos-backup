@@ -7,9 +7,12 @@ import {
   notifyError,
   UNDO_MS,
   undoDelete,
+  unvault,
+  vaultAlbum,
   type Album,
+  type Bucket,
 } from '@photobackup/core';
-import { albumsChanged } from '@photobackup/core/react';
+import { albumsChanged, BUCKET_LABEL, BUCKET_VERB, needsVault } from '@photobackup/core/react';
 import { useCallback } from 'react';
 import { Pressable, StyleSheet, useWindowDimensions, View } from 'react-native';
 
@@ -38,10 +41,17 @@ export function AlbumGrid({
   albums,
   onOpen,
   onMenu,
+  bucket,
 }: {
   albums: Album[];
   onOpen: (album: Album) => void;
   onMenu: (album: Album) => void;
+  /**
+   * Which half of the archive these albums are in. Undefined is the library's
+   * own. Inside a bucket every cover is a decrypted thumbnail, and none of them
+   * is written to this phone's disk — see `Cover`.
+   */
+  bucket?: Bucket;
 }) {
   const { width } = useWindowDimensions();
   // Two across. The browser goes to five on a wide screen; a phone has room for
@@ -62,6 +72,7 @@ export function AlbumGrid({
         >
           <Cover
             id={album.cover_id}
+            sealed={bucket !== undefined}
             style={{ width: side, height: side, borderRadius: radius.xl }}
           />
           <Text variant="small" numberOfLines={1} style={styles.name}>
@@ -86,21 +97,29 @@ export function AlbumGrid({
  * is a delete of forty photographs that happens to be spelled as an album, and
  * it should have to be aimed at deliberately. Both are armed for that reason.
  *
- * The two above them — Archive and Hide — are drawn and inert. They take the
- * photographs with them into the vault, and the vault's gate is Phase 6; the
- * rows are here so that what an album can have done to it is stated in one
- * place rather than discovered a phase later.
+ * The two above them — Archive and Hide — take the photographs with them into
+ * the vault, under one batch, so that the Undo puts the album and its contents
+ * back together. Inside a bucket they collapse into the single row that makes
+ * sense there: an album already in the Archive can come out of it, and nothing
+ * else. There is deliberately no delete in a bucket — taking an album out and
+ * then deleting it is two decisions, and one button that decrypted an album in
+ * order to throw it away would be spending the password on the one operation
+ * that does not need it.
  *
+ * @param bucket Which half of the archive this album is in. Undefined is the
+ * library's own.
  * @param onChanged Called after a delete lands, and after one is undone, so the
  * screen can re-read the index. There is nothing to patch in place: an album is
  * a row in a list, and the list is one request.
  */
 export function AlbumMenu({
   album,
+  bucket,
   onClose,
   onChanged,
 }: {
   album: Album | null;
+  bucket?: Bucket;
   onClose: () => void;
   onChanged?: () => void;
 }) {
@@ -110,6 +129,64 @@ export function AlbumMenu({
     albumsChanged();
     onChanged?.();
   }, [onChanged]);
+
+  /**
+   * Into a bucket, with everything in it.
+   *
+   * One batch for the album and its photographs, which is what makes the Undo
+   * one act rather than forty. A vault that does not exist yet is not an error
+   * to report — it is a password to choose — so it is handed to the gate rather
+   * than to a notice. See core's `needsVault`.
+   */
+  const fileAway = useCallback(
+    (to: Bucket, id: string, title: string) => {
+      onClose();
+      vaultAlbum(to, id)
+        .then(({ batch, moved }) => {
+          changed();
+          const notice: string = notify({
+            title: `“${title}” ${to === 'archive' ? 'archived' : 'hidden'}`,
+            description: `${counted(moved)} encrypted in ${BUCKET_LABEL[to]}, with the album.`,
+            timeout: UNDO_MS,
+            action: {
+              label: 'Undo',
+              onPress: () => {
+                closeNotice(notice);
+                unvault({ batch })
+                  .then(changed)
+                  .catch((err: unknown) => notifyError(err, 'Could not undo'));
+              },
+            },
+          });
+        })
+        .catch((err: unknown) => {
+          if (needsVault(err)) return;
+          notifyError(err, `Could not ${BUCKET_VERB[to].toLowerCase()} the album`);
+        });
+    },
+    [changed, onClose],
+  );
+
+  /** Back out of a bucket, into the library and into the album it was in. */
+  const bringBack = useCallback(
+    (from: Bucket, id: string, title: string) => {
+      onClose();
+      unvault({ bucket: from, album: id })
+        .then(({ restored }) => {
+          changed();
+          notify({
+            type: 'success',
+            title: `“${title}” restored`,
+            description: `${counted(restored)} back in the library, in the album.`,
+          });
+        })
+        .catch((err: unknown) => {
+          if (needsVault(err)) return;
+          notifyError(err, 'Could not restore the album');
+        });
+    },
+    [changed, onClose],
+  );
 
   const remove = useCallback(
     (id: string, title: string, photos: boolean) => {
@@ -146,41 +223,48 @@ export function AlbumMenu({
   // is rather than by its name, because a title in a verb phrase reads like a
   // place: "Archive Iceland 2025" is a sentence about Iceland. A person is the
   // other way round, and PeopleRow says so.
-  const actions: Action[] = album
-    ? [
-        {
-          key: 'archive',
-          label: describeAction('Archive', { kind: 'album' }),
-          icon: 'archive',
-          disabled: true,
-          note: 'Phase 6',
-        },
-        {
-          key: 'hide',
-          label: describeAction('Hide', { kind: 'album' }),
-          icon: 'eye-off',
-          disabled: true,
-          note: 'Phase 6',
-        },
-        {
-          key: 'delete',
-          label: describeAction('Delete', { kind: 'album' }),
-          icon: 'folder-minus',
-          tone: 'destructive',
-          armed: true,
-          onPress: () => remove(album.id, album.title, false),
-        },
-        {
-          key: 'delete-all',
-          label: 'Delete album and photos',
-          icon: 'trash-2',
-          tone: 'destructive',
-          armed: true,
-          disabled: album.count === 0,
-          onPress: () => remove(album.id, album.title, true),
-        },
-      ]
-    : [];
+  const actions: Action[] = !album
+    ? []
+    : bucket
+      ? [
+          {
+            key: 'restore',
+            label: describeAction(bucket === 'hidden' ? 'Unhide' : 'Unarchive', { kind: 'album' }),
+            icon: 'rotate-ccw',
+            onPress: () => bringBack(bucket, album.id, album.title),
+          },
+        ]
+      : [
+          {
+            key: 'archive',
+            label: describeAction('Archive', { kind: 'album' }),
+            icon: 'archive',
+            onPress: () => fileAway('archive', album.id, album.title),
+          },
+          {
+            key: 'hide',
+            label: describeAction('Hide', { kind: 'album' }),
+            icon: 'eye-off',
+            onPress: () => fileAway('hidden', album.id, album.title),
+          },
+          {
+            key: 'delete',
+            label: describeAction('Delete', { kind: 'album' }),
+            icon: 'folder-minus',
+            tone: 'destructive',
+            armed: true,
+            onPress: () => remove(album.id, album.title, false),
+          },
+          {
+            key: 'delete-all',
+            label: 'Delete album and photos',
+            icon: 'trash-2',
+            tone: 'destructive',
+            armed: true,
+            disabled: album.count === 0,
+            onPress: () => remove(album.id, album.title, true),
+          },
+        ];
 
   return (
     <ActionSheet

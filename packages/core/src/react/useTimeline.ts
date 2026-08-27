@@ -102,6 +102,16 @@ export interface TimelineState {
    * a position out of it has to know that, and the calendar does.
    */
   loading: boolean;
+  /**
+   * Whether what is drawn came out of the store rather than off the archive.
+   *
+   * Only ever true where there is a store, which is only ever the phone: it is
+   * how a grid knows the difference between "nothing has arrived yet" and "this
+   * is last time's archive, and the machine is not answering". Cleared the
+   * moment the network's own table lands, whether or not it agreed with the
+   * cached one.
+   */
+  stale: boolean;
   error: string | null;
   retry: () => void;
   /** The item at a position, or undefined while it is still being fetched. */
@@ -190,6 +200,7 @@ export function useTimeline(
   const [total, setTotal] = useState(0);
   const [ready, setReady] = useState(false);
   const [refreshing, setRefreshing] = useState(true);
+  const [cached, setCached] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Bumped whenever a page lands. The item array itself lives in a ref: it is
   // one slot per photo in the archive, and copying it to announce that 200 of
@@ -399,8 +410,9 @@ export function useTimeline(
     let painted: DayTable | null = null;
     let answered = false;
 
-    const adopt = (table: DayTable) => {
+    const adopt = (table: DayTable, from: "cache" | "archive") => {
       painted = table;
+      setCached(from === "cache");
       model.current = daysFrom(table.days);
       setDays(model.current);
       setTotal(table.total);
@@ -418,7 +430,7 @@ export function useTimeline(
     cache?.days(where).then((held) => {
       if (!held || answered || controller.signal.aborted) return;
       items.current = new Array(held.total);
-      adopt(held);
+      adopt(held, "cache");
     });
 
     fetchTimelineDays(asked.current, looking.current, controller.signal)
@@ -433,7 +445,7 @@ export function useTimeline(
           if (painted) clear();
           items.current = new Array(table.total);
         }
-        adopt(table);
+        adopt(table, "archive");
         setRefreshing(false);
         cache?.saveDays(where, table);
       })
@@ -509,6 +521,7 @@ export function useTimeline(
       total,
       ready,
       loading: refreshing,
+      stale: cached,
       error,
       retry,
       at,
@@ -517,7 +530,21 @@ export function useTimeline(
       request,
       patch,
     }),
-    [days, total, ready, refreshing, error, retry, at, indexOf, locate, request, patch, version],
+    [
+      days,
+      total,
+      ready,
+      refreshing,
+      cached,
+      error,
+      retry,
+      at,
+      indexOf,
+      locate,
+      request,
+      patch,
+      version,
+    ],
   );
 }
 

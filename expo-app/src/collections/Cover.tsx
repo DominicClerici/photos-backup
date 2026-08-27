@@ -4,6 +4,7 @@ import { Image } from 'expo-image';
 import { useState } from 'react';
 import { StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
 
+import { mediaCacheFor } from '../gallery/cache';
 import { color } from '../theme';
 
 /**
@@ -26,6 +27,7 @@ export function Cover({
   size = 512,
   style,
   round = false,
+  sealed = false,
 }: {
   /** The asset to draw, or nothing — an empty collection has no cover. */
   id?: string;
@@ -34,6 +36,14 @@ export function Cover({
   style?: StyleProp<ViewStyle>;
   /** A person is a circle; everything else is a rounded square. */
   round?: boolean;
+  /**
+   * Whether this collection is inside the vault, in which case its cover is a
+   * decrypted thumbnail and is kept in memory only. A bucket's album grid is a
+   * page of photographs somebody hid; leaving them in expo-image's disk cache
+   * would leave them readable long after the vault re-locked. See
+   * `src/gallery/cache.ts`.
+   */
+  sealed?: boolean;
 }) {
   const [fallback, setFallback] = useState(false);
   const [broken, setBroken] = useState(false);
@@ -52,7 +62,7 @@ export function Cover({
         style={StyleSheet.absoluteFill}
         source={media(id, thumbVariant(fallback ? BASE_THUMB_SIZE : size))}
         contentFit="cover"
-        cachePolicy="memory-disk"
+        cachePolicy={mediaCacheFor(sealed)}
         transition={120}
         recyclingKey={`${id}#${fallback ? BASE_THUMB_SIZE : size}`}
         onError={() => (fallback ? setBroken(true) : setFallback(true))}
