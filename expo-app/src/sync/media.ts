@@ -293,28 +293,41 @@ export class PhotoKitMediaSource implements MediaSource {
     directory.create({ intermediates: true, idempotent: true });
     const destination = new File(directory, cacheName(item.localId));
 
-    const result = await this.gate.run(() =>
-      photoKitDownloadSharedResource(assetId, destination.uri, paired ? 'pairedVideo' : 'primary')
-    );
-
-    // Null is this build, not this asset — the same meaning it carries
-    // everywhere in the native module's façade. Charged to the item anyway,
-    // because there is nothing else here to charge it to and the run has to keep
-    // going; the alternative is a shared album that fails the whole backup.
-    if (result === null) {
-      throw new SyncError(
-        `this build cannot download shared assets, or ${assetId} is no longer in a shared album`,
-        'item'
+    // Everything that decides whether this download worked happens inside the
+    // gate, and that is load-bearing rather than tidy. The native call reports a
+    // refusal by *resolving* with ok:false — see photoKitDownloadSharedResource —
+    // so a gate handed a closure that only fetched would see every refusal as a
+    // success, and the strain that is supposed to stretch the pause between
+    // downloads would sit at zero however hard iCloud was pushing back. The gate
+    // learns what happened the only way it can: by the closure throwing.
+    const download = await this.gate.run(async () => {
+      const result = await photoKitDownloadSharedResource(
+        assetId,
+        destination.uri,
+        paired ? 'pairedVideo' : 'primary'
       );
-    }
-    if (!result.ok) {
-      throw new SyncError(
-        `iCloud would not hand over ${item.filename}: ${describeFailure(result.failure)}`,
-        'item'
-      );
-    }
 
-    const { download } = result;
+      // Null is this build, not this asset — the same meaning it carries
+      // everywhere in the native module's façade. Charged to the item anyway,
+      // because there is nothing else here to charge it to and the run has to
+      // keep going; the alternative is a shared album that fails the whole
+      // backup.
+      if (result === null) {
+        throw new SyncError(
+          `this build cannot download shared assets, or ${assetId} is no longer in a shared album`,
+          'item'
+        );
+      }
+      if (!result.ok) {
+        throw new SyncError(
+          `iCloud would not hand over ${item.filename}: ${describeFailure(result.failure)}`,
+          'item'
+        );
+      }
+
+      return result.download;
+    });
+
     return {
       uri: destination.uri,
       size: download.bytes,
