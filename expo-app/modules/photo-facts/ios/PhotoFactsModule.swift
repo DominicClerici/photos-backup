@@ -66,6 +66,11 @@
 //                             how many bytes had arrived before it gave up.
 //                             Zero bytes is never mistaken for success, because
 //                             `ok` says which of the two it is.
+//                             Both of these are bounded, which nothing else in
+//                             the file needs to be: they are the only calls that
+//                             wait on iCloud, and PhotoKit will wait on a
+//                             stalled transfer for as long as the app is alive.
+//                             See StallWatchdog.
 //   downloadSharedResourceAsync
 //                             the same fetch, kept rather than counted, and the
 //                             one the backup runs on. It writes to a path the
@@ -126,6 +131,37 @@ private let noResourceCode = 404
 /// path that is not there. Apple's side of the transfer worked, so this is
 /// reported as ours.
 private let notWrittenCode = 507
+
+/// A fetch abandoned because nothing was arriving any more. See StallWatchdog.
+///
+/// Ours rather than Apple's, and deliberately not the NSUserCancelledError that
+/// cancelling the request actually produces: 3072 is on the caller's permanent
+/// list, where "asking again is asking to be cancelled again" is true of a
+/// cancel somebody meant and false of this one. A stall is the most retryable
+/// thing that happens on this path, and it has to arrive looking like it.
+private let stalledCode = 504
+
+/// How long a fetch may go with nothing arriving before it is given up on.
+///
+/// Measured from the last sign of life of any kind — bytes handed over, or a
+/// move in iCloud's own download fraction — so a transfer is never cut off for
+/// being slow, only for having stopped. A 2GB video over a weak connection is
+/// minutes of legitimate work and a deadline on the total would be a worse bug
+/// than the one this exists for.
+///
+/// Ninety seconds is far longer than any gap seen in a healthy fetch and far
+/// shorter than the ten minutes a wedged one was observed to cost. What follows
+/// it is a retry rather than a lost photograph: the failure is charged to the
+/// item, and the sync engine tries again with backoff.
+private let sharedFetchStallSeconds = 90.0
+
+/// How often the watchdog looks. The check is a subtraction behind a lock, and
+/// the resolution it buys is not worth paying for more often than this.
+private let sharedFetchPollSeconds = 5.0
+
+/// Where the watchdog's timer fires. Its own queue, because the thing it is
+/// watching for is every other queue having gone quiet.
+private let watchdogQueue = DispatchQueue(label: "photofacts.watchdog", qos: .utility)
 
 public class PhotoFactsModule: Module {
   public func definition() -> ModuleDefinition {
@@ -411,6 +447,13 @@ private final class SharedFetchSink {
   private var bytes = 0
   private var fraction = 0.0
   private var reportedAt = 0.0
+  /// When something last arrived — bytes, or a move in iCloud's own progress.
+  ///
+  /// Read by the watchdog from a queue of its own, which is why it lives under
+  /// the same lock as the counters rather than beside them. It starts at the
+  /// moment the sink is made, so the wait for the first byte is watched on the
+  /// same terms as every gap after it.
+  private var activeAt = CFAbsoluteTimeGetCurrent()
   /// The first write that failed. Kept rather than thrown: this runs inside
   /// PhotoKit's delivery handler, where there is nobody to throw to, and the
   /// completion handler is where a caller is listening.
@@ -455,6 +498,13 @@ private final class SharedFetchSink {
     return writeFailure
   }
 
+  /// How long nothing at all has arrived for.
+  func idleSeconds() -> Double {
+    lock.lock()
+    defer { lock.unlock() }
+    return CFAbsoluteTimeGetCurrent() - activeAt
+  }
+
   /// The digest of everything written, and the end of the file. Call once.
   func finish() -> String {
     lock.lock()
@@ -469,10 +519,106 @@ private final class SharedFetchSink {
     change()
 
     let now = CFAbsoluteTimeGetCurrent()
+    // Every call, not every reported one. This is the record of the fetch being
+    // alive, and throttling it would be a fetch that looks stalled six times a
+    // second for as long as it is going well.
+    activeAt = now
+
     guard now - reportedAt >= progressReportInterval else { return nil }
     reportedAt = now
     return ["localId": localId, "bytes": bytes, "fraction": fraction]
   }
+}
+
+/// Ends a fetch that has stopped arriving.
+///
+/// PhotoKit's answer to a transfer iCloud has gone quiet on is to wait for it.
+/// PHAssetResourceRequestOptions carries no timeout and there is no deadline to
+/// set: requestData's completion handler runs when the bytes are all here or
+/// when something goes wrong, and a stall is neither. The consequence upstream
+/// is a promise that never settles — an upload worker parked forever, the gate
+/// behind it never opening, and a backup that has stopped without saying so.
+/// That is the ten minutes of "Fetching IMG_4021.HEIC" this was written for.
+///
+/// So the deadline is ours, and it is a deadline on silence rather than on the
+/// whole transfer. See sharedFetchStallSeconds.
+///
+/// Whoever reaches settle() first owns the promise, and the other resolves
+/// nothing: a completion handler arriving after the watchdog has given up is
+/// Apple answering a request that was already cancelled and already reported,
+/// and resolving a promise twice is a crash in the bridge.
+///
+/// The watchdog resolves the promise itself rather than leaving it to the
+/// cancelled request's completion handler, which is the more suspicious of the
+/// two designs and the right one: it needs no faith that cancelDataRequest
+/// produces a callback, and a fetch this has given up on is over from the
+/// caller's point of view whatever Apple does next.
+private final class StallWatchdog {
+  private let lock = NSLock()
+  private let idleFor: () -> Double
+  private let onStall: (PHAssetResourceDataRequestID) -> Void
+  private var timer: DispatchSourceTimer?
+  private var settled = false
+
+  init(
+    idleFor: @escaping () -> Double,
+    onStall: @escaping (PHAssetResourceDataRequestID) -> Void
+  ) {
+    self.idleFor = idleFor
+    self.onStall = onStall
+  }
+
+  /// Begins watching a request that is already in flight.
+  ///
+  /// Armed from the identifier rather than before it, because cancelling is half
+  /// of what this does and the identifier is what cancels. A request that
+  /// finished before requestData even returned is already settled by the time it
+  /// gets here, and is given no timer at all.
+  func start(_ requestID: PHAssetResourceDataRequestID) {
+    lock.lock()
+    guard !settled else {
+      lock.unlock()
+      return
+    }
+    let ticking = DispatchSource.makeTimerSource(queue: watchdogQueue)
+    timer = ticking
+    lock.unlock()
+
+    ticking.schedule(deadline: .now() + sharedFetchPollSeconds, repeating: sharedFetchPollSeconds)
+    // Strongly captured, and the cycle broken by the cancel() that every exit
+    // from here performs. A watchdog held by nothing else has to outlive its own
+    // arming, or the fetch it is watching quietly goes back to being unbounded.
+    ticking.setEventHandler { [self] in
+      guard idleFor() >= sharedFetchStallSeconds, settle() else { return }
+      onStall(requestID)
+    }
+    ticking.resume()
+  }
+
+  /// True for whichever of the completion handler and the watchdog gets here
+  /// first, false for the one that follows it.
+  @discardableResult
+  func settle() -> Bool {
+    lock.lock()
+    guard !settled else {
+      lock.unlock()
+      return false
+    }
+    settled = true
+    let ticking = timer
+    timer = nil
+    lock.unlock()
+
+    // Outside the lock: cancelling releases the event handler, which holds the
+    // last reference to this object in the ordinary case.
+    ticking?.cancel()
+    return true
+  }
+}
+
+/// Milliseconds since an instant, for the elapsed figure every fetch reports.
+private func elapsedMs(since started: CFAbsoluteTime) -> Int {
+  return Int(((CFAbsoluteTimeGetCurrent() - started) * 1000.0).rounded())
 }
 
 /// Reads one shared asset's primary resource all the way through, and reports
@@ -528,14 +674,32 @@ private func fetchResource(
 
   let started = CFAbsoluteTimeGetCurrent()
 
-  PHAssetResourceManager.default().requestData(
+  // The survey is driven by a loop that retries and paces itself, and every one
+  // of those decisions is made after a fetch answers. A fetch that never answers
+  // is the one case the loop cannot reach, so it is bounded here. See
+  // StallWatchdog.
+  let watchdog = StallWatchdog(idleFor: { progress.idleSeconds() }) { requestID in
+    PHAssetResourceManager.default().cancelDataRequest(requestID)
+    let received = progress.count()
+    promise.resolve(fetchFailure(
+      domain: photoFactsErrorDomain,
+      code: stalledCode,
+      message: "iCloud stopped sending after \(received) bytes and went quiet for "
+        + "\(Int(sharedFetchStallSeconds))s",
+      bytes: received,
+      elapsedMs: elapsedMs(since: started)
+    ))
+  }
+
+  let requestID = PHAssetResourceManager.default().requestData(
     for: resource,
     options: options,
     dataReceivedHandler: { data in
       if let body = progress.received(data) { onProgress(body) }
     },
     completionHandler: { error in
-      let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - started) * 1000.0).rounded())
+      guard watchdog.settle() else { return }
+      let elapsed = elapsedMs(since: started)
       let received = progress.count()
 
       if let error {
@@ -548,7 +712,7 @@ private func fetchResource(
           code: ns.code,
           message: ns.localizedDescription,
           bytes: received,
-          elapsedMs: elapsedMs
+          elapsedMs: elapsed
         ))
         return
       }
@@ -561,7 +725,7 @@ private func fetchResource(
       let read: [String: Any?] = [
         "ok": true,
         "bytes": received,
-        "elapsedMs": elapsedMs,
+        "elapsedMs": elapsed,
         "uniformTypeIdentifier": resource.uniformTypeIdentifier,
         "originalFilename": resource.originalFilename,
         "resourceType": resourceTypeName(resource.type)
@@ -569,6 +733,8 @@ private func fetchResource(
       promise.resolve(read)
     }
   )
+
+  watchdog.start(requestID)
 }
 
 /// A failed read, in the shape the successful one resolves in. `ok` is what
@@ -658,14 +824,40 @@ private func downloadResource(
 
   let started = CFAbsoluteTimeGetCurrent()
 
-  PHAssetResourceManager.default().requestData(
+  // The backup's version of the same guard, and the one that was actually being
+  // paid for: this promise is awaited by an upload worker, inside a gate that
+  // serializes every shared download in the run. A fetch that never answers does
+  // not stall one photograph, it stalls all of them, and the Pause button reads
+  // a flag that is only checked between items. See StallWatchdog.
+  //
+  // The half-written file goes with it. A download given up on leaves nothing
+  // behind for the same reason a failed one does not: what would survive is a
+  // plausible-looking original with a digest that matches nothing, and the retry
+  // that follows would upload it.
+  let watchdog = StallWatchdog(idleFor: { sink.idleSeconds() }) { requestID in
+    PHAssetResourceManager.default().cancelDataRequest(requestID)
+    let received = sink.count()
+    _ = sink.finish()
+    discard(url)
+    promise.resolve(fetchFailure(
+      domain: photoFactsErrorDomain,
+      code: stalledCode,
+      message: "iCloud stopped sending \(url.lastPathComponent) after \(received) bytes "
+        + "and went quiet for \(Int(sharedFetchStallSeconds))s",
+      bytes: received,
+      elapsedMs: elapsedMs(since: started)
+    ))
+  }
+
+  let requestID = PHAssetResourceManager.default().requestData(
     for: resource,
     options: options,
     dataReceivedHandler: { data in
       if let body = sink.received(data) { onProgress(body) }
     },
     completionHandler: { error in
-      let elapsedMs = Int(((CFAbsoluteTimeGetCurrent() - started) * 1000.0).rounded())
+      guard watchdog.settle() else { return }
+      let elapsed = elapsedMs(since: started)
       let received = sink.count()
       let writeFailure = sink.failedToWrite()
       let md5 = sink.finish()
@@ -675,7 +867,7 @@ private func downloadResource(
         discard(url)
         promise.resolve(fetchFailure(
           domain: ns.domain, code: ns.code, message: ns.localizedDescription,
-          bytes: received, elapsedMs: elapsedMs))
+          bytes: received, elapsedMs: elapsed))
         return
       }
 
@@ -687,7 +879,7 @@ private func downloadResource(
         promise.resolve(fetchFailure(
           domain: photoFactsErrorDomain, code: notWrittenCode,
           message: "could not write \(url.lastPathComponent): \(writeFailure.localizedDescription)",
-          bytes: received, elapsedMs: elapsedMs))
+          bytes: received, elapsedMs: elapsed))
         return
       }
 
@@ -696,7 +888,7 @@ private func downloadResource(
         "path": url.path,
         "bytes": received,
         "md5": md5,
-        "elapsedMs": elapsedMs,
+        "elapsedMs": elapsed,
         "uniformTypeIdentifier": resource.uniformTypeIdentifier,
         "originalFilename": resource.originalFilename,
         "resourceType": resourceTypeName(resource.type)
@@ -704,6 +896,8 @@ private func downloadResource(
       promise.resolve(downloaded)
     }
   )
+
+  watchdog.start(requestID)
 }
 
 /// What the caller passes to ask for a Live Photo's clip instead of its still.

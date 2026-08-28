@@ -207,6 +207,13 @@ export type SharedResourceRead = {
  * category would be worse than the pair itself. The partial byte count is the
  * other half of the picture — a read that died after thirty seconds and twelve
  * megabytes is a different failure from one that died instantly.
+ *
+ * One code is the module's own and is worth knowing by sight: `PhotoFacts` 504
+ * is a fetch iCloud stopped answering, given up on from this side after a
+ * minute and a half of silence rather than by Apple. It is reported in our
+ * domain deliberately — cancelling the request produces NSUserCancelledError,
+ * which the caller treats as permanent, and a stall is the most retryable thing
+ * that happens on this path. See StallWatchdog in the Swift.
  */
 export type SharedFetchFailure = {
   /** NSError's domain, or `PhotoFacts` for something the module found itself. */
