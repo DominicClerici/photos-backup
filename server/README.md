@@ -12,6 +12,14 @@ go run ./cmd/photod                  # migrations run at startup, TLS generates 
 photobackup pair                     # a code to pair a device with
 ```
 
+That first line needs a `.env` at the repo root holding `POSTGRES_PASSWORD`;
+compose fails with `set POSTGRES_PASSWORD in .env` without one, because the
+password is no longer written into the committed `docker-compose.yml`. The
+container publishes 5432 on loopback only. `DATABASE_URL` and, for the tests,
+`TEST_DATABASE_URL` have to carry the same password — the built-in fallbacks in
+`config.FromEnv` and the test helpers are a development convenience and only
+work against a volume that was initialised with them.
+
 photod serves one page — the sign-in form — and reverse-proxies the rest. The
 gallery is the Next.js app in `../web`, which runs on loopback behind this
 process; see its README to bring the browser side up.

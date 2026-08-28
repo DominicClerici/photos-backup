@@ -323,6 +323,30 @@ Postgres runs from the repository's `docker-compose.yml` on this machine — the
 same container the tests use, on 5432, which is what `DATABASE_URL` in
 `photod.env` points at. There is no system `postgresql` unit.
 
+**The port is published on loopback only, and the password comes from `.env`.**
+It used to be `"5432:5432"`, which binds `0.0.0.0` and `[::]` — and the
+"Firewall" section below was wrong about what that meant, so the database was
+reachable from every device on the LAN with a password committed to a public
+repository. Both halves are fixed: the publish is `127.0.0.1` and `[::1]`, and
+`POSTGRES_PASSWORD` is interpolated from `.env`, which `*.env` in `.gitignore`
+keeps out of the repository.
+
+`docker compose up` fails with `set POSTGRES_PASSWORD in .env` when that file is
+missing, which is the intended failure — an unset variable would otherwise reach
+`initdb` as a blank password on a fresh volume. Create it with a value that
+matches `DATABASE_URL` in `photod.env`:
+
+```sh
+printf 'POSTGRES_PASSWORD=%s\n' "$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40)" > .env
+chmod 600 .env
+```
+
+Only `initdb` reads it, so writing a new value into `.env` does nothing to a
+volume that already exists. Rotating the password on a live archive is an
+`alter user` against the running container plus the matching edit to
+`DATABASE_URL`; `.env` is what a later `docker compose down -v` would rebuild
+the role from, so it has to be kept in step either way.
+
 The image is `pgvector/pgvector:pg18`, not the stock `postgres:18-alpine`, and
 the difference matters twice. Migration 0016 opens with `create extension
 vector`, which the alpine image cannot satisfy — and the two images are built on

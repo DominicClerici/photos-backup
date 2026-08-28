@@ -13,10 +13,32 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: photobackup
-      POSTGRES_PASSWORD: photobackup
+      # Read from .env, which is gitignored, because this file is not: it is
+      # committed to a public repository, and a password in it is a published
+      # password. The `:?` makes a missing value a startup error rather than an
+      # empty one — an unset variable here would otherwise reach initdb as a
+      # blank password on a fresh volume.
+      #
+      # Only initdb reads this. Changing it does nothing to a volume that
+      # already exists; rotating the password on a live archive is an
+      # `alter user` plus DATABASE_URL in /etc/photod/photod.env, and this line
+      # is what a future `docker compose down -v` would then rebuild from.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: photobackup
+    # Loopback only. This used to be "5432:5432", which binds 0.0.0.0 *and*
+    # [::] — and on Fedora Workstation the default firewall zone opens
+    # 1025-65535/tcp, so the archive's whole database was reachable from every
+    # device on the LAN, and over a globally-routable IPv6 address besides.
+    #
+    # Nothing off this machine has ever needed it. photod is the only client
+    # and it connects over localhost; photo-ml never touches Postgres at all.
+    #
+    # Both loopback families are published because DATABASE_URL says
+    # `localhost`, and which of ::1 and 127.0.0.1 that resolves to first is not
+    # something this file should have an opinion about.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
+      - "[::1]:5432:5432"
     volumes:
       # postgres:18+ expects the mount one level up, so it can keep
       # major-version-specific subdirectories and support pg_upgrade --link.
