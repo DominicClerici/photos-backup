@@ -485,7 +485,7 @@ web_install() {
 	# the running process owns.
 	run sudo rsync -a --delete --exclude '.next/cache' "$WEB_STAGE/" "$WEB_DEST/"
 	run sudo chown -R photoweb:photoweb "$WEB_DEST"
-	run sudo install -d -o photoweb -g photoweb -m 0755 "$WEB_DEST/.next/cache"
+	run sudo install -d -o photoweb -g photoweb -m 0755 "$WEB_DEST/web/.next/cache"
 
 	step "restarting the gallery"
 	run sudo systemctl restart photoweb

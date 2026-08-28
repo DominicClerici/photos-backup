@@ -51,6 +51,16 @@ Environment=PORT=8790
 # and emits a server that needs no package manager and no dependency
 # resolution at startup. So this is plain node against one file, not a
 # framework CLI walking node_modules.
+
+# ReadWritePaths below is not optional to systemd: a path that does not exist
+# fails namespace setup, and the unit never reaches node at all — 226/NAMESPACE
+# in a five-second restart loop. photobackup-admin's web_install creates the
+# cache directory before it restarts this, so on a redeploy it is always there;
+# what is not covered is every other way this unit starts. A first install has
+# no cache directory yet, and a --no-web redeploy syncs this file while skipping
+# the step that would have created it. The `+` runs this as root and outside the
+# sandbox, which is what lets it precede the namespace it exists to satisfy.
+ExecStartPre=+/usr/bin/install -d -o photoweb -g photoweb -m 0755 /opt/photoweb/web/.next/cache
 ExecStart=/usr/bin/node /opt/photoweb/server.js
 Restart=on-failure
 RestartSec=5s
@@ -61,7 +71,7 @@ KillSignal=SIGTERM
 # drive, no TLS directory — every one of those belongs to photod.
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/photoweb/.next/cache
+ReadWritePaths=/opt/photoweb/web/.next/cache
 PrivateTmp=yes
 NoNewPrivileges=yes
 PrivateDevices=yes
