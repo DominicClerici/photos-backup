@@ -346,13 +346,43 @@ export type OpenedAsset = {
   release: () => Promise<void>;
 };
 
+/**
+ * How far an open that turned out to be a download has got.
+ *
+ * Only a shared asset produces any. Everything else opens a file that is already
+ * on the phone, and there is nothing to say between asking for it and having it.
+ */
+export type OpenProgress = {
+  /** Bytes handed over so far. Moves even for an asset already on the phone. */
+  bytes: number;
+  /** iCloud's own 0..1 for the download, and 0 when there is nothing to download. */
+  fraction: number;
+};
+
+export type OpenOptions = {
+  hash: boolean;
+  /**
+   * Called while a shared asset is coming down from iCloud, as often as the
+   * native module reports itself.
+   *
+   * Optional because most callers have nothing to do with it, and because a
+   * source that cannot report progress is not a source that cannot open
+   * anything: a dev client too old to carry the event still fetches, it simply
+   * says nothing until the asset is here.
+   */
+  onProgress?: (progress: OpenProgress) => void;
+};
+
 export interface MediaSource {
   enumerate(maxItems: number): Promise<EnumeratedAsset[]>;
   /**
    * Resolves and stats an original, hashing it only when asked. The hash blocks
    * the JS thread for its duration, so the caller decides when to pay for it.
+   *
+   * For a shared asset this is a download rather than an open, which is why it
+   * can report progress at all. See OpenProgress.
    */
-  open(item: QueueItem, opts: { hash: boolean }): Promise<OpenedAsset>;
+  open(item: QueueItem, opts: OpenOptions): Promise<OpenedAsset>;
   /**
    * Reads the library's own record of an asset — see AssetFacts. Returns null
    * for anything that has none of its own, which is every Live Photo's paired

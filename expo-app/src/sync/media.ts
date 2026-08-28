@@ -13,6 +13,7 @@ import {
   photoKitEnumerate,
   photoKitFacts,
   photoKitMd5,
+  photoKitOnSharedFetchProgress,
   photoKitSharedAlbums,
   type PhotoKitAsset,
   type PhotoKitFacts,
@@ -33,6 +34,8 @@ import {
   type EnumeratedAsset,
   type MediaSource,
   type OpenedAsset,
+  type OpenOptions,
+  type OpenProgress,
   type QueueItem,
   type SharedOrigin,
 } from './types';
@@ -210,8 +213,8 @@ export class PhotoKitMediaSource implements MediaSource {
     return assets;
   }
 
-  async open(item: QueueItem, opts: { hash: boolean }): Promise<OpenedAsset> {
-    if (item.source === 'shared') return this.openShared(item);
+  async open(item: QueueItem, opts: OpenOptions): Promise<OpenedAsset> {
+    if (item.source === 'shared') return this.openShared(item, opts.onProgress);
     return item.kind === 'live_video' ? this.openPairedVideo(item, opts) : this.openOriginal(item, opts);
   }
 
@@ -282,7 +285,10 @@ export class PhotoKitMediaSource implements MediaSource {
    * Every download goes through the gate, which serializes them and paces them
    * against how much trouble iCloud has been giving. See sharedalbums/gate.ts.
    */
-  private async openShared(item: QueueItem): Promise<OpenedAsset> {
+  private async openShared(
+    item: QueueItem,
+    onProgress?: (progress: OpenProgress) => void
+  ): Promise<OpenedAsset> {
     const paired = item.kind === 'live_video';
     const assetId = paired ? item.parentLocalId : item.localId;
     if (!assetId) {
@@ -301,11 +307,21 @@ export class PhotoKitMediaSource implements MediaSource {
     // downloads would sit at zero however hard iCloud was pushing back. The gate
     // learns what happened the only way it can: by the closure throwing.
     const download = await this.gate.run(async () => {
-      const result = await photoKitDownloadSharedResource(
-        assetId,
-        destination.uri,
-        paired ? 'pairedVideo' : 'primary'
-      );
+      // Armed inside the gate rather than around it, so the listener lives
+      // exactly as long as the download it is reporting. Every upload worker
+      // queues here, and a subscription taken out before the wait would spend
+      // that wait reporting somebody else's bytes.
+      const stopWatching = this.watch(assetId, onProgress);
+      let result;
+      try {
+        result = await photoKitDownloadSharedResource(
+          assetId,
+          destination.uri,
+          paired ? 'pairedVideo' : 'primary'
+        );
+      } finally {
+        stopWatching();
+      }
 
       // Null is this build, not this asset — the same meaning it carries
       // everywhere in the native module's façade. Charged to the item anyway,
@@ -344,6 +360,23 @@ export class PhotoKitMediaSource implements MediaSource {
         deleteQuietly(destination);
       },
     };
+  }
+
+  /**
+   * Reports the download in flight, and hands back the way to stop.
+   *
+   * Filtered on the asset PhotoKit was asked for rather than on the queue item,
+   * because for a Live Photo they are not the same string: the motion half is
+   * queued under a suffixed id of our own and fetched under its parent's, and
+   * the parent's is what the native module echoes back.
+   */
+  private watch(assetId: string, onProgress?: (progress: OpenProgress) => void): () => void {
+    if (!onProgress) return () => {};
+
+    return photoKitOnSharedFetchProgress((progress) => {
+      if (progress.localId !== assetId) return;
+      onProgress({ bytes: progress.bytes, fraction: progress.fraction });
+    });
   }
 
   private async openOriginal(item: QueueItem, opts: { hash: boolean }): Promise<OpenedAsset> {

@@ -59,14 +59,22 @@ jest.mock('../../../modules/photo-facts', () => ({
   photoKitSharedAlbums: jest.fn(),
 }));
 
-import { photoKitDownloadSharedResource } from '../../../modules/photo-facts';
+import {
+  photoKitDownloadSharedResource,
+  photoKitOnSharedFetchProgress,
+  type SharedFetchProgress,
+} from '../../../modules/photo-facts';
 import { SharedFetchGate } from '../../sharedalbums/gate';
 import { CALM_GAP_MS } from '../../sharedalbums/run';
 import { PhotoKitMediaSource } from '../media';
+import type { OpenProgress } from '../types';
 import { queued, TestClock } from './fakes';
 
 const download = photoKitDownloadSharedResource as jest.MockedFunction<
   typeof photoKitDownloadSharedResource
+>;
+const watch = photoKitOnSharedFetchProgress as jest.MockedFunction<
+  typeof photoKitOnSharedFetchProgress
 >;
 
 beforeEach(() => {
@@ -164,4 +172,108 @@ test('a build that cannot download at all fails the item', async () => {
   await expect(source(gate).open(sharedItem(), { hash: true })).rejects.toThrow(
     /this build cannot download shared assets/
   );
+});
+
+/**
+ * The progress the backup shows while a shared asset comes down.
+ *
+ * Worth its own tests for one reason that is easy to get wrong and invisible
+ * when it is: a Live Photo's video half is queued under an identifier of our own
+ * and fetched under its parent's, so the listener has to filter on the second or
+ * the motion half of every shared Live Photo downloads in silence.
+ */
+function watching(): { emit: (progress: SharedFetchProgress) => void; removed: () => number } {
+  let removals = 0;
+  const listeners: ((progress: SharedFetchProgress) => void)[] = [];
+
+  watch.mockImplementation((listener) => {
+    listeners.push(listener);
+    return () => {
+      removals += 1;
+    };
+  });
+
+  return {
+    emit: (progress) => listeners.forEach((listener) => listener(progress)),
+    removed: () => removals,
+  };
+}
+
+test('what iCloud reports about the asset in flight reaches the caller', async () => {
+  const events = watching();
+  const seen: OpenProgress[] = [];
+  download.mockImplementation(async () => {
+    events.emit({ localId: 'ph://shared-1', bytes: 2_048, fraction: 0.5 });
+    return handedOver();
+  });
+
+  await source(new SharedFetchGate(new TestClock())).open(sharedItem(), {
+    hash: true,
+    onProgress: (progress) => seen.push(progress),
+  });
+
+  expect(seen).toEqual([{ bytes: 2_048, fraction: 0.5 }]);
+});
+
+// Events from the fetch before this one can still be in flight. Reporting them
+// against this asset would run the label backwards.
+test('what iCloud reports about some other asset is ignored', async () => {
+  const events = watching();
+  const seen: OpenProgress[] = [];
+  download.mockImplementation(async () => {
+    events.emit({ localId: 'ph://somebody-else', bytes: 999, fraction: 0.9 });
+    return handedOver();
+  });
+
+  await source(new SharedFetchGate(new TestClock())).open(sharedItem(), {
+    hash: true,
+    onProgress: (progress) => seen.push(progress),
+  });
+
+  expect(seen).toEqual([]);
+});
+
+test("a shared Live Photo's video half is reported under its parent's id", async () => {
+  const events = watching();
+  const seen: OpenProgress[] = [];
+  download.mockImplementation(async () => {
+    events.emit({ localId: 'ph://parent', bytes: 4_096, fraction: 0.2 });
+    return handedOver();
+  });
+
+  const video = queued('ph://parent#live', {
+    source: 'shared',
+    kind: 'live_video',
+    parentLocalId: 'ph://parent',
+  });
+  await source(new SharedFetchGate(new TestClock())).open(video, {
+    hash: true,
+    onProgress: (progress) => seen.push(progress),
+  });
+
+  expect(seen).toEqual([{ bytes: 4_096, fraction: 0.2 }]);
+});
+
+// A listener per download that outlived it would have every later fetch
+// reporting itself to every earlier one's caller.
+test('the listener is taken down with the download, failed or not', async () => {
+  const events = watching();
+  const media = source(new SharedFetchGate(new TestClock()));
+  const noop = () => {};
+
+  download.mockResolvedValueOnce(handedOver());
+  await media.open(sharedItem(), { hash: true, onProgress: noop });
+  download.mockResolvedValueOnce(refusal());
+  await expect(media.open(sharedItem(), { hash: true, onProgress: noop })).rejects.toThrow();
+
+  expect(events.removed()).toBe(2);
+});
+
+test('a caller that wants no progress subscribes to none', async () => {
+  watching();
+  download.mockResolvedValue(handedOver());
+
+  await source(new SharedFetchGate(new TestClock())).open(sharedItem(), { hash: true });
+
+  expect(watch).not.toHaveBeenCalled();
 });

@@ -7,6 +7,8 @@ import type {
   EnumeratedAsset,
   MediaSource,
   OpenedAsset,
+  OpenOptions,
+  OpenProgress,
   QueueItem,
   Transport,
   UploadProgress,
@@ -126,7 +128,13 @@ export function twoRound(second: 'have' | 'want'): CheckResponder {
     });
 }
 
-export type FakeFile = { size: number; md5: string; filename?: string };
+export type FakeFile = {
+  size: number;
+  md5: string;
+  filename?: string;
+  /** What the download reports on its way in, for a file standing in for a shared asset. */
+  arriving?: OpenProgress[];
+};
 
 export class FakeMedia implements MediaSource {
   readonly opens: { localId: string; hash: boolean }[] = [];
@@ -134,6 +142,12 @@ export class FakeMedia implements MediaSource {
   sweepCount = 0;
   /** What facts() answers, per local id. Anything absent has none. */
   readonly facts_: Map<string, AssetFacts> = new Map();
+  /**
+   * The engine's clock, where a test wants a download to take time. Set rather
+   * than constructed with, because only the handful of tests that watch the
+   * label as an asset arrives care that it moves at all.
+   */
+  clock?: TestClock;
 
   constructor(
     private readonly assets: EnumeratedAsset[] = [],
@@ -145,12 +159,20 @@ export class FakeMedia implements MediaSource {
     return this.assets;
   }
 
-  async open(item: QueueItem, opts: { hash: boolean }): Promise<OpenedAsset> {
+  async open(item: QueueItem, opts: OpenOptions): Promise<OpenedAsset> {
     this.opens.push({ localId: item.localId, hash: opts.hash });
     if (this.openFailures.has(item.localId)) {
       throw new SyncError(`cannot open ${item.localId}`, 'item');
     }
-    const file = this.files.get(item.localId) ?? { size: 100, md5: `md5-${item.localId}` };
+    const file: FakeFile = this.files.get(item.localId) ?? { size: 100, md5: `md5-${item.localId}` };
+
+    // Time has to pass between these or the engine's own throttle swallows all
+    // but the first, which is what it is for and not what is under test here.
+    for (const progress of file.arriving ?? []) {
+      this.clock?.advance(1_000);
+      opts.onProgress?.(progress);
+    }
+
     return {
       uri: `file:///fake/${item.localId}`,
       size: file.size,

@@ -34,17 +34,20 @@ function build(options: {
 }) {
   const store = new MemoryQueueStore(options.seed ?? []);
   const media = options.media ?? new FakeMedia();
+  const clock = new TestClock();
+  const activity: string[] = [];
+  media.clock = clock;
   const engine = new SyncEngine(
     {
       store,
       media,
       transport: options.transport,
-      clock: new TestClock(),
-      onProgress: (_: Progress) => {},
+      clock,
+      onProgress: (progress: Progress) => activity.push(progress.activity),
     },
     { ...DEFAULT_ENGINE_CONFIG, deviceId: DEVICE, ...options.config }
   );
-  return { engine, store, media, transport: options.transport };
+  return { engine, store, media, transport: options.transport, clock, activity };
 }
 
 function queuedShared(localId: string): QueueItem {
@@ -282,4 +285,58 @@ test('forgetting shared items leaves the library alone', async () => {
 
   expect(await h.store.forgetShared()).toBe(1);
   expect(h.store.snapshot().map((item) => item.localId)).toEqual(['ph://library-1']);
+});
+
+// A shared asset's open is a download, and one that can take minutes. The label
+// used to be written once and then stand still for the whole of it, which is
+// what a stalled fetch looks like too — the two were indistinguishable from the
+// screen, and the fetch that prompted all this looked stopped for ten minutes
+// while nobody could tell whether it was.
+test('the label moves while a shared asset is coming down', async () => {
+  const h = build({
+    transport: new FakeTransport(alwaysRespond('unknown')),
+    media: shared('ph://shared-1', {
+      size: 10,
+      md5: 'm',
+      arriving: [
+        { bytes: 1_000_000, fraction: 0.25 },
+        { bytes: 3_000_000, fraction: 0.75 },
+      ],
+    }),
+  });
+
+  await h.engine.run();
+
+  expect(h.activity).toContain('Fetching ph://shared-1.HEIC — 25%');
+  expect(h.activity).toContain('Fetching ph://shared-1.HEIC — 75%');
+});
+
+// iCloud's fraction describes a download, so it never moves for an asset the
+// phone has already cached — and a label pinned to it would read 0% for the
+// whole of a fetch that was going perfectly well. The bytes handed over are the
+// measurement that always moves.
+test('an asset already on the phone is measured in the bytes it hands over', async () => {
+  const h = build({
+    transport: new FakeTransport(alwaysRespond('unknown')),
+    media: shared('ph://shared-1', {
+      size: 10,
+      md5: 'm',
+      arriving: [{ bytes: 2_400_000, fraction: 0 }],
+    }),
+  });
+
+  await h.engine.run();
+
+  expect(h.activity).toContain('Fetching ph://shared-1.HEIC — 2.4 MB');
+});
+
+// The library path opens a file that is already here, and has nothing to say
+// between asking for it and having it.
+test('a library original is not given a progress reporter', async () => {
+  const media = new FakeMedia([asset('ph://library-1')]);
+  const h = build({ transport: new FakeTransport(alwaysRespond('want')), media });
+
+  await h.engine.run();
+
+  expect(h.activity.some((line) => line.includes('—'))).toBe(false);
 });

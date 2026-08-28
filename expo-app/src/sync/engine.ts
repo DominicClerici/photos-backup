@@ -5,6 +5,7 @@ import {
   TRANSPORT_BACKOFF,
   type BackoffPolicy,
 } from './backoff';
+import { formatBytes } from '../stats/format';
 import { CHUNK_THRESHOLD } from './chunkPlan';
 import {
   asSyncError,
@@ -18,6 +19,7 @@ import {
   type Clock,
   type MediaSource,
   type OpenedAsset,
+  type OpenProgress,
   type Phase,
   type Progress,
   type QueueItem,
@@ -445,9 +447,20 @@ export class SyncEngine {
 
     this.report('uploading', shared ? `Fetching ${item.filename}` : `Uploading ${item.filename}`, true);
 
+    // A shared asset's open is a download, and one that can legitimately take
+    // minutes. Without this the label is written once and then sits there for
+    // the whole of it, which makes a 2GB video arriving slowly and a request
+    // iCloud has stopped answering look exactly alike — and the second is a
+    // thing that happens. The library path has nothing to report: its open
+    // resolves against a file that is already here.
+    const arriving = shared
+      ? (progress: OpenProgress) =>
+          this.report('uploading', `Fetching ${item.filename} — ${arrival(progress)}`)
+      : undefined;
+
     let opened: OpenedAsset;
     try {
-      opened = await this.deps.media.open(item, { hash: shared });
+      opened = await this.deps.media.open(item, { hash: shared, onProgress: arriving });
     } catch (e) {
       await this.blameItem(item, asSyncError(e, 'item'));
       return;
@@ -673,6 +686,20 @@ export class SyncEngine {
   private log(line: string): void {
     this.deps.onLog?.(line);
   }
+}
+
+/**
+ * How far a shared asset has got, in whichever of its two measurements is
+ * actually moving.
+ *
+ * iCloud's fraction is the better of the two and is not always there: it
+ * describes the download and stays at zero for an asset the phone has already
+ * cached, where the bytes handed over are the only thing that moves. Preferring
+ * it where it is real and falling back to the byte count everywhere else is what
+ * keeps the label from being the half that is standing still.
+ */
+function arrival(progress: OpenProgress): string {
+  return progress.fraction > 0 ? percent(progress.fraction, 1) : formatBytes(progress.bytes);
 }
 
 /** A whole-number percentage, for a progress label. */
