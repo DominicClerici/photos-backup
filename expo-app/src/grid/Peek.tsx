@@ -12,7 +12,7 @@ import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import { Image } from 'expo-image';
 import { useVideoPlayer, VideoView } from 'expo-video';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Modal, Pressable, StyleSheet, useWindowDimensions, View } from 'react-native';
 import Animated, {
   Easing,
@@ -26,9 +26,19 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { MediaCache } from '../gallery/cache';
 import { color, radius, space } from '../theme';
 import { Text, type Action } from '../ui';
+import { RELEASE_MS } from './Tile';
 
-const OPEN_MS = 220;
-const CLOSE_MS = 160;
+/**
+ * The lift, and the way back.
+ *
+ * The open is a fifth of a second because the photograph is already most of the
+ * way there — the hold has drawn the tile back to `PRESS_SCALE` and the card
+ * starts from exactly that square, so this animates the rest of one continuous
+ * movement rather than beginning a new one. Going back is quicker still: the
+ * decision has been made and the grid is what somebody wants to see.
+ */
+const OPEN_MS = 200;
+const CLOSE_MS = RELEASE_MS;
 /** The margin the enlarged photograph keeps from the sides of the screen. */
 const MARGIN = space.xxl;
 /** The largest stored rendition, and the only place its extra pixels show. */
@@ -61,8 +71,9 @@ export interface PeekTarget {
  * The hold means the same thing whether or not the grid is picking: it peeks.
  * What changes is the first row under the photograph, which says Select while
  * the grid is browsing and Deselect once this photograph is in the selection.
- * Picking a run of them is a horizontal drag across the grid — see the pan in
- * `Grid` — and this row is the way in for anyone who has not found that yet.
+ * That row is one of the two ways into selection mode, the other being the
+ * pill; the drag that picks a run of them is inside that mode and never a way
+ * into it. See the pan in `Grid`.
  *
  * The still stays mounted underneath the video for the browser's reason — the
  * dissolve is then between two pictures of the same moment, and never lets the
@@ -117,12 +128,22 @@ export function Peek({
     // a row somebody has armed.
   }, [target, open, playing]);
 
-  const dismiss = useCallback(() => {
+  /**
+   * Putting it back.
+   *
+   * Driven by the target going away rather than by whatever asked it to, which
+   * is the only arrangement that works: a row that files a photograph and then
+   * closes this is not calling the button underneath the photograph, it is
+   * calling the grid — and while this watched only that button, every one of
+   * those rows left the lifted photograph sitting on screen over the thing it
+   * had just done.
+   */
+  useEffect(() => {
+    if (target || !held) return;
     open.value = withTiming(0, { duration: CLOSE_MS, easing: Easing.in(Easing.cubic) }, (done) => {
       if (done) runOnJS(setHeld)(null);
     });
-    onClose();
-  }, [onClose, open]);
+  }, [target, held, open]);
 
   const item = held?.item ?? null;
 
@@ -194,7 +215,7 @@ export function Peek({
       statusBarTranslucent
       visible
       animationType="none"
-      onRequestClose={dismiss}
+      onRequestClose={onClose}
     >
       <Animated.View style={[StyleSheet.absoluteFill, scrimStyle]} pointerEvents="none">
         <BlurView intensity={38} tint="dark" style={StyleSheet.absoluteFill} />
@@ -203,7 +224,7 @@ export function Peek({
 
       <Pressable
         style={StyleSheet.absoluteFill}
-        onPress={dismiss}
+        onPress={onClose}
         accessibilityRole="button"
         accessibilityLabel="Close"
       />

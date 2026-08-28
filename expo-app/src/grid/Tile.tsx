@@ -8,13 +8,138 @@ import {
 } from '@photobackup/core';
 import { Feather } from '@expo/vector-icons';
 import { Image } from 'expo-image';
-import { memo, useCallback, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { StyleSheet, Text as RNText, View } from 'react-native';
-import Animated, { useAnimatedStyle, type SharedValue } from 'react-native-reanimated';
+import Animated, {
+  Easing,
+  useAnimatedStyle,
+  useSharedValue,
+  withDelay,
+  withTiming,
+  type SharedValue,
+} from 'react-native-reanimated';
 
 import type { MediaCache } from '../gallery/cache';
 import { color, radius, space, text } from '../theme';
 import { rectAt, type Places } from './geometry';
+
+/** How long a photograph takes to arrive, once there is one to draw. */
+const ARRIVE_MS = 120;
+
+/**
+ * How far the picked tile's edges are clipped away, and over how long.
+ *
+ * A clip rather than an inset: the photograph must not move or resize when it
+ * is chosen — a picture that jumps a pixel and re-rasterises on every tap is
+ * the whole of what made this feel like a stutter — so what closes over it is a
+ * border in the board's own colour. Nothing inside is laid out again.
+ */
+const PICKED = 3;
+const PICK_MS = 50;
+
+/**
+ * The hold, before it becomes a lift.
+ *
+ * Nothing happens for `PRESS_LEAD_MS`, which is what keeps a tap and a scroll
+ * from twitching the grid. After that the tile draws back, reaching
+ * `PRESS_SCALE` exactly as the hold completes — so the shrink is the countdown,
+ * and the lift begins from where the finger has already taken it.
+ */
+export const PRESS_LEAD_MS = 150;
+export const PRESS_SCALE = 0.9;
+/**
+ * How long a tile has to be held before it lifts.
+ *
+ * Here rather than beside the gesture that enforces it, because the shrink
+ * above is the visible half of the same number: the tile has to arrive at
+ * `PRESS_SCALE` exactly as the hold completes, and two files disagreeing about
+ * when that is would be a tile that finished shrinking and then waited.
+ */
+export const HOLD_MS = 380;
+/** Letting go, whether the hold completed or not. Also the peek's way back. */
+export const RELEASE_MS = 150;
+
+/**
+ * Everything about a square that moves: where the zoom puts it, how far the
+ * hold has drawn it back, and how far the clip has closed over it.
+ *
+ * Three styles rather than one, and the split is the point. The transform runs
+ * every frame of a zoom; the box is written only when the zoom crosses a level;
+ * the clip only when somebody picks something. Reanimated flushes whichever of
+ * them ran in a single batch of property updates, so the box and the scale that
+ * divides by it can never be a frame apart — which is what a pinch used to
+ * flash at every level it crossed.
+ *
+ * Both animations are guarded on the value having actually changed. A scroll
+ * mounts a couple of hundred of these a second, and a square that started two
+ * animations on the way in to say that nothing had happened would be paying
+ * that cost across the whole grid.
+ */
+function useMotion({
+  box,
+  places,
+  z,
+  pressed,
+  selected,
+}: {
+  box: SharedValue<number>;
+  places: Places;
+  z: SharedValue<number>;
+  pressed: boolean;
+  selected: boolean;
+}) {
+  const press = useSharedValue(pressed ? 1 : 0);
+  const holding = useRef(pressed);
+  useEffect(() => {
+    if (holding.current === pressed) return;
+    holding.current = pressed;
+    press.value = pressed
+      ? withDelay(
+          PRESS_LEAD_MS,
+          // The rest of the hold, so the tile arrives at PRESS_SCALE on the
+          // same frame the peek decides to lift it.
+          withTiming(1, { duration: HOLD_MS - PRESS_LEAD_MS, easing: Easing.out(Easing.quad) }),
+        )
+      : withTiming(0, { duration: RELEASE_MS, easing: Easing.out(Easing.quad) });
+  }, [pressed, press]);
+
+  const pick = useSharedValue(selected ? 1 : 0);
+  const picked = useRef(selected);
+  useEffect(() => {
+    if (picked.current === selected) return;
+    picked.current = selected;
+    pick.value = withTiming(selected ? 1 : 0, { duration: PICK_MS, easing: Easing.linear });
+  }, [selected, pick]);
+
+  const boxStyle = useAnimatedStyle(() => ({ width: box.value, height: box.value }));
+
+  const style = useAnimatedStyle(() => {
+    const b = box.value;
+    const r = rectAt(places, z.value);
+    // The cell's own transform grows from the top left, because that is the
+    // corner every rect the grid computes describes. The hold's does not: it is
+    // the square drawing back into itself, so it is walked to the middle of the
+    // box and out again. Exact at rest, where the two walks cancel and both
+    // scales are one.
+    const half = b / 2;
+    return {
+      transform: [
+        { translateX: r.x },
+        { translateY: r.y },
+        { scale: r.size / b },
+        { translateX: half },
+        { translateY: half },
+        { scale: 1 - (1 - PRESS_SCALE) * press.value },
+        { translateX: -half },
+        { translateY: -half },
+      ],
+    };
+  });
+
+  const clipStyle = useAnimatedStyle(() => ({ borderWidth: PICKED * pick.value }));
+
+  return { boxStyle, style, clipStyle };
+}
 
 /**
  * One square of the grid.
@@ -23,8 +148,14 @@ import { rectAt, type Places } from './geometry';
  * and scaled down to whatever the zoom currently wants, for the reason the
  * browser's Tile gives: resizing the box every frame means re-rasterising every
  * thumbnail on screen every frame, while scaling one that is already big enough
- * costs a composite. The scale runs on the UI thread from the shared zoom, so
- * React sees none of it.
+ * costs a composite.
+ *
+ * `box` is a shared value rather than a prop, and that is not a detail. React
+ * commits a width on one schedule and Reanimated writes a transform on another,
+ * so a box that changed with a render was a frame of every tile on screen drawn
+ * at the new size with the old scale — the flash a pinch used to show at every
+ * level it crossed. Read from the UI thread, the two land in the same batch of
+ * property updates and there is nothing to see. See `Grid`'s `boxSize`.
  *
  * Memoized, and it matters more here than it would in a browser: a scroll
  * re-renders the grid whenever the mounted range moves, and the several hundred
@@ -37,11 +168,12 @@ export const Tile = memo(function Tile({
   places,
   z,
   cache,
-  selecting = false,
   selected = false,
+  pressed = false,
 }: {
   item: TimelineItem;
-  box: number;
+  /** The size the tile is laid out at, in points. Written by the zoom. */
+  box: SharedValue<number>;
   thumb: ThumbSize;
   /** Where this tile sits at each zoom level. See grid/geometry. */
   places: Places;
@@ -52,9 +184,10 @@ export const Tile = memo(function Tile({
    * decrypted it — see `src/gallery/cache.ts`.
    */
   cache: MediaCache;
-  /** Whether the grid is picking rather than browsing. */
-  selecting?: boolean;
+  /** Whether this photograph is in the selection. */
   selected?: boolean;
+  /** Whether a finger is being held on it. See the hold in `Grid`. */
+  pressed?: boolean;
 }) {
   const [missing, setMissing] = useState<ThumbSize[]>([]);
 
@@ -86,55 +219,86 @@ export const Tile = memo(function Tile({
     [item.id, size],
   );
 
+  /**
+   * The rendition currently on screen, which is not always the wanted one.
+   *
+   * A zoom changes which file a tile should be drawing, and the swap used to be
+   * a dissolve: two half-transparent copies of the same photograph, with the
+   * dark tile showing through both of them for sixty milliseconds. Across a
+   * screenful at once that is the flicker a pinch was full of.
+   *
+   * So the old rendition keeps drawing, underneath, until the new one has
+   * actually landed — at which point it is simply covered. Same photograph,
+   * sharper file, nothing to see.
+   */
+  const [painted, setPainted] = useState(size);
+  const stale =
+    painted !== undefined && size !== undefined && painted !== size
+      ? media(item.id, thumbVariant(painted))
+      : null;
+
   const onError = useCallback(() => {
     if (size === undefined) return;
     setMissing((held) => (held.includes(size) ? held : [...held, size]));
   }, [size]);
 
-  const style = useAnimatedStyle(() => {
-    const r = rectAt(places, z.value);
-    return {
-      transform: [{ translateX: r.x }, { translateY: r.y }, { scale: r.size / box }],
-    };
-  });
+  const { boxStyle, style, clipStyle } = useMotion({ box, places, z, pressed, selected });
 
   return (
-    <Animated.View style={[styles.tile, { width: box, height: box }, style]}>
-      {/* The picture is drawn back from its cell when it is picked, which is
-          what `chrome` was left as a separate node for: the zoom writes a
-          transform to the box above and this inset must not fight it. The gap
-          it opens is the tile colour, so a wall of selected photographs reads
-          as a grid of separate things rather than one dimmed sheet. */}
-      <View style={[styles.chrome, selected && styles.picked]}>
+    <Animated.View style={[styles.tile, boxStyle, style]}>
+      <View style={styles.chrome}>
         {attempt && source ? (
-          <Image
-            style={styles.picture}
-            source={source}
-            contentFit="cover"
-            // The bytes are the same whatever the tile is drawn at, so the disk
-            // cache is what makes scrolling back through a year of photographs
-            // free. WEB_TO_MOBILE § 3.6 is about the day table and the pages
-            // for exactly this reason: the thumbnails already have a cache.
-            //
-            // Except inside the vault, which is the one grid that keeps nothing.
-            cachePolicy={cache}
-            // Short enough to read as the picture arriving rather than as an
-            // animation, and it covers the swap when a zoom changes the size.
-            transition={120}
-            // Keyed by the asset rather than the URL, so following a zoom to a
-            // larger rendition replaces the picture in place instead of tearing
-            // it down and leaving a hole where a photograph was.
-            recyclingKey={item.id}
-            onError={onError}
-            accessibilityIgnoresInvertColors
-          />
+          <>
+            {stale ? (
+              <Image
+                style={styles.picture}
+                source={stale}
+                contentFit="cover"
+                cachePolicy={cache}
+                transition={0}
+                accessibilityIgnoresInvertColors
+              />
+            ) : null}
+            <Image
+              // Keyed by the size, so a rendition that changes is a fresh view
+              // laid over the one still drawing rather than a dissolve through
+              // it. `stale` above is what it is laid over.
+              key={size}
+              style={styles.picture}
+              source={source}
+              contentFit="cover"
+              // The bytes are the same whatever the tile is drawn at, so the
+              // disk cache is what makes scrolling back through a year of
+              // photographs free. WEB_TO_MOBILE § 3.6 is about the day table
+              // and the pages for exactly this reason: the thumbnails already
+              // have a cache.
+              //
+              // Except inside the vault, which is the one grid that keeps
+              // nothing.
+              cachePolicy={cache}
+              // Short enough to read as the picture arriving rather than as an
+              // animation — and only ever for the first one. A swap has the
+              // photograph already underneath it and fades through nothing.
+              transition={stale ? 0 : ARRIVE_MS}
+              recyclingKey={item.id}
+              onLoad={() => setPainted(size)}
+              onError={onError}
+              accessibilityIgnoresInvertColors
+            />
+          </>
         ) : (
           <View style={styles.blank}>
             {size === undefined ? (
-              <Feather name="alert-triangle" size={Math.min(22, box * 0.28)} color={color.faint} />
+              <Feather name="alert-triangle" size={20} color={color.faint} />
             ) : null}
           </View>
         )}
+
+        {/* What closes over a picked photograph, in the board's own colour, so
+            a wall of chosen pictures reads as a grid of separate things rather
+            than one dimmed sheet. A border rather than an inset because the
+            photograph underneath must not move by so much as a pixel. */}
+        <Animated.View style={[StyleSheet.absoluteFill, styles.clip, clipStyle]} pointerEvents="none" />
 
         {item.live && item.live !== 'failed' ? <LiveGlyph /> : null}
 
@@ -146,16 +310,10 @@ export const Tile = memo(function Tile({
         ) : null}
 
         {/* Top right, because the bottom right is a video's length and the top
-            left is the Live mark. An unpicked tile in selection mode gets the
-            empty ring rather than nothing at all: without it there is no way to
-            tell a grid that is picking from one that is browsing except by
-            finding a selected tile, and at the start of a selection there is
-            not one. */}
-        {selecting ? (
-          <View style={[styles.tick, selected && styles.tickOn]}>
-            {selected ? <Feather name="check" size={12} color={color.primaryForeground} /> : null}
-          </View>
-        ) : null}
+            left is the Live mark. Only ever on a chosen photograph: the tick is
+            the mark of being picked, and a grid of empty rings over everything
+            is a grid nobody can see the photographs in. */}
+        {selected ? <Tick /> : null}
       </View>
     </Animated.View>
   );
@@ -180,10 +338,10 @@ export const Skeleton = memo(function Skeleton({
   box,
   places,
   z,
-  selecting = false,
   selected = false,
+  pressed = false,
 }: {
-  box: number;
+  box: SharedValue<number>;
   places: Places;
   z: SharedValue<number>;
   /**
@@ -191,28 +349,28 @@ export const Skeleton = memo(function Skeleton({
    * crosses it selects it — the selection is runs of indices precisely so that
    * it can cover ground nobody has downloaded. So it draws the tick too.
    */
-  selecting?: boolean;
   selected?: boolean;
+  pressed?: boolean;
 }) {
-  const style = useAnimatedStyle(() => {
-    const r = rectAt(places, z.value);
-    return {
-      transform: [{ translateX: r.x }, { translateY: r.y }, { scale: r.size / box }],
-    };
-  });
+  const { boxStyle, style, clipStyle } = useMotion({ box, places, z, pressed, selected });
 
   return (
-    <Animated.View style={[styles.tile, { width: box, height: box }, style]}>
-      <View style={[styles.chrome, selected && styles.picked]}>
-        {selecting ? (
-          <View style={[styles.tick, selected && styles.tickOn]}>
-            {selected ? <Feather name="check" size={12} color={color.primaryForeground} /> : null}
-          </View>
-        ) : null}
+    <Animated.View style={[styles.tile, boxStyle, style]}>
+      <View style={styles.chrome}>
+        <Animated.View style={[StyleSheet.absoluteFill, styles.clip, clipStyle]} pointerEvents="none" />
+        {selected ? <Tick /> : null}
       </View>
     </Animated.View>
   );
 });
+
+function Tick() {
+  return (
+    <View style={styles.tick}>
+      <Feather name="check" size={12} color={color.primaryForeground} />
+    </View>
+  );
+}
 
 /** Apple's concentric rings, the mark everyone already reads as "Live". */
 function LiveGlyph() {
@@ -237,12 +395,14 @@ const styles = StyleSheet.create({
     // scale that shrinks a box down to it has to grow from the same corner.
     transformOrigin: 'top left',
   },
-  // The picture sits inside the square rather than being it, so that Phase 5's
-  // selection can draw the tile back from its cell without fighting the
-  // transform the zoom loop writes to the node above.
+  // The picture sits inside the square rather than being it, so that the clip
+  // that marks a selection can close over it without fighting the transform the
+  // zoom loop writes to the node above.
   chrome: { flex: 1, overflow: 'hidden', backgroundColor: color.tile },
-  picked: { padding: 3 },
-  picture: { flex: 1 },
+  clip: { borderColor: color.background },
+  // Absolute rather than flexed, because there are two of them during a swap
+  // and a column of two flexed children is two half-height photographs.
+  picture: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
   // A derivative that has not been generated yet, and one that cannot be drawn
   // at all. Both are squares rather than spinners: a screenful at the smallest
   // zoom is a couple of thousand of them, and the difference that matters is
@@ -257,18 +417,19 @@ const styles = StyleSheet.create({
 
   tick: {
     position: 'absolute',
-    top: 4,
-    right: 4,
+    // Clear of the clip, so the mark keeps its margin from the edge somebody
+    // can actually see rather than from the one the border has covered.
+    top: PICKED + 4,
+    right: PICKED + 4,
     width: 18,
     height: 18,
     alignItems: 'center',
     justifyContent: 'center',
     borderRadius: radius.pill,
     borderWidth: 1.4,
-    borderColor: 'rgba(255,255,255,0.85)',
-    backgroundColor: 'rgba(8,8,10,0.28)',
+    borderColor: color.primary,
+    backgroundColor: color.primary,
   },
-  tickOn: { borderColor: color.primary, backgroundColor: color.primary },
 
   live: { position: 'absolute', top: 5, left: 5, width: 14, height: 14 },
   liveOuter: {

@@ -63,7 +63,7 @@ import {
 } from './geometry';
 import { Peek, type PeekTarget } from './Peek';
 import { Scrubber } from './Scrubber';
-import { Skeleton, Tile } from './Tile';
+import { HOLD_MS, PRESS_SCALE, Skeleton, Tile } from './Tile';
 import { rememberLevel, savedLevel } from './zoomStore';
 
 /** How often unfinished tiles ask whether their derivative landed. */
@@ -115,6 +115,15 @@ const EDGE_SPEED = 22;
 
 /** The margin the grid keeps at each side, and what the day headings hang on. */
 const GUTTER = space.md;
+
+/**
+ * The space between two tiles.
+ *
+ * A hairline rather than the browser's four points. A phone's grid is read at
+ * arm's length and a photograph is the only thing on it worth any pixels, so
+ * the gap is there to say that two pictures are two pictures and nothing more.
+ */
+const TILE_GAP = 1;
 
 /** Room above the first heading, under the status bar and the floating date. */
 const TOP_ROOM = space.xxl;
@@ -216,7 +225,10 @@ export function Grid({
   const levels = useMemo(
     () =>
       ZOOM_LEVELS.map((cap) =>
-        layoutLevel(days, metricsFor(inner, cap, flat ? { headerHeight: 0 } : {})),
+        layoutLevel(
+          days,
+          metricsFor(inner, cap, { gap: TILE_GAP, ...(flat ? { headerHeight: 0 } : {}) }),
+        ),
       ),
     [days, inner, flat],
   );
@@ -229,6 +241,21 @@ export function Grid({
   /** The continuous zoom. One value, read by React and by every worklet here. */
   const z = useSharedValue(savedLevel());
   const scrollY = useSharedValue(0);
+
+  /**
+   * The size every tile is laid out at, in points.
+   *
+   * The cell of the level a running transition is heading *towards*, so a tile
+   * is never laid out smaller than it is being drawn — which is the whole of
+   * why the box is not simply the cell size. It is a shared value rather than
+   * state for a reason worth stating: React commits a width on one schedule and
+   * Reanimated writes a transform on another, so while this was a prop, every
+   * level a pinch crossed gave a frame of the whole screen laid out at the new
+   * box and still scaled for the old one. That is the flash the zoom had. Kept
+   * on the UI thread, the width and the scale that divides by it are written in
+   * the same batch, and a pinch crosses seven levels without a seam.
+   */
+  const boxSize = useSharedValue(cells[clamp(Math.round(z.value), 0, MAX_ZOOM)] ?? 1);
 
   const env = useRef<Env>({
     levels,
@@ -260,17 +287,21 @@ export function Grid({
   });
 
   /**
-   * The size tiles are laid out at, and the rendition drawn into them.
+   * The settled zoom, and the rendition drawn into the tiles.
    *
-   * The box follows the *largest* level a running transition will reach, so
-   * zooming in upgrades the picture as soon as the tiles are laid out for it,
-   * and zooming out keeps the larger one until the grid has settled at the
-   * smaller cell. Between gestures it is simply the settled level.
+   * The rendition follows the *largest* level a running transition will reach,
+   * so zooming in asks for the sharper file as soon as the tiles are laid out
+   * for it, and zooming out keeps the larger one until the grid has settled at
+   * the smaller cell. Between gestures it is simply the settled level.
+   *
+   * Only the file changes here. Where the tiles are and how big they are drawn
+   * is `boxSize` above, on the UI thread, and it moves several times a second
+   * during a pinch — which is exactly why these two were separated: this one is
+   * a render, and a render per frame of a zoom is a zoom that stutters.
    */
   const [level, setLevel] = useState(() => Math.round(z.value));
-  const [boxLevel, setBoxLevel] = useState(level);
-  const box = cells[boxLevel] ?? cells[level] ?? 1;
-  const thumb = thumbSizeFor(boxLevel);
+  const [sharpest, setSharpest] = useState(level);
+  const thumb = thumbSizeFor(sharpest);
 
   const [window, setWindow] = useState<ItemRange>({ start: 0, end: 0 });
   const [wanted, setWanted] = useState<ItemRange>({ start: 0, end: 0 });
@@ -444,10 +475,11 @@ export function Grid({
   const onZoomed = useCallback(
     (v: number) => {
       zoom.current = v;
-      // Only ever upwards during a gesture: tiles are laid out at this box and
-      // scaled down from it, so a box that shrank mid-transition would be
-      // stretching a small picture across a large cell.
-      setBoxLevel((held) => Math.max(held, clamp(Math.ceil(v), 0, MAX_ZOOM)));
+      // Only ever upwards during a gesture: a tile drawing the file it is
+      // already holding while the grid moves is a tile that is slightly soft
+      // for a moment, and one that fetched a smaller file on the way past
+      // would be a screenful of downloads thrown away at the other end.
+      setSharpest((held) => Math.max(held, clamp(Math.ceil(v), 0, MAX_ZOOM)));
       settleRange(true);
       settlePill();
     },
@@ -458,7 +490,7 @@ export function Grid({
     (to: number) => {
       zoom.current = to;
       setLevel(to);
-      setBoxLevel(to);
+      setSharpest(to);
       setPinching(false);
       settleRange(false);
       settlePill();
@@ -573,6 +605,12 @@ export function Grid({
   useAnimatedReaction(
     () => z.value,
     (v) => {
+      // The box the tiles are laid out at, written before anything reads it and
+      // in the same flush as the transforms that divide by it. Ceiling, so a
+      // tile is never laid out smaller than the cell it is being drawn at, and
+      // exact at every level, so a settled grid draws at scale(1).
+      boxSize.value = valueAt(cells, clamp(Math.ceil(v), 0, MAX_ZOOM));
+
       const held = anchor.value;
       if (held) {
         const r = rectAt(held.places, v);
@@ -637,17 +675,41 @@ export function Grid({
     [itemAt, places, positionAt],
   );
 
+  /**
+   * Which tile a finger is currently on, or null.
+   *
+   * Set the moment a finger lands and dropped when it leaves, which is what
+   * draws the tile back under it — see the hold below. Held for as long as a
+   * peek is open, so the photograph lifts from where the shrink left it and
+   * comes back to the same place rather than to a tile that sprang out from
+   * under it while the blur was up.
+   */
+  const [pressing, setPressing] = useState<number | null>(null);
+  /** Whether the tile under the finger became a peek, so releasing keeps it. */
+  const lifted = useRef(false);
+
+  const closePeek = useCallback(() => {
+    setPeek(null);
+    setPressing(null);
+    lifted.current = false;
+  }, []);
+
   const openPeek = useCallback(
     (x: number, y: number) => {
       const found = photoAt(x, y);
       if (!found) return;
+      lifted.current = true;
+      // The square the hold has already shrunk, not the cell it sits in: the
+      // lift begins from exactly what is on screen, so there is no jump
+      // between the shrink ending and the photograph rising.
+      const inset = (found.rect.size * (1 - PRESS_SCALE)) / 2;
       setPeek({
         item: found.item,
         index: found.index,
         from: {
-          x: found.rect.x + GUTTER,
-          y: found.rect.y - top.current,
-          size: found.rect.size,
+          x: found.rect.x + GUTTER + inset,
+          y: found.rect.y - top.current + inset,
+          size: found.rect.size * PRESS_SCALE,
         },
       });
     },
@@ -697,14 +759,17 @@ export function Grid({
   // ── The drag that picks ────────────────────────────────────────────────────
   //
   // Sideways to start, then wherever you like: the grid only ever scrolls
-  // vertically, so a horizontal movement is a gesture nothing else wants and
-  // the one unambiguous way to begin picking without first going somewhere to
-  // turn picking on. Once it has begun, moving up or down runs the selection
-  // through the tiles on the way — and into the band at either edge, which
-  // pulls the timeline past the finger so a drag can cover more than a screen.
+  // vertically, so a horizontal movement is a gesture nothing else wants.
+  // Moving up or down from there runs the selection through the tiles on the
+  // way — and into the band at either edge, which pulls the timeline past the
+  // finger so a drag can cover more than a screen.
   //
-  // This is iOS Photos' gesture, and it is the reason the hold is left alone to
-  // go on meaning "show me this one".
+  // Only ever *inside* selection mode. This is iOS Photos' gesture and that is
+  // iOS Photos' rule: a sideways drag on a wall of photographs is somebody
+  // being imprecise about a scroll far more often than it is somebody asking to
+  // start choosing, and a grid that answered it by turning selection on was a
+  // grid that kept changing what a tap meant behind your back. The ways in are
+  // the pill and the hold's first row, both of which are somebody saying so.
 
   /** True from the moment the pan claims the gesture until it lets go. */
   const painting = useRef(false);
@@ -761,15 +826,11 @@ export function Grid({
       finger.current = { x, y };
       lastPainted.current = index;
       setDragging(true);
-      // A drag that begins outside selection mode turns it on, which is the
-      // whole point of the gesture: it is the way in, not merely a faster way
-      // of doing what the pill already offers.
-      if (!pickingNow.current) enter();
       beginDrag(index);
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       pulling.current ??= setInterval(pull, 16);
     },
-    [positionAt, enter, beginDrag, pull],
+    [positionAt, beginDrag, pull],
   );
 
   const movePaint = useCallback(
@@ -799,6 +860,10 @@ export function Grid({
   const paint = useMemo(
     () =>
       Gesture.Pan()
+        // Off entirely while the grid is browsing, so a sideways thumb on a
+        // photograph does nothing at all rather than something nobody asked
+        // for.
+        .enabled(picking)
         // Sideways to claim it, and a vertical start hands it straight back to
         // the scroll view. Fourteen points is far enough that a thumb drifting
         // on its way to a flick never trips it.
@@ -818,7 +883,7 @@ export function Grid({
         .onFinalize(() => {
           runOnJS(endPaint)();
         }),
-    [beginPaint, movePaint, endPaint],
+    [picking, beginPaint, movePaint, endPaint],
   );
 
   /**
@@ -841,7 +906,7 @@ export function Grid({
     const one = { kind: 'items', count: 1, noun } as const;
     const target = { ids: [item.id] };
     const picked = selected(index);
-    const shut = () => setPeek(null);
+    const shut = closePeek;
 
     const rows: Action[] = [
       {
@@ -946,19 +1011,57 @@ export function Grid({
     }
 
     return rows;
-  }, [peek, actions, selected, enter, toggle]);
+  }, [peek, actions, selected, enter, toggle, closePeek]);
+
+  /**
+   * A finger has landed. Whichever tile it is on begins to answer.
+   *
+   * The answer is deliberately late — see `PRESS_LEAD_MS` — so a tap and the
+   * start of a scroll both come and go without the grid twitching. What is
+   * begun here is only the knowledge of *which* tile; the shape of the shrink
+   * belongs to the tile itself, which is what keeps it off this thread.
+   */
+  const beginHold = useCallback(
+    (x: number, y: number) => {
+      const index = positionAt(x, y);
+      setPressing(index < 0 ? null : index);
+    },
+    [positionAt],
+  );
+
+  /**
+   * The finger has gone, or another gesture has taken it.
+   *
+   * Not while a peek is up: the photograph lifted out of that tile and has to
+   * be able to fall back into the same square, so the shrink is the peek's to
+   * release. Everywhere else the tile comes back on its own.
+   */
+  const endHold = useCallback(() => {
+    if (lifted.current) return;
+    setPressing(null);
+  }, []);
 
   const hold = useMemo(
     () =>
       Gesture.LongPress()
-        .minDuration(380)
+        .minDuration(HOLD_MS)
         // Enough that a finger settling on the way to a scroll never trips it,
         // little enough that it is a hold rather than a wait.
         .maxDistance(12)
+        .onBegin((e) => {
+          runOnJS(beginHold)(e.x, e.y);
+        })
         .onStart((e) => {
           runOnJS(openPeek)(e.x, e.y);
+        })
+        // Finalize rather than end, because the common case is this gesture
+        // losing: a scroll or a pinch claiming the finger cancels the hold, and
+        // a tile left drawn back under a finger that has moved on is a tile
+        // nobody can explain.
+        .onFinalize(() => {
+          runOnJS(endHold)();
         }),
-    [openPeek],
+    [beginHold, endHold, openPeek],
   );
 
   const tap = useMemo(
@@ -1104,22 +1207,22 @@ export function Grid({
                 <Tile
                   key={item.id}
                   item={item}
-                  box={box}
+                  box={boxSize}
                   thumb={thumb}
                   places={places(index)}
                   z={z}
                   cache={cache}
-                  selecting={picking}
                   selected={picking && selected(index)}
+                  pressed={pressing === index}
                 />
               ) : (
                 <Skeleton
                   key={`@${index}`}
-                  box={box}
+                  box={boxSize}
                   places={places(index)}
                   z={z}
-                  selecting={picking}
                   selected={picking && selected(index)}
+                  pressed={pressing === index}
                 />
               ),
             )}
@@ -1190,7 +1293,7 @@ export function Grid({
         </View>
       ) : null}
 
-      <Peek target={peek} actions={peekActions} cache={cache} onClose={() => setPeek(null)} />
+      <Peek target={peek} actions={peekActions} cache={cache} onClose={closePeek} />
     </View>
   );
 }

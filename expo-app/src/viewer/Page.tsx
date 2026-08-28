@@ -154,13 +154,14 @@ export function Page({
  * the browser's design and its words; what is different here is only that the
  * hold is a `LongPress` rather than a captured pointer.
  *
- * Four layers, and the order is the argument:
+ * Three layers, and the order is the argument:
  *
- * - the thumbnail, which is already in expo-image's disk cache because the grid
- *   drew it a moment ago, so there is a photograph on screen in the frame the
- *   viewer opens rather than a spinner;
- * - the preview, rendered from the blob, so it works even while the thumbnail
- *   job is still queued;
+ * - the preview, rendered from the blob, and the first thing drawn. The grid's
+ *   thumbnail used to be laid under it for the frame before it arrived, and it
+ *   cannot be: a thumbnail is a square centre crop and a photograph is not
+ *   square, so what it actually did was sit behind every landscape shot with
+ *   its own edges showing above and below the picture. A moment of nothing is
+ *   a better answer than a moment of the wrong shape;
  * - the original, but only once somebody has zoomed past what the preview can
  *   answer — WEB_TO_MOBILE § 4 asks for "preview then original", and *then* is
  *   the whole of it: a phone should not carry fifty megapixels across a network
@@ -193,7 +194,6 @@ function PhotoStage({
   // finger is on the photograph, and the two mean the same thing to the picture.
   const plain = hasOverlay && (!overlayOn || pressed);
 
-  const thumb = useMemo(() => media(item.id, thumbVariant()), [item.id]);
   const preview = useMemo(() => media(item.id, 'preview'), [item.id]);
   const bare = useMemo(
     () => (hasOverlay ? media(item.id, 'preview/plain') : null),
@@ -236,8 +236,6 @@ function PhotoStage({
 
   return (
     <>
-      <Image style={StyleSheet.absoluteFill} source={thumb} contentFit="contain" cachePolicy={cache} transition={0} />
-
       <Image
         style={StyleSheet.absoluteFill}
         source={preview}
