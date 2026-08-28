@@ -128,6 +128,24 @@ const TILE_GAP = 1;
 /** Room above the first heading, under the status bar and the floating date. */
 const TOP_ROOM = space.xxl;
 
+/**
+ * The point a zoom happens around: a tile, how far down it the fingers are, and
+ * where on the screen that is to stay.
+ *
+ * A tile rather than a scroll offset, because an offset means something
+ * different at every level — the whole timeline is nearly three times taller at
+ * the smallest cell size than at the largest. `places` is the same twenty-one
+ * numbers a tile carries, which is all the UI thread needs to place it at any
+ * continuous zoom.
+ */
+interface Anchor {
+  places: number[];
+  /** How far down the anchored tile the held point is, 0–1. */
+  frac: number;
+  /** Where the held point should stay, measured from the top of the screen. */
+  screenY: number;
+}
+
 /** What the JS side needs to answer a scroll or a zoom without waiting for a render. */
 interface Env {
   levels: LevelLayout[];
@@ -241,6 +259,15 @@ export function Grid({
   /** The continuous zoom. One value, read by React and by every worklet here. */
   const z = useSharedValue(savedLevel());
   const scrollY = useSharedValue(0);
+  /**
+   * Whether a zoom owns the scroll offset.
+   *
+   * True from the moment a pinch activates until the settle after it finishes,
+   * and read by the scroll handler, which stands down for the duration: while
+   * this is up, the reaction that holds the anchor is the only thing writing
+   * the offset and the only thing reporting it. See both.
+   */
+  const zooming = useSharedValue(false);
 
   /**
    * The size every tile is laid out at, in points.
@@ -473,8 +500,12 @@ export function Grid({
   );
 
   const onZoomed = useCallback(
-    (v: number) => {
+    (v: number, y: number) => {
       zoom.current = v;
+      // The offset arrives with the zoom because the zoom is what wrote it: the
+      // scroll handler is standing down, so this is the only thing keeping
+      // `top` current, and everything below measures against it.
+      top.current = y - padTop;
       // Only ever upwards during a gesture: a tile drawing the file it is
       // already holding while the grid moves is a tile that is slightly soft
       // for a moment, and one that fetched a smaller file on the way past
@@ -483,12 +514,13 @@ export function Grid({
       settleRange(true);
       settlePill();
     },
-    [settleRange, settlePill],
+    [padTop, settleRange, settlePill],
   );
 
   const onSettled = useCallback(
-    (to: number) => {
+    (to: number, y: number) => {
       zoom.current = to;
+      top.current = y - padTop;
       setLevel(to);
       setSharpest(to);
       setPinching(false);
@@ -496,12 +528,23 @@ export function Grid({
       settlePill();
       rememberLevel(to);
     },
-    [settleRange, settlePill],
+    [padTop, settleRange, settlePill],
   );
 
   const scrollHandler = useAnimatedScrollHandler({
     onScroll: (e) => {
       scrollY.value = e.contentOffset.y;
+      // A running zoom moves this scroll view itself, a frame at a time, and
+      // reports where it put it — see the reaction below. Every one of those
+      // frames comes back through here as a scroll event, and answering them
+      // as well meant recomputing the mounted range, the fetch range and the
+      // floating date on the JS thread sixty times a second, on top of the ten
+      // a transition already costs. Worse, those recomputes ran `settleRange`
+      // without `widen`, so they spent the gesture narrowing the very set the
+      // zoom was widening — tiles unmounted mid-transition and mounted again a
+      // frame later. That was most of the stutter: the thread that has to
+      // mount what a zoom is asking for was busy measuring where it would go.
+      if (zooming.value) return;
       runOnJS(onScrolled)(e.contentOffset.y);
     },
   });
@@ -515,16 +558,35 @@ export function Grid({
   // exactly where it left off. See grid/geometry.
 
   /** The point held still while the grid re-flows underneath it. */
-  const anchor = useSharedValue<{
-    /** Where the anchored tile sits at each level — all the UI thread needs. */
-    places: number[];
-    /** How far down that tile the held point is, 0–1. */
-    frac: number;
-    /** Where the held point should stay, measured from the top of the screen. */
-    screenY: number;
-  } | null>(null);
+  const anchor = useSharedValue<Anchor | null>(null);
+  /**
+   * The anchor that has been computed but not yet taken up.
+   *
+   * Two values rather than one, because the two moments are not the same. The
+   * point under the fingers can be worked out as soon as they land; it may only
+   * take effect once the gesture is actually driving the zoom. Between those, a
+   * settle from the pinch before this one may still be running — and that
+   * settle is held by the anchor already in `anchor`, which it must go on being
+   * held by until the new gesture takes over. Writing the new one straight into
+   * `anchor` moved the grid under an animation nobody was touching, which is
+   * the jump a second pinch inside three hundred milliseconds used to make.
+   */
+  const armed = useSharedValue<Anchor | null>(null);
   const startCell = useSharedValue(0);
   const told = useSharedValue(z.value);
+  /**
+   * Whether the anchor is still crossing to the JS thread and back.
+   *
+   * The anchor needs the day model, which is why it cannot be computed on the
+   * UI thread, which is why there is a round trip at all — and it is the one
+   * round trip a pinch cannot afford to ignore, because until it lands there is
+   * nothing to zoom around. See the gesture below.
+   */
+  const arming = useSharedValue(false);
+  /** Whether this gesture has taken the zoom over yet. See `onUpdate`. */
+  const driving = useSharedValue(false);
+  /** The gesture's scale on the frame it did. */
+  const baseScale = useSharedValue(1);
 
   /**
    * Pins the tile under the fingers, so the zoom happens around it.
@@ -537,10 +599,10 @@ export function Grid({
    */
   const armAnchor = useCallback(
     (focalX: number, focalY: number) => {
-      setPinching(true);
       const e = env.current;
       if (e.total === 0 || e.days.length === 0) {
-        anchor.value = null;
+        armed.value = null;
+        arming.value = false;
         return;
       }
       const at = frameAt(e.levels, zoom.current);
@@ -548,34 +610,115 @@ export function Grid({
       const index = itemAtPoint(e.days, e.total, at, focalX - GUTTER, y);
       const held = places(index);
       const rect = rectAt(held, zoom.current);
-      anchor.value = {
+      // `screenY` here is provisional and is never the one used: the gesture
+      // pins it again, exactly, on the frame it takes the zoom over. What this
+      // round trip is for is the tile and the fraction down it, which are the
+      // parts that need the day model.
+      armed.value = {
         places: held,
         frac: clamp((y - rect.y) / (rect.size || 1), 0, 1),
         screenY: focalY,
       };
+      arming.value = false;
     },
-    [anchor, places],
+    [armed, arming, places],
   );
+
+  /**
+   * The scroll view stands down, now that the pinch is certainly a pinch.
+   *
+   * Separated from `armAnchor` above because that one now runs on the second
+   * finger landing, and a two-finger drag that never becomes a pinch is a
+   * scroll somebody is in the middle of. Only activation may stop it.
+   */
+  const beginPinch = useCallback(() => {
+    setPinching(true);
+  }, []);
 
   const pinch = useMemo(
     () =>
       Gesture.Pinch()
-        // On activation rather than on the second finger touching down: the
-        // focal point is only meaningful once the gesture has decided it is a
-        // pinch, and anchoring to (0, 0) would zoom around the corner of the
-        // screen. The round trip to the JS thread costs a frame or two at a
-        // scale of about 1, which is nothing to look at.
+        /**
+         * Anchored on the second finger landing, not on the gesture activating.
+         *
+         * The anchor needs the day model and so has to be computed on the JS
+         * thread, and that round trip used to be made at activation — with `z`
+         * already free to move. So the opening frames of every pinch had
+         * nothing to zoom around: the grid re-flowed about the top of the
+         * board while the scroll offset stayed where it was, and the frame the
+         * anchor finally landed on snapped the photograph back under the
+         * fingers. On a busy JS thread — which is precisely the thread a pinch
+         * has just given a screenful of tiles to reconsider — that is several
+         * frames, and it is the lurch a zoom opened with.
+         *
+         * Made here, the trip has the fifty-odd milliseconds RNGH spends
+         * deciding that two fingers are a pinch, and it is almost always back
+         * before the first `onUpdate`. When it is not, `onUpdate` waits.
+         */
+        .onTouchesDown((e) => {
+          if (e.numberOfTouches !== 2) return;
+          let x = 0;
+          let y = 0;
+          for (const touch of e.allTouches) {
+            x += touch.x;
+            y += touch.y;
+          }
+          arming.value = true;
+          runOnJS(armAnchor)(x / e.allTouches.length, y / e.allTouches.length);
+        })
         .onStart((e) => {
-          startCell.value = valueAt(cells, z.value);
-          runOnJS(armAnchor)(e.focalX, e.focalY);
+          zooming.value = true;
+          driving.value = false;
+          if (!arming.value && armed.value === null) {
+            // Nothing landed as a pair — a third finger, or a pinch RNGH
+            // recognised some other way. The old path, and still correct: ask
+            // now, and let `onUpdate` wait for the answer.
+            arming.value = true;
+            runOnJS(armAnchor)(e.focalX, e.focalY);
+          }
+          runOnJS(beginPinch)();
         })
         .onUpdate((e) => {
-          z.value = clamp(zoomForCell(cells, startCell.value * e.scale), 0, MAX_ZOOM);
+          // Not a frame of zoom until there is something to zoom around. What
+          // is on screen in the meantime is whatever was there already — most
+          // often a settle from the previous pinch, still running and still
+          // held by its own anchor — so the grid carries on rather than
+          // stopping, and the hand is picked up at whatever scale it has
+          // reached by the time the answer lands.
+          if (arming.value) return;
+
+          if (!driving.value) {
+            driving.value = true;
+            // Everything the gesture measures from is read on this one frame,
+            // together: the cell size it is scaling away from, the scale it is
+            // scaling from, and where the anchored point currently sits. Read
+            // any of them earlier and they describe a grid that has moved since
+            // — which is exactly what a zoom taking over from a settle still in
+            // flight would be doing.
+            startCell.value = valueAt(cells, z.value);
+            baseScale.value = e.scale;
+            const fresh = armed.value;
+            if (fresh !== null) {
+              armed.value = null;
+              const r = rectAt(fresh.places, z.value);
+              anchor.value = {
+                places: fresh.places,
+                frac: fresh.frac,
+                screenY: r.y + fresh.frac * r.size + padTop - scrollY.value,
+              };
+            }
+          }
+
+          const scale = e.scale / (baseScale.value || 1);
+          z.value = clamp(zoomForCell(cells, startCell.value * scale), 0, MAX_ZOOM);
         })
         // Finalize rather than end, because a gesture that is cancelled rather
         // than finished still has to give the scroll back: `pinching` is what
         // switches it off, and only `onSettled` switches it on again.
         .onFinalize(() => {
+          arming.value = false;
+          driving.value = false;
+          armed.value = null;
           // Eased to the nearest level rather than left between two, so every
           // tile rasterises at exactly its cell size again — the difference
           // between scale(1) and scale(0.9999999).
@@ -586,11 +729,31 @@ export function Grid({
             (finished) => {
               if (!finished) return;
               anchor.value = null;
-              runOnJS(onSettled)(to);
+              // Handed back before React hears the zoom is over, so the scroll
+              // events that follow are answered again. `scrollY` rather than
+              // the offset the anchor last commanded, because a pinch that was
+              // cancelled before it ever moved anything never commanded one.
+              zooming.value = false;
+              runOnJS(onSettled)(to, scrollY.value);
             },
           );
         }),
-    [anchor, armAnchor, cells, onSettled, startCell, z],
+    [
+      anchor,
+      armed,
+      arming,
+      armAnchor,
+      baseScale,
+      beginPinch,
+      cells,
+      driving,
+      onSettled,
+      padTop,
+      scrollY,
+      startCell,
+      z,
+      zooming,
+    ],
   );
 
   /**
@@ -611,22 +774,47 @@ export function Grid({
       // exact at every level, so a settled grid draws at scale(1).
       boxSize.value = valueAt(cells, clamp(Math.ceil(v), 0, MAX_ZOOM));
 
+      // Where the grid is, or is about to be. Carried to React below because
+      // the scroll handler is standing down for the duration of the zoom and
+      // this is the only place that knows.
+      let at = scrollY.value;
       const held = anchor.value;
       if (held) {
         const r = rectAt(held.places, v);
-        const at = r.y + held.frac * r.size;
+        const point = r.y + held.frac * r.size;
         const limit = Math.max(0, valueAt(heights, v) + padTop + padBottom - viewport);
-        scrollTo(scroller, 0, clamp(at + padTop - held.screenY, 0, limit), false);
+        at = clamp(point + padTop - held.screenY, 0, limit);
+        scrollTo(scroller, 0, at, false);
       }
       // React is pulled back in only when the mounted set or the layout box may
       // have to change — a handful of renders per transition, not one a frame.
       if (Math.abs(v - told.value) < ZOOM_STEP) return;
       told.value = v;
-      runOnJS(onZoomed)(v);
+      runOnJS(onZoomed)(v, at);
     },
   );
 
-  const boardStyle = useAnimatedStyle(() => ({ height: valueAt(heights, z.value) }));
+  /**
+   * How tall the board is, and why it is the ceiling rather than the blend.
+   *
+   * The anchor above writes a scroll offset every frame of a zoom, and an
+   * offset past the end of the content is one the scroll view quietly clamps to
+   * whatever content it currently has. Zooming in makes the timeline taller —
+   * three times taller across the scale — so a height that only ever reached
+   * what the current position needs arrived a frame behind the offset that
+   * needed it, and near the foot of the archive the clamp took the difference.
+   * The photograph under the fingers slid away all the way in and jumped back
+   * at the end.
+   *
+   * Reaching the level the transition is heading for means the room is always
+   * already there and the clamp never fires; the anchor's own `limit` above,
+   * which is the exact blend, stays the only thing bounding the scroll. Exact
+   * at rest, where the ceiling of a settled level is that level — so the grid
+   * still ends every gesture scrollable to precisely its own last row.
+   */
+  const boardStyle = useAnimatedStyle(() => ({
+    height: valueAt(heights, clamp(Math.ceil(z.value), 0, MAX_ZOOM)),
+  }));
 
   // ── The tap, the hold and the drag ─────────────────────────────────────────
 
@@ -1168,11 +1356,11 @@ export function Grid({
           ref={scroller}
           onScroll={scrollHandler}
           // The last word on where the scroll ended, whichever way it ended.
-          // The animated handler above skips anything within SCROLL_STEP of
-          // what it last reported, which is what keeps a fling from flooding
-          // the JS thread — and which means the frame a fling comes to rest on
-          // may be one it declined to mention. These two are ungated, so what
-          // is mounted is always settled against where the grid actually is.
+          // The animated handler above declines to report anything while a
+          // zoom owns the offset, and a fling that was still running when two
+          // fingers came down comes to rest inside that window. These two are
+          // ungated, so what is mounted is always settled against where the
+          // grid actually is rather than against where the zoom left it.
           onScrollEndDrag={(e) => onScrolled(e.nativeEvent.contentOffset.y)}
           onMomentumScrollBegin={() => {
             coasting.current = true;

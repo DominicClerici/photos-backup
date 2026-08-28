@@ -220,52 +220,93 @@ export const Tile = memo(function Tile({
   );
 
   /**
-   * The rendition currently on screen, which is not always the wanted one.
+   * The rendition actually on screen, or undefined until the first has landed.
    *
    * A zoom changes which file a tile should be drawing, and the swap used to be
    * a dissolve: two half-transparent copies of the same photograph, with the
    * dark tile showing through both of them for sixty milliseconds. Across a
    * screenful at once that is the flicker a pinch was full of.
    *
-   * So the old rendition keeps drawing, underneath, until the new one has
-   * actually landed — at which point it is simply covered. Same photograph,
-   * sharper file, nothing to see.
+   * So the rendition already drawing keeps drawing, and the one being swapped
+   * to is mounted *underneath* it and left to load out of sight. When it lands,
+   * the layer on top is dropped and the layer behind is already showing the
+   * same photograph, at the same rect, under the same contentFit. There is
+   * nothing to fade and no frame in which the square is empty.
+   *
+   * Which is why the layers are a keyed array rather than two slots in the
+   * markup, and that is the whole of the fix. React reconciles an array by key,
+   * so the layer holding a picture keeps its view whichever position it ends up
+   * in. Two fixed slots reconcile by position instead — and under that, the
+   * moment the wanted size changed, the loaded image was unmounted and a fresh
+   * one mounted in its place while a second fresh one mounted behind it. Two
+   * blank views and no picture between them, on every tile on screen, at every
+   * level a pinch crossed. That was the flash.
    */
-  const [painted, setPainted] = useState(size);
-  const stale =
-    painted !== undefined && size !== undefined && painted !== size
-      ? media(item.id, thumbVariant(painted))
-      : null;
+  const [painted, setPainted] = useState<ThumbSize | undefined>(undefined);
+
+  /**
+   * The rendition currently being asked for, as `onLoad` needs to read it.
+   *
+   * A load can land for a file the zoom has already moved past. Promoting that
+   * one would name a layer the next render does not draw, and the render after
+   * that would have to mount it again from nothing — one blank view laid over
+   * the photograph, which is the single thing this arrangement exists to stop.
+   */
+  const want = useRef(size);
+  useEffect(() => {
+    want.current = size;
+  }, [size]);
+
+  const arrived = useCallback((landed: ThumbSize) => {
+    if (want.current === landed) setPainted(landed);
+  }, []);
 
   const onError = useCallback(() => {
     if (size === undefined) return;
     setMissing((held) => (held.includes(size) ? held : [...held, size]));
   }, [size]);
 
+  const held = useMemo(
+    () =>
+      painted !== undefined && size !== undefined && painted !== size
+        ? media(item.id, thumbVariant(painted))
+        : null,
+    [item.id, painted, size],
+  );
+
+  /**
+   * What to draw, in the order the layers were added and never any other.
+   *
+   * At most two: the one holding the picture, and the one arriving behind it.
+   * Insertion order means the holder is always first, so promoting the arrival
+   * is a deletion from in front of it rather than a reordering — React never
+   * moves a view here either, only ever adds one at the end or drops the head.
+   */
+  const layers: { size: ThumbSize; source: ReturnType<typeof media>; holding: boolean }[] = [];
+  if (held !== null && painted !== undefined) {
+    layers.push({ size: painted, source: held, holding: true });
+  }
+  if (size !== undefined && source !== null) {
+    layers.push({ size, source, holding: false });
+  }
+
   const { boxStyle, style, clipStyle } = useMotion({ box, places, z, pressed, selected });
 
   return (
     <Animated.View style={[styles.tile, boxStyle, style]}>
       <View style={styles.chrome}>
-        {attempt && source ? (
-          <>
-            {stale ? (
-              <Image
-                style={styles.picture}
-                source={stale}
-                contentFit="cover"
-                cachePolicy={cache}
-                transition={0}
-                accessibilityIgnoresInvertColors
-              />
-            ) : null}
+        {attempt && layers.length > 0 ? (
+          layers.map((layer) => (
             <Image
-              // Keyed by the size, so a rendition that changes is a fresh view
-              // laid over the one still drawing rather than a dissolve through
-              // it. `stale` above is what it is laid over.
-              key={size}
-              style={styles.picture}
-              source={source}
+              // Keyed by the rendition and reconciled as an array, so the layer
+              // that is already drawing keeps its view while the other one is
+              // added behind it and later taken from in front of it. See
+              // `layers` above; this key is the whole of why nothing flashes.
+              key={layer.size}
+              // The holder sits over the arrival, so a rendition being swapped
+              // to is invisible for the whole of the time it takes to load.
+              style={layer.holding ? overStyle : styles.picture}
+              source={layer.source}
               contentFit="cover"
               // The bytes are the same whatever the tile is drawn at, so the
               // disk cache is what makes scrolling back through a year of
@@ -277,15 +318,15 @@ export const Tile = memo(function Tile({
               // nothing.
               cachePolicy={cache}
               // Short enough to read as the picture arriving rather than as an
-              // animation — and only ever for the first one. A swap has the
-              // photograph already underneath it and fades through nothing.
-              transition={stale ? 0 : ARRIVE_MS}
+              // animation — and only ever for the very first one. A swap has
+              // the photograph already over it and fades through nothing.
+              transition={painted === undefined ? ARRIVE_MS : 0}
               recyclingKey={item.id}
-              onLoad={() => setPainted(size)}
-              onError={onError}
+              onLoad={layer.holding ? undefined : () => arrived(layer.size)}
+              onError={layer.holding ? undefined : onError}
               accessibilityIgnoresInvertColors
             />
-          </>
+          ))
         ) : (
           <View style={styles.blank}>
             {size === undefined ? (
@@ -403,6 +444,11 @@ const styles = StyleSheet.create({
   // Absolute rather than flexed, because there are two of them during a swap
   // and a column of two flexed children is two half-height photographs.
   picture: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  // What puts the rendition already drawn over the one still loading. A
+  // z-order rather than a different position in the markup, because the two
+  // layers must keep their views across the swap and only their stacking may
+  // change — see `layers` in Tile.
+  over: { zIndex: 2 },
   // A derivative that has not been generated yet, and one that cannot be drawn
   // at all. Both are squares rather than spinners: a screenful at the smallest
   // zoom is a couple of thousand of them, and the difference that matters is
@@ -476,3 +522,6 @@ const styles = StyleSheet.create({
     borderLeftColor: '#ffffff',
   },
 });
+
+/** The holding layer's style, composed once: a swap must allocate nothing. */
+const overStyle = [styles.picture, styles.over];
