@@ -37,6 +37,8 @@ export interface ArchiveState {
   config: Config;
   setServerUrl(value: string): void;
   setMaxItems(value: string): void;
+  /** Whether iOS may wake the app to back up. See src/background. */
+  setBackgroundBackup(value: boolean): void;
 
   server: ServerResolution | null;
   resolving: boolean;
@@ -236,11 +238,20 @@ export function ArchiveProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const setBackgroundBackup = useCallback((value: boolean) => {
+    setConfig((current) => {
+      const next = { ...current, backgroundBackup: value };
+      saveConfig(next);
+      return next;
+    });
+  }, []);
+
   const state = useMemo<ArchiveState>(
     () => ({
       config,
       setServerUrl,
       setMaxItems,
+      setBackgroundBackup,
       server,
       resolving,
       findServer,
@@ -260,6 +271,7 @@ export function ArchiveProvider({ children }: { children: React.ReactNode }) {
       config,
       setServerUrl,
       setMaxItems,
+      setBackgroundBackup,
       server,
       resolving,
       findServer,

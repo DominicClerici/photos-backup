@@ -3,11 +3,13 @@ import { usePermissions } from 'expo-media-library';
 import { createContext, use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { archiveAddress, archiveToken } from '../archive';
+import { shouldRunInBackground, syncBackgroundRegistration } from '../background';
 import { loadSelection, saveSelection } from '../sharedalbums/selection';
 import { DEFAULT_GATE, NO_GATE, readConditions } from '../sync/conditions';
 import { DEFAULT_ENGINE_CONFIG, SyncEngine } from '../sync/engine';
+import { acquireRun } from '../sync/exclusive';
 import { PhotoKitMediaSource } from '../sync/media';
-import { openQueueStore, type SqliteQueueStore } from '../sync/sqliteStore';
+import { sharedQueueStore, type SqliteQueueStore } from '../sync/sqliteStore';
 import { HttpTransport } from '../sync/transport';
 import {
   emptyCounts,
@@ -120,10 +122,23 @@ export function BackupProvider({ children }: { children: React.ReactNode }) {
   }, [credential]);
 
   useEffect(() => {
-    openQueueStore()
+    sharedQueueStore()
       .then(setStore)
       .catch((e) => setStoreError(errorText(e)));
   }, []);
+
+  /**
+   * Keeps iOS's idea of the background task in step with the switch in
+   * settings, and drops it the moment there is no pairing to run under.
+   *
+   * Declarative rather than done inside the switch's handler, because the
+   * registration lives in iOS and the preference lives in a file on this phone,
+   * and only one of those survives a reinstall. Reconciling the two whenever
+   * either changes is what makes the switch mean what it says a week later.
+   */
+  useEffect(() => {
+    void syncBackgroundRegistration(shouldRunInBackground(config, credential !== null));
+  }, [config, credential]);
 
   const refreshQueue = useCallback(async (queue: SqliteQueueStore) => {
     const [counts, failedItems] = await Promise.all([queue.counts(), queue.failed(20)]);
@@ -153,25 +168,38 @@ export function BackupProvider({ children }: { children: React.ReactNode }) {
       setHeldBecause(conditions.blockedBy);
       if (conditions.blockedBy) return;
 
+      // A background window can be running this same queue — iOS starts one
+      // without asking, and on a background launch this provider is mounted
+      // alongside it. `engine.current` above only knows about runs this screen
+      // started. See src/sync/exclusive.
+      const release = acquireRun('foreground');
+      if (!release) {
+        setRunError('a background backup is running — it will finish on its own');
+        return;
+      }
+
       setRunning(true);
 
-      const instance = new SyncEngine(
-        {
-          store,
-          // The ticked albums, read at the moment the run starts rather than
-          // held by the source: enumeration happens once per run, and a run
-          // already going should finish the set it was started on.
-          media: new PhotoKitMediaSource({ albumIds: chosenIds }),
-          transport: new HttpTransport(archiveAddress, archiveToken, log),
-          clock: systemClock,
-          onProgress: setProgress,
-          onLog: log,
-        },
-        { ...DEFAULT_ENGINE_CONFIG, deviceId: credential.deviceId, maxItems: config.maxItems }
-      );
-      engine.current = instance;
-
+      // Inside the try, and the `finally` below is why: everything from here on
+      // runs holding the run lock, so a throw while the engine is being built
+      // has to reach a release just as a throw from the run itself does.
       try {
+        const instance = new SyncEngine(
+          {
+            store,
+            // The ticked albums, read at the moment the run starts rather than
+            // held by the source: enumeration happens once per run, and a run
+            // already going should finish the set it was started on.
+            media: new PhotoKitMediaSource({ albumIds: chosenIds }),
+            transport: new HttpTransport(archiveAddress, archiveToken, log),
+            clock: systemClock,
+            onProgress: setProgress,
+            onLog: log,
+          },
+          { ...DEFAULT_ENGINE_CONFIG, deviceId: credential.deviceId, maxItems: config.maxItems }
+        );
+        engine.current = instance;
+
         await instance.run();
       } catch (e) {
         // A refused device is not a run that went wrong, it is a pairing that
@@ -198,6 +226,7 @@ export function BackupProvider({ children }: { children: React.ReactNode }) {
           setRunError(errorText(e));
         }
       } finally {
+        release();
         setRunning(false);
         await refreshQueue(store);
         // The moment the archived count matters most is the moment a run ends,

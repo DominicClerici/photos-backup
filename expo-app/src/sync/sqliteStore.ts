@@ -213,6 +213,29 @@ export async function openQueueStore(name: string = QUEUE_DATABASE): Promise<Sql
   return new SqliteQueueStore(db);
 }
 
+let shared: Promise<SqliteQueueStore> | null = null;
+
+/**
+ * The one queue connection this process uses.
+ *
+ * There are two callers now — the Backup tab's provider and the background
+ * task — and on a background launch both run, because iOS starting the app to
+ * service a task mounts the whole React tree alongside it. Two connections to
+ * the same file would work, WAL and all, but they would be two connections
+ * disagreeing about a database whose consistency this app maintains in
+ * JavaScript rather than in SQL. One handle keeps that argument from existing.
+ *
+ * A failed open is not cached: the next caller gets a fresh attempt rather than
+ * the first one's error forever.
+ */
+export function sharedQueueStore(): Promise<SqliteQueueStore> {
+  shared ??= openQueueStore().catch((e) => {
+    shared = null;
+    throw e;
+  });
+  return shared;
+}
+
 async function createSchema(db: SQLite.SQLiteDatabase): Promise<void> {
   await db.execAsync('pragma journal_mode = WAL');
   await db.execAsync(`

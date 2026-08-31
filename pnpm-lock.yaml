@@ -19,6 +19,9 @@ importers:
       expo:
         specifier: ~57.0.11
         version: 57.0.16(@babel/core@7.29.7)(@expo/metro-runtime@57.0.14)(expo-router@57.0.17)(react-dom@19.2.8(react@19.2.3))(react-native-worklets@0.10.1(@babel/core@7.29.7)(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))(react@19.2.3))(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))(react@19.2.3)(typescript@6.0.3)
+      expo-background-task:
+        specifier: ~57.0.14
+        version: 57.0.14(expo@57.0.16)(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))
       expo-battery:
         specifier: ^57.0.1
         version: 57.0.2(expo@57.0.16)(react@19.2.3)
@@ -61,6 +64,9 @@ importers:
       expo-status-bar:
         specifier: ~57.0.1
         version: 57.0.1(expo@57.0.16)(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))(react@19.2.3)
+      expo-task-manager:
+        specifier: ~57.0.14
+        version: 57.0.14(expo@57.0.16)(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))
       expo-video:
         specifier: ~57.0.3
         version: 57.0.3(expo@57.0.16)(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))(react@19.2.3)
@@ -2804,6 +2810,11 @@ packages:
       react: '*'
       react-native: '*'
 
+  expo-background-task@57.0.14:
+    resolution: {integrity: sha512-7aeiIuMuDkkPa/IivSVmeTv386vFcx+remqehk7GGn2W8GwmWYiFEL/DVGwyrtkfYxGzF+CRuZMcSLlu51hanw==}
+    peerDependencies:
+      expo: '*'
+
   expo-battery@57.0.2:
     resolution: {integrity: sha512-3++v5kSUj4aOKKTkLtJwU57UOrC0GORj4eM2Tcg2mJjdUNHHxxBes4x6w/D5LAOQmvgVsHF1Z5CP8TfQe4rsQw==}
     peerDependencies:
@@ -2991,6 +3002,12 @@ packages:
       expo: '*'
       expo-font: '*'
       react: '*'
+      react-native: '*'
+
+  expo-task-manager@57.0.14:
+    resolution: {integrity: sha512-EXK1ecx2lo5ahR9y+cEJGiOENaeDOZ4jWfS1T0ak/OYOaSSIF1XgGnXiQOgJu5QuDwmwlBc2Zr6q/IRWsGaZ4g==}
+    peerDependencies:
+      expo: '*'
       react-native: '*'
 
   expo-updates-interface@57.0.1:
@@ -4961,6 +4978,9 @@ packages:
   unicorn-magic@0.3.0:
     resolution: {integrity: sha512-+QBBXBCvifc56fsbuxZQ6Sic3wqqc3WWaqxs58gvJrcOuN83HGTCwz3oS5phzU9LthRNE9VrJCFCLUgHeeFnfA==}
     engines: {node: '>=18'}
+
+  unimodules-app-loader@57.0.1:
+    resolution: {integrity: sha512-wey5ChoJkCTq0j0JWdIMu2QB81vVrdhmrNAP14ZZ6WDslnZ7ff7Ezv8rMdEnVHaCKz3xK4mIVXbVU51xHgdyCA==}
 
   universalify@2.0.1:
     resolution: {integrity: sha512-gptHNQghINnc/vTGIk0SOFGFNXw7JVrlRUtConJRlvaw6DuX0wO5Jeko9sWrMBhh+PsYAZ7oXAiOnf/UKogyiw==}
@@ -8277,6 +8297,13 @@ snapshots:
       - supports-color
       - typescript
 
+  expo-background-task@57.0.14(expo@57.0.16)(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3)):
+    dependencies:
+      expo: 57.0.16(@babel/core@7.29.7)(@expo/metro-runtime@57.0.14)(expo-router@57.0.17)(react-dom@19.2.8(react@19.2.3))(react-native-worklets@0.10.1(@babel/core@7.29.7)(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))(react@19.2.3))(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))(react@19.2.3)(typescript@6.0.3)
+      expo-task-manager: 57.0.14(expo@57.0.16)(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))
+    transitivePeerDependencies:
+      - react-native
+
   expo-battery@57.0.2(expo@57.0.16)(react@19.2.3):
     dependencies:
       expo: 57.0.16(@babel/core@7.29.7)(@expo/metro-runtime@57.0.14)(expo-router@57.0.17)(react-dom@19.2.8(react@19.2.3))(react-native-worklets@0.10.1(@babel/core@7.29.7)(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))(react@19.2.3))(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))(react@19.2.3)(typescript@6.0.3)
@@ -8484,6 +8511,12 @@ snapshots:
       react: 19.2.3
       react-native: 0.86.2(@types/react@19.2.18)(react@19.2.3)
       sf-symbols-typescript: 2.2.0
+
+  expo-task-manager@57.0.14(expo@57.0.16)(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3)):
+    dependencies:
+      expo: 57.0.16(@babel/core@7.29.7)(@expo/metro-runtime@57.0.14)(expo-router@57.0.17)(react-dom@19.2.8(react@19.2.3))(react-native-worklets@0.10.1(@babel/core@7.29.7)(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))(react@19.2.3))(react-native@0.86.2(@types/react@19.2.18)(react@19.2.3))(react@19.2.3)(typescript@6.0.3)
+      react-native: 0.86.2(@types/react@19.2.18)(react@19.2.3)
+      unimodules-app-loader: 57.0.1
 
   expo-updates-interface@57.0.1(expo@57.0.16):
     dependencies:
@@ -10742,6 +10775,8 @@ snapshots:
   unicode-property-aliases-ecmascript@2.2.0: {}
 
   unicorn-magic@0.3.0: {}
+
+  unimodules-app-loader@57.0.1: {}
 
   universalify@2.0.1: {}
 

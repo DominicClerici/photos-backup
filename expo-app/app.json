@@ -40,7 +40,8 @@
       "expo-secure-store",
       "expo-router",
       "expo-image",
-      "expo-video"
+      "expo-video",
+      "expo-background-task"
     ],
     "experiments": {
       "reactCompiler": true

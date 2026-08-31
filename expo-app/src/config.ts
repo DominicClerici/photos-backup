@@ -21,6 +21,14 @@ export const DEFAULT_SERVER = 'https://192.168.1.97:8787';
 export const DEFAULT_MAX_ITEMS = 0;
 
 /**
+ * Off, because a backup that starts happening on its own is a thing to be asked
+ * for rather than a default to be discovered. See src/background — iOS decides
+ * when a background window happens and the honest place to say so is the switch
+ * that turns it on.
+ */
+export const DEFAULT_BACKGROUND_BACKUP = false;
+
+/**
  * Settings, and nothing secret.
  *
  * The device id used to be generated here, at random, and was whatever the phone
@@ -35,6 +43,8 @@ export type Config = {
   /** The last address that actually answered, tried before the manual one. */
   lastServerUrl: string | null;
   maxItems: number;
+  /** Whether iOS may wake the app to advance the queue. See src/background. */
+  backgroundBackup: boolean;
 };
 
 function defaults(): Config {
@@ -42,6 +52,7 @@ function defaults(): Config {
     serverUrl: DEFAULT_SERVER,
     lastServerUrl: null,
     maxItems: DEFAULT_MAX_ITEMS,
+    backgroundBackup: DEFAULT_BACKGROUND_BACKUP,
   };
 }
 
@@ -60,6 +71,9 @@ export function loadConfig(): Config {
       serverUrl: httpsOnly(parsed.serverUrl) ?? fallback.serverUrl,
       lastServerUrl: httpsOnly(parsed.lastServerUrl) ?? null,
       maxItems: normalizeMaxItems(parsed.maxItems, fallback.maxItems),
+      // A config file written before this field existed reads as off, which is
+      // the same answer a fresh install gives.
+      backgroundBackup: parsed.backgroundBackup === true,
     };
   } catch {
     return fallback;

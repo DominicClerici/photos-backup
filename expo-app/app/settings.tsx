@@ -1,5 +1,6 @@
 import { useRouter } from 'expo-router';
 
+import { BackgroundBackupCard } from '../src/components/BackgroundBackupCard';
 import { GalleryAccessCard } from '../src/components/GalleryAccessCard';
 import { PairingCard } from '../src/components/PairingCard';
 import { ServerCard } from '../src/components/ServerCard';
@@ -28,6 +29,7 @@ export default function SettingsRoute() {
     <Screen title="Settings" action={{ icon: 'x', label: 'Close', onPress: () => router.back() }}>
       <ServerCard />
       <PairingCard />
+      <BackgroundBackupCard />
       <GalleryAccessCard />
 
       {!granted && (

@@ -7,6 +7,11 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { SelectionProvider, ViewProvider } from '@photobackup/core/react';
 
 import { Controls } from '../src/actions';
+// Imported for its module body, which is where the background task is defined.
+// iOS launching the app to service a task loads this bundle and then looks for a
+// handler under that name, so the definition has to have happened by the time
+// any of this file's exports are called. See src/background/task.ts.
+import '../src/background/task';
 import { installCacheInvalidation } from '../src/gallery/cache';
 import { installSearchRecents } from '../src/search';
 import { ArchiveProvider, useArchive } from '../src/state/archive';

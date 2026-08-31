@@ -26,4 +26,5 @@ export { Empty, Screen, TAB_BAR_CLEARANCE } from './Screen';
 export { TabBar } from './TabBar';
 export { Subheading, Text, type TextTone, type TextVariant } from './Text';
 export { Toaster } from './Toaster';
+export { Toggle } from './Toggle';
 export { closeToast, installToaster, subscribeToasts, type Toast } from './toast';
