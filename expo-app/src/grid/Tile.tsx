@@ -60,15 +60,38 @@ export const HOLD_MS = 380;
 export const RELEASE_MS = 150;
 
 /**
+ * The side of the square the zoom's transform works in.
+ *
+ * A tile is drawn by scaling a square of this side to whatever size the zoom
+ * currently wants; the box underneath it is laid out at `box` points and
+ * scaled by `UNIT / box` to fill that square again. Two scales that cancel,
+ * and the reason they are split apart is which thread owns each one.
+ *
+ * The box is a layout property, and a layout property is React's to write. It
+ * has to be, because expo-image downscales a decoded photograph to the size of
+ * the view holding it — so a box that changed while a pinch was running was
+ * every thumbnail on screen being decoded again, mid-gesture, at every level
+ * the pinch crossed. That is the stutter. What is written here instead is a
+ * transform and nothing else, which dirties no layout and re-decodes nothing,
+ * and the box changes exactly once, in React, when the grid has settled.
+ *
+ * Keeping the compensating scale in the same style object as the width it
+ * compensates for is the other half of it: the two land in one commit, so they
+ * can never be a frame apart, and the worklet above never mentions the box at
+ * all — a change of box does not disturb, or even re-create, the zoom.
+ *
+ * The value is arbitrary and cancels out; a power of two keeps it tidy.
+ */
+const UNIT = 128;
+
+/**
  * Everything about a square that moves: where the zoom puts it, how far the
  * hold has drawn it back, and how far the clip has closed over it.
  *
- * Three styles rather than one, and the split is the point. The transform runs
- * every frame of a zoom; the box is written only when the zoom crosses a level;
- * the clip only when somebody picks something. Reanimated flushes whichever of
- * them ran in a single batch of property updates, so the box and the scale that
- * divides by it can never be a frame apart — which is what a pinch used to
- * flash at every level it crossed.
+ * Two styles rather than one, and the split is the point. The transform runs
+ * every frame of a zoom; the clip is written only when somebody picks
+ * something. Neither touches a layout property — see `UNIT` for why that is
+ * the whole difference between a pinch that glides and one that stutters.
  *
  * Both animations are guarded on the value having actually changed. A scroll
  * mounts a couple of hundred of these a second, and a square that started two
@@ -76,13 +99,11 @@ export const RELEASE_MS = 150;
  * that cost across the whole grid.
  */
 function useMotion({
-  box,
   places,
   z,
   pressed,
   selected,
 }: {
-  box: SharedValue<number>;
   places: Places;
   z: SharedValue<number>;
   pressed: boolean;
@@ -111,22 +132,19 @@ function useMotion({
     pick.value = withTiming(selected ? 1 : 0, { duration: PICK_MS, easing: Easing.linear });
   }, [selected, pick]);
 
-  const boxStyle = useAnimatedStyle(() => ({ width: box.value, height: box.value }));
-
   const style = useAnimatedStyle(() => {
-    const b = box.value;
     const r = rectAt(places, z.value);
     // The cell's own transform grows from the top left, because that is the
     // corner every rect the grid computes describes. The hold's does not: it is
     // the square drawing back into itself, so it is walked to the middle of the
-    // box and out again. Exact at rest, where the two walks cancel and both
-    // scales are one.
-    const half = b / 2;
+    // unit square and out again. Exact at rest, where the two walks cancel and
+    // the hold's scale is one.
+    const half = UNIT / 2;
     return {
       transform: [
         { translateX: r.x },
         { translateY: r.y },
-        { scale: r.size / b },
+        { scale: r.size / UNIT },
         { translateX: half },
         { translateY: half },
         { scale: 1 - (1 - PRESS_SCALE) * press.value },
@@ -138,24 +156,38 @@ function useMotion({
 
   const clipStyle = useAnimatedStyle(() => ({ borderWidth: PICKED * pick.value }));
 
-  return { boxStyle, style, clipStyle };
+  return { style, clipStyle };
+}
+
+/**
+ * The box the photograph is actually laid out in, and the scale that returns it
+ * to the unit square the zoom draws.
+ *
+ * One object so that React commits the width and its compensation together.
+ * Memoized because it is the only prop of a settled tile that ever changes, and
+ * a fresh object per render would re-style every square on the screen.
+ */
+function useChrome(box: number) {
+  return useMemo(
+    () => [styles.chrome, { width: box, height: box, transform: [{ scale: UNIT / box }] }],
+    [box],
+  );
 }
 
 /**
  * One square of the grid.
  *
- * Laid out at `box` — the largest cell size the running transition will reach —
- * and scaled down to whatever the zoom currently wants, for the reason the
- * browser's Tile gives: resizing the box every frame means re-rasterising every
- * thumbnail on screen every frame, while scaling one that is already big enough
- * costs a composite.
+ * Laid out at `box` — the cell size of the level the grid has settled on — and
+ * scaled to whatever the zoom currently wants, for the reason the browser's
+ * Tile gives: resizing the box means re-rasterising the thumbnail inside it,
+ * while scaling one that is already drawn costs a composite.
  *
- * `box` is a shared value rather than a prop, and that is not a detail. React
- * commits a width on one schedule and Reanimated writes a transform on another,
- * so a box that changed with a render was a frame of every tile on screen drawn
- * at the new size with the old scale — the flash a pinch used to show at every
- * level it crossed. Read from the UI thread, the two land in the same batch of
- * property updates and there is nothing to see. See `Grid`'s `boxSize`.
+ * Which is why the box is the settled cell rather than the moving one. A pinch
+ * that changed it on the way past re-decoded every photograph on screen at
+ * every level it crossed — see `UNIT`. So for the whole of a transition the
+ * tile is drawn from the picture it already had, softening a little on the way
+ * in, and the box and the sharper rendition arrive together once the grid has
+ * come to rest.
  *
  * Memoized, and it matters more here than it would in a browser: a scroll
  * re-renders the grid whenever the mounted range moves, and the several hundred
@@ -172,8 +204,8 @@ export const Tile = memo(function Tile({
   pressed = false,
 }: {
   item: TimelineItem;
-  /** The size the tile is laid out at, in points. Written by the zoom. */
-  box: SharedValue<number>;
+  /** The size the tile is laid out at, in points. The settled level's cell. */
+  box: number;
   thumb: ThumbSize;
   /** Where this tile sits at each zoom level. See grid/geometry. */
   places: Places;
@@ -290,11 +322,12 @@ export const Tile = memo(function Tile({
     layers.push({ size, source, holding: false });
   }
 
-  const { boxStyle, style, clipStyle } = useMotion({ box, places, z, pressed, selected });
+  const { style, clipStyle } = useMotion({ places, z, pressed, selected });
+  const chrome = useChrome(box);
 
   return (
-    <Animated.View style={[styles.tile, boxStyle, style]}>
-      <View style={styles.chrome}>
+    <Animated.View style={[styles.tile, style]}>
+      <View style={chrome}>
         {attempt && layers.length > 0 ? (
           layers.map((layer) => (
             <Image
@@ -382,7 +415,7 @@ export const Skeleton = memo(function Skeleton({
   selected = false,
   pressed = false,
 }: {
-  box: SharedValue<number>;
+  box: number;
   places: Places;
   z: SharedValue<number>;
   /**
@@ -393,11 +426,12 @@ export const Skeleton = memo(function Skeleton({
   selected?: boolean;
   pressed?: boolean;
 }) {
-  const { boxStyle, style, clipStyle } = useMotion({ box, places, z, pressed, selected });
+  const { style, clipStyle } = useMotion({ places, z, pressed, selected });
+  const chrome = useChrome(box);
 
   return (
-    <Animated.View style={[styles.tile, boxStyle, style]}>
-      <View style={styles.chrome}>
+    <Animated.View style={[styles.tile, style]}>
+      <View style={chrome}>
         <Animated.View style={[StyleSheet.absoluteFill, styles.clip, clipStyle]} pointerEvents="none" />
         {selected ? <Tick /> : null}
       </View>
@@ -432,14 +466,27 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 0,
     left: 0,
+    // The unit square the zoom scales. Fixed, so nothing a zoom does can dirty
+    // this node's layout; `chrome` below is what carries the real box.
+    width: UNIT,
+    height: UNIT,
     // Every rect the grid computes is the top-left corner of a cell, so the
     // scale that shrinks a box down to it has to grow from the same corner.
     transformOrigin: 'top left',
   },
   // The picture sits inside the square rather than being it, so that the clip
   // that marks a selection can close over it without fighting the transform the
-  // zoom loop writes to the node above.
-  chrome: { flex: 1, overflow: 'hidden', backgroundColor: color.tile },
+  // zoom loop writes to the node above. Absolute, so that changing its box
+  // never asks the node above to be laid out again — and scaled from the same
+  // top-left corner, since it is undoing exactly the scale up there.
+  chrome: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    overflow: 'hidden',
+    backgroundColor: color.tile,
+    transformOrigin: 'top left',
+  },
   clip: { borderColor: color.background },
   // Absolute rather than flexed, because there are two of them during a swap
   // and a column of two flexed children is two half-height photographs.

@@ -28,7 +28,15 @@ import {
 import { BlurView } from 'expo-blur';
 import { router, useIsFocused } from 'expo-router';
 import * as Haptics from 'expo-haptics';
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  startTransition,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { StyleSheet, useWindowDimensions, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
@@ -93,6 +101,19 @@ const OVERSCAN = 0.75;
  * covering the ground in between.
  */
 const CHUNK = 48;
+
+/**
+ * The same, for the widenings a running zoom asks for.
+ *
+ * Coarser, because during a gesture a render is not merely work: React
+ * committing while Reanimated wants to commit makes Reanimated stand down for
+ * that frame and fold its updates into React's — so the scroll offset the
+ * anchor writes lands and the transforms that go with it do not. One frame of
+ * the grid sliding without its tiles, which is what a zoom used to teleport
+ * with. Four chunks at a time means a pinch crosses the whole scale in a
+ * render or two instead of a dozen.
+ */
+const ZOOM_CHUNK = CHUNK * 4;
 
 /** How far the zoom must travel before React is told. About a tenth of a level. */
 const ZOOM_STEP = 0.1;
@@ -253,7 +274,9 @@ export function Grid({
 
   const heights = useMemo(() => heightsOf(levels), [levels]);
   const cells = useMemo(() => cellsOf(levels), [levels]);
-  const headerHeights = useMemo(() => headerHeightsOf(levels), [levels]);
+  // One number, not seven: every level is given the same heading height, and
+  // saying so here is what lets a heading animate a transform and nothing else.
+  const headerHeight = useMemo(() => headerHeightsOf(levels)[0] ?? 0, [levels]);
 
   const scroller = useAnimatedRef<Animated.ScrollView>();
   /** The continuous zoom. One value, read by React and by every worklet here. */
@@ -268,21 +291,6 @@ export function Grid({
    * the offset and the only thing reporting it. See both.
    */
   const zooming = useSharedValue(false);
-
-  /**
-   * The size every tile is laid out at, in points.
-   *
-   * The cell of the level a running transition is heading *towards*, so a tile
-   * is never laid out smaller than it is being drawn — which is the whole of
-   * why the box is not simply the cell size. It is a shared value rather than
-   * state for a reason worth stating: React commits a width on one schedule and
-   * Reanimated writes a transform on another, so while this was a prop, every
-   * level a pinch crossed gave a frame of the whole screen laid out at the new
-   * box and still scaled for the old one. That is the flash the zoom had. Kept
-   * on the UI thread, the width and the scale that divides by it are written in
-   * the same batch, and a pinch crosses seven levels without a seam.
-   */
-  const boxSize = useSharedValue(cells[clamp(Math.round(z.value), 0, MAX_ZOOM)] ?? 1);
 
   const env = useRef<Env>({
     levels,
@@ -314,21 +322,31 @@ export function Grid({
   });
 
   /**
-   * The settled zoom, and the rendition drawn into the tiles.
+   * The settled zoom, and the two things that follow it.
    *
-   * The rendition follows the *largest* level a running transition will reach,
-   * so zooming in asks for the sharper file as soon as the tiles are laid out
-   * for it, and zooming out keeps the larger one until the grid has settled at
-   * the smaller cell. Between gestures it is simply the settled level.
+   * Both only ever change when the grid has come to rest, and that is the whole
+   * of what makes a transition smooth. `box` is the size every tile is laid out
+   * at, and `rendition` is the stored file drawn into it — and both of them,
+   * changed while a pinch was running, meant every photograph on screen being
+   * decoded again at the moment the grid could least afford it: expo-image
+   * downscales to the view it is in, so a new box re-decodes as surely as a new
+   * file does. See `Tile`'s `UNIT`.
    *
-   * Only the file changes here. Where the tiles are and how big they are drawn
-   * is `boxSize` above, on the UI thread, and it moves several times a second
-   * during a pinch — which is exactly why these two were separated: this one is
-   * a render, and a render per frame of a zoom is a zoom that stutters.
+   * So for the length of a gesture the grid draws the pictures it already has,
+   * scaled. What is soft on the way in comes back sharp when the fingers have
+   * been up for three hundred milliseconds and nothing is moving.
+   *
+   * The rendition trails the box by a commit rather than sharing it, because
+   * the two are different kinds of work: the box is where several hundred
+   * squares are, which has to be right on the frame the zoom settles, and the
+   * rendition is several hundred images being asked for, which does not. A
+   * transition puts the grid in its place first and sharpens it immediately
+   * after, rather than doing both in one long frame at the end of the gesture.
    */
   const [level, setLevel] = useState(() => Math.round(z.value));
-  const [sharpest, setSharpest] = useState(level);
-  const thumb = thumbSizeFor(sharpest);
+  const [rendition, setRendition] = useState(level);
+  const box = cells[clamp(level, 0, MAX_ZOOM)] ?? 1;
+  const thumb = thumbSizeFor(rendition);
 
   const [window, setWindow] = useState<ItemRange>({ start: 0, end: 0 });
   const [wanted, setWanted] = useState<ItemRange>({ start: 0, end: 0 });
@@ -384,14 +402,26 @@ export function Grid({
    * geometry changes, which is the only time the answers do.
    */
   const places = useMemo(() => {
-    const cache = new Map<number, number[]>();
+    let cache = new Map<number, number[]>();
+    let older = new Map<number, number[]>();
     return (index: number): number[] => {
       const held = cache.get(index);
       if (held) return held;
-      // Bounded well above anything a screenful plus overscan can mount, and
-      // dropped whole rather than evicted one at a time: the entries are all
-      // equally cheap to rebuild.
-      if (cache.size > 4000) cache.clear();
+      // Two generations rather than one, and the older one is why. Bounded, the
+      // map has to be dropped eventually — but dropping it outright hands every
+      // square currently on screen a brand new array, which re-renders all of
+      // them and re-serializes all of their worklets, in one frame, for nothing.
+      // Kept for a generation, the entries still in use come straight back and
+      // only the ground already walked is let go.
+      const kept = older.get(index);
+      if (kept) {
+        cache.set(index, kept);
+        return kept;
+      }
+      if (cache.size > 4000) {
+        older = cache;
+        cache = new Map();
+      }
       const day = dayIndexOf(days, index);
       const built = placesFor(levels, day, index - days[day].start);
       cache.set(index, built);
@@ -459,8 +489,9 @@ export function Grid({
   const settleRange = useCallback(
     (widen: boolean) => {
       const need = rangeFor(OVERSCAN);
-      const start = Math.floor(need.start / CHUNK) * CHUNK;
-      const end = Math.ceil(need.end / CHUNK) * CHUNK;
+      const chunk = widen ? ZOOM_CHUNK : CHUNK;
+      const start = Math.floor(need.start / chunk) * chunk;
+      const end = Math.ceil(need.end / chunk) * chunk;
 
       setWindow((held) => {
         const next = widen
@@ -468,6 +499,14 @@ export function Grid({
           : { start, end };
         return next.start === held.start && next.end === held.end ? held : next;
       });
+
+      // Nothing is asked for while a transition is running. A page landing
+      // mid-pinch is a network answer parsed, a store mutated and the whole
+      // grid re-rendered on the one thread the gesture needs — and the range it
+      // was fetched for is the wrong one anyway, because the zoom has moved on
+      // since. What a zoom-out uncovers is drawn as the squares it already
+      // knows the place of, and filled the moment the grid comes to rest.
+      if (widen) return;
 
       const fetch = rangeFor(FETCH_OVERSCAN);
       setWanted((held) => (held.start === fetch.start && held.end === fetch.end ? held : fetch));
@@ -506,15 +545,14 @@ export function Grid({
       // scroll handler is standing down, so this is the only thing keeping
       // `top` current, and everything below measures against it.
       top.current = y - padTop;
-      // Only ever upwards during a gesture: a tile drawing the file it is
-      // already holding while the grid moves is a tile that is slightly soft
-      // for a moment, and one that fetched a smaller file on the way past
-      // would be a screenful of downloads thrown away at the other end.
-      setSharpest((held) => Math.max(held, clamp(Math.ceil(v), 0, MAX_ZOOM)));
+      // The mounted set, and nothing else. Not the rendition, not the fetch
+      // range, and not the floating date — the anchor holds the same tile under
+      // the fingers the whole way, so the date is very nearly never wrong, and
+      // a render it did cause would cost a frame of the transition. All three
+      // are settled together the moment the grid stops.
       settleRange(true);
-      settlePill();
     },
-    [padTop, settleRange, settlePill],
+    [padTop, settleRange],
   );
 
   const onSettled = useCallback(
@@ -522,10 +560,12 @@ export function Grid({
       zoom.current = to;
       top.current = y - padTop;
       setLevel(to);
-      setSharpest(to);
       setPinching(false);
       settleRange(false);
       settlePill();
+      // A commit behind the geometry above, so the grid takes its new shape on
+      // this frame and asks for several hundred sharper files on the next one.
+      startTransition(() => setRendition(to));
       rememberLevel(to);
     },
     [padTop, settleRange, settlePill],
@@ -768,12 +808,6 @@ export function Grid({
   useAnimatedReaction(
     () => z.value,
     (v) => {
-      // The box the tiles are laid out at, written before anything reads it and
-      // in the same flush as the transforms that divide by it. Ceiling, so a
-      // tile is never laid out smaller than the cell it is being drawn at, and
-      // exact at every level, so a settled grid draws at scale(1).
-      boxSize.value = valueAt(cells, clamp(Math.ceil(v), 0, MAX_ZOOM));
-
       // Where the grid is, or is about to be. Carried to React below because
       // the scroll handler is standing down for the duration of the zoom and
       // this is the only place that knows.
@@ -795,26 +829,28 @@ export function Grid({
   );
 
   /**
-   * How tall the board is, and why it is the ceiling rather than the blend.
+   * How tall the board is, and why a transition gets the tallest it could need.
    *
    * The anchor above writes a scroll offset every frame of a zoom, and an
    * offset past the end of the content is one the scroll view quietly clamps to
    * whatever content it currently has. Zooming in makes the timeline taller —
    * three times taller across the scale — so a height that only ever reached
-   * what the current position needs arrived a frame behind the offset that
-   * needed it, and near the foot of the archive the clamp took the difference.
+   * what the current position needs arrives a frame behind the offset that
+   * needs it, and near the foot of the archive the clamp takes the difference.
    * The photograph under the fingers slid away all the way in and jumped back
    * at the end.
    *
-   * Reaching the level the transition is heading for means the room is always
-   * already there and the clamp never fires; the anchor's own `limit` above,
-   * which is the exact blend, stays the only thing bounding the scroll. Exact
-   * at rest, where the ceiling of a settled level is that level — so the grid
-   * still ends every gesture scrollable to precisely its own last row.
+   * So the room is simply already there, for the whole of the gesture and the
+   * settle after it: the anchor's own `limit`, which is the exact blend, stays
+   * the only thing bounding the scroll, and nothing can be scrolled into the
+   * slack because the scroll view has stood down for the duration. Written by
+   * React rather than by a worklet — a height is a layout property, and a
+   * layout property changing under a running pinch lays out every square on the
+   * screen. This way there are two of those per gesture rather than one per
+   * level, and the one at the end shares its commit with the new box.
    */
-  const boardStyle = useAnimatedStyle(() => ({
-    height: valueAt(heights, clamp(Math.ceil(z.value), 0, MAX_ZOOM)),
-  }));
+  const tallest = useMemo(() => Math.max(...heights), [heights]);
+  const boardHeight = pinching ? tallest : (heights[clamp(level, 0, MAX_ZOOM)] ?? 0);
 
   // ── The tap, the hold and the drag ─────────────────────────────────────────
 
@@ -1381,9 +1417,9 @@ export function Grid({
             paddingHorizontal: GUTTER,
           }}
         >
-          <Animated.View style={boardStyle}>
+          <View style={{ height: boardHeight }}>
             {headings.map((d) => (
-              <Heading key={days[d].id} day={days[d]} tops={tops(d)} heights={headerHeights} z={z} />
+              <Heading key={days[d].id} day={days[d]} tops={tops(d)} height={headerHeight} z={z} />
             ))}
 
             {/* Every square in range is drawn, whether or not there is a photo
@@ -1395,7 +1431,7 @@ export function Grid({
                 <Tile
                   key={item.id}
                   item={item}
-                  box={boxSize}
+                  box={box}
                   thumb={thumb}
                   places={places(index)}
                   z={z}
@@ -1406,7 +1442,7 @@ export function Grid({
               ) : (
                 <Skeleton
                   key={`@${index}`}
-                  box={boxSize}
+                  box={box}
                   places={places(index)}
                   z={z}
                   selected={picking && selected(index)}
@@ -1414,7 +1450,7 @@ export function Grid({
                 />
               ),
             )}
-          </Animated.View>
+          </View>
         </Animated.ScrollView>
       </GestureDetector>
 
@@ -1489,29 +1525,33 @@ export function Grid({
 /**
  * One day's heading, placed by the same blend the tiles are.
  *
- * Its height is blended too, and it has to be: a heading is 52 points at every
- * level, but the *gap* between the day above and the tiles below it is part of
- * what `layoutLevel` stacked, so a fixed box here would leave the label sitting
- * at the wrong end of its own space halfway through a transition.
+ * Only placed by it. The height a heading is given is the same at every level —
+ * `metricsFor` takes one number and hands it to all seven — so blending it was
+ * a constant, and an expensive one: a height is a layout property, and a style
+ * that returns one alongside a transform sends the pair through the shadow tree
+ * on every frame of every scroll and every pinch, dirtying the node's layout
+ * each time. Stated as the constant it is, the heading writes a transform and
+ * nothing else. What varies between levels is where the heading starts, which
+ * is `tops`, and the gap under it, which `layoutLevel` has already stacked into
+ * the tiles below.
  */
 function Heading({
   day,
   tops,
-  heights,
+  height,
   z,
 }: {
   day: Day;
   tops: number[];
-  heights: number[];
+  height: number;
   z: SharedValue<number>;
 }) {
   const style = useAnimatedStyle(() => ({
     transform: [{ translateY: valueAt(tops, z.value) }],
-    height: valueAt(heights, z.value),
   }));
 
   return (
-    <Animated.View style={[styles.heading, style]} pointerEvents="none">
+    <Animated.View style={[styles.heading, { height }, style]} pointerEvents="none">
       <Text variant="title" numberOfLines={1} style={styles.headingLabel}>
         {day.label}
       </Text>

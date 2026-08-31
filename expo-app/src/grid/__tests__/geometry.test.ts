@@ -138,6 +138,21 @@ test('two levels that draw the same grid are one step of the pinch', () => {
   }
 });
 
+/**
+ * What `Grid`'s `Heading` rests on.
+ *
+ * A heading draws a transform and nothing else — no animated height — and that
+ * is only correct because the number is the same at every level. If a level
+ * ever earned a heading of its own size, a heading would have to blend it, and
+ * the blend would have to be split the way `Tile`'s box is: React writing the
+ * height and a compensating scale beside it, never a worklet.
+ */
+test('every level gives a heading the same height', () => {
+  const { levels } = build();
+  const headers = headerHeightsOf(levels);
+  expect(new Set(headers).size).toBe(1);
+});
+
 test('a timeline with no headings still places its tiles', () => {
   const days = daysFrom([{ day: '', count: 500 }]);
   const levels = ZOOM_LEVELS.map((cap) =>
