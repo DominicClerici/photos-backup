@@ -124,6 +124,14 @@ type Runner struct {
 	// DescribeQuiet is how long the vision and ocr queues must have been quiet
 	// before a describe job is claimed. See visionHold. Two minutes by default.
 	DescribeQuiet time.Duration
+	// IngestRetry is how long the vision pool waits before asking for the card
+	// again after photo-ml refuses it. Fifteen minutes by default.
+	//
+	// A pace rather than a backoff, and it does not grow, because a refusal is
+	// not a failure: somebody has the gallery open, or something outside this
+	// archive is holding most of the card. The queue is the state and the work
+	// is still in it. See vision.go and photo_ml/leases.py.
+	IngestRetry time.Duration
 
 	// PollInterval is the floor on how often an idle worker looks for work.
 	// Uploads nudge the pools directly, so this only matters for work that
@@ -150,12 +158,27 @@ type Runner struct {
 	wrongCaptioner  sync.Once
 	wrongRecogniser sync.Once
 
-	// The vision pool's shared view of whether photo-ml is up. Shared so that
-	// the probe rate is a property of the interval rather than of
-	// VISION_CONCURRENCY.
+	// The vision pool's shared view of the card: whether photo-ml is up, and
+	// whether it has given this process the ingest lease. Shared so that the
+	// probe rate and the lease are properties of the archive rather than of
+	// VISION_CONCURRENCY — four workers must not be four leases, and they must
+	// not be four health probes either. See vision.go.
 	mlMu        sync.Mutex
 	mlOK        bool
 	mlCheckedAt time.Time
+	// holdingIngest is whether photo-ml has told this process it may use the
+	// card, and ingestRenewedAt is when it last said so. Held while the ML
+	// queue is draining and handed back the moment it is not.
+	holdingIngest   bool
+	ingestRenewedAt time.Time
+	// ingestRefusedAt and ingestRefusal are the last refusal and its reason.
+	// The first paces the retry; the second keeps a four-hour wait to one line
+	// in the journal rather than one line every fifteen minutes.
+	ingestRefusedAt time.Time
+	ingestRefusal   string
+	// noLeases says once, and only once, that this photo-ml is old enough not
+	// to know what a lease is.
+	noLeases sync.Once
 }
 
 func New(deps Deps) *Runner {
@@ -167,6 +190,7 @@ func New(deps Deps) *Runner {
 		PrepWorkers:       2,
 		VisionWorkers:     1,
 		DescribeQuiet:     120 * time.Second,
+		IngestRetry:       defaultIngestRetry,
 		PollInterval:      5 * time.Second,
 		SweepInterval:     time.Minute,
 		HeartbeatInterval: jobs.DefaultLease / 3,
@@ -232,6 +256,12 @@ func (r *Runner) Start(ctx context.Context) {
 	go func() {
 		defer r.wg.Done()
 		r.sweep(ctx)
+		// On the way out, and with a context that is not the cancelled one.
+		// The lease would lapse ninety seconds later on its own — that is what
+		// the term is for, and it is what covers a `kill -9` — but a clean stop
+		// can do better than ninety seconds, and a restart that takes the card
+		// back from itself is worth avoiding.
+		r.releaseIngest(context.WithoutCancel(ctx))
 	}()
 }
 

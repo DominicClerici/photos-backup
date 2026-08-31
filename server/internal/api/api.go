@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/dominicclerici/photos-backup/server/internal/blobstore"
 	"github.com/dominicclerici/photos-backup/server/internal/db"
@@ -91,6 +92,12 @@ type Server struct {
 	// text, filenames and place names, and says in the response that it did.
 	// See internal/api/search.go.
 	ML *mlclient.Client
+	// MLSearchIdle is how long photo-ml is asked to keep the search models on
+	// the card after the last gallery request. Zero takes the default.
+	//
+	// It is a setting on this struct rather than on the worker's because this
+	// is the half of the archive that can see a browser. See mlwarm.go.
+	MLSearchIdle time.Duration
 	// WorkerEnabled says whether this process is draining the queue. A server
 	// with WORKER_DISABLED set still accepts uploads and still answers reads;
 	// what it does not do is ever build a thumbnail, and the status page exists
@@ -108,6 +115,10 @@ type Server struct {
 	// vocab holds the archive's own people and place names, which the query
 	// parser is only allowed to recognise things from. See search.go.
 	vocab vocabularyCache
+	// search holds photo-ml's last answer about whether the models a search
+	// needs are on the card, and is what turns gallery traffic into the lease
+	// that puts them there. See mlwarm.go.
+	search searchLease
 	// deriv caches the walk behind the storage card. See derivativeBytes.
 	deriv storageCache
 }
@@ -157,8 +168,15 @@ func (s *Server) Handler() http.Handler {
 	// two, and the second one — PlaintextHandler — served all of this to
 	// anybody who could open a loopback port. Moving the gallery off that port
 	// is what let it be deleted.
-	s.readRoutes(mux, s.requireAuth)
-	s.galleryRoutes(mux, s.requireAuth)
+	// Both tables behind the same guard, and both wrapped in the one that
+	// notices somebody is looking. Every request through here is a browser or a
+	// phone with the gallery open, which is the fact photo-ml cannot observe and
+	// needs, and the upload endpoints above are deliberately outside it: a phone
+	// backing up its camera roll overnight is not somebody searching. See
+	// mlwarm.go.
+	watched := s.watching(s.requireAuth)
+	s.readRoutes(mux, watched)
+	s.galleryRoutes(mux, watched)
 	return mux
 }
 
@@ -308,6 +326,12 @@ func (s *Server) readRoutes(mux *http.ServeMux, allow guard) {
 	// relevance is the answer to the question that was asked, and chronology is
 	// not. See internal/api/search.go.
 	mux.HandleFunc("GET /v1/search", allow(s.handleSearch))
+	// A POST in the read table, and the one route here that changes something
+	// rather than reporting it — what it changes is on the GPU service rather
+	// than in the archive. It is the gallery saying it has just been opened, so
+	// that the models a search needs are arriving while the first screen of
+	// thumbnails is rather than after somebody has typed. See mlwarm.go.
+	mux.HandleFunc("POST /v1/search/warm", allow(s.handleSearchWarm))
 
 	// The collections page and the heading of one album. The membership itself
 	// is not here: an album is read back through /v1/timeline?album=, so it

@@ -85,6 +85,20 @@ type parsedQuery struct {
 	Source string `json:"source"`
 }
 
+// holdingNote turns photo-ml's reason for refusing the card into the sentence
+// the page draws above an unexpectedly ordinary set of results.
+//
+// photo-ml's own wording, because it is the only side that knows which of the
+// several reasons it was, and it is written for a person: "the ingest lease
+// holds the card", "9.2GB of the card is held outside this archive". What is
+// added here is the consequence, which photo-ml has no business knowing.
+func holdingNote(reason string) string {
+	if reason == "" {
+		reason = "the GPU service would not hold the search models"
+	}
+	return reason + ", so this search ranked by words alone: captions, tags, recognised text, filenames and place names"
+}
+
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 
@@ -107,14 +121,41 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		offset = n
 	}
 
-	parsed, degraded := s.parse(r)
+	// Whether the two models a search needs are on the card, asked before
+	// anything is sent to either.
+	//
+	// This used to be unanswerable and therefore unasked: they were resident,
+	// so they were always there. They are leased now — see mlwarm.go — and a
+	// lease can be refused, because an overnight caption pass has the card or
+	// because something outside this archive is holding most of it. Asking
+	// first is what turns those into a search ranked by words rather than a
+	// search that waits ten seconds for a timeout and then ranks by words.
+	grant := s.searchGrant(r.Context())
+	parsed, degraded := s.parse(r, grant.Ready)
 
 	// The visual half, as a vector. Absent is a supported answer: a query with
 	// no leftover phrase — "videos from 2019" — never wanted one, and a query
 	// whose phrase could not be embedded falls back to the text ranking, which
 	// is §7's degraded path with no second code path behind it.
 	var vector []float32
-	if parsed.Visual != "" && s.ML != nil {
+	switch {
+	case parsed.Visual == "":
+	case s.ML == nil:
+		degraded = "photo-ml is not configured, so this search ranked by words alone: captions, tags, recognised text, filenames and place names"
+	case !grant.Held:
+		// The card is spoken for. Said plainly, and with photo-ml's own
+		// sentence: "no results" and "no results, because a caption pass is
+		// running" are not the same page, and this is the field that keeps them
+		// apart. The text ranking has been sitting in Postgres since the last
+		// backfill and is what actually answers this query.
+		degraded = holdingNote(grant.Reason)
+	case !grant.Ready:
+		// Held, but the checkpoints are still arriving — the twenty seconds
+		// after a page load. Waiting would put a person behind a model load for
+		// a query the text half can answer now, and the next thing they type
+		// will have the encoder.
+		degraded = "the archive is still loading the models that rank by what a photograph looks like; this search ranked by words alone"
+	default:
 		ctx, cancel := context.WithTimeout(r.Context(), searchEmbedTimeout)
 		embedded, err := s.ML.EmbedTexts(ctx, []string{parsed.Visual})
 		cancel()
@@ -126,8 +167,6 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		case len(embedded.Vectors) == 1:
 			vector = embedded.Vectors[0]
 		}
-	} else if parsed.Visual != "" && s.ML == nil {
-		degraded = "photo-ml is not configured, so this search ranked by words alone: captions, tags, recognised text, filenames and place names"
 	}
 
 	results, total, err := s.Store.Search(r.Context(), db.SearchRequest{
@@ -162,7 +201,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 // from `q`, so removing a chip is omitting a parameter. Removing something a
 // parser inferred is not expressible any other way — a merge-on-top of a parse
 // can add a filter but has no way to say "and not the date it found".
-func (s *Server) parse(r *http.Request) (searchquery.Query, string) {
+func (s *Server) parse(r *http.Request, model bool) (searchquery.Query, string) {
 	query := r.URL.Query()
 	text := query.Get("q")
 
@@ -182,7 +221,13 @@ func (s *Server) parse(r *http.Request) (searchquery.Query, string) {
 	}
 
 	grammar := searchquery.Parse(text, vocab, time.Now())
-	if s.ML == nil || text == "" {
+	// `model` is whether the query parser is actually on the card right now. It
+	// is not, most of the time, and that is the design rather than a
+	// degradation: what is lost is a refinement on top of an answer the grammar
+	// has already given, and loading 1.2GB of weights to find one would be the
+	// tail wagging the dog. Nothing is said about it in the response for the
+	// same reason the error path below says nothing — see there.
+	if s.ML == nil || text == "" || !model {
 		return grammar, ""
 	}
 

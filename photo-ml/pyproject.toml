@@ -22,6 +22,11 @@ dependencies = [
     "torchvision>=0.26.0",
     "accelerate>=1.14.0",
     "kernels>=0.16.0,<0.17.0",
+    # The driver, asked how much of the card belongs to somebody else. Pure
+    # ctypes over libnvidia-ml, no CUDA context of its own, and an import that
+    # is allowed to fail: see vram.py, where a host that cannot answer raises no
+    # objection to anything.
+    "nvidia-ml-py>=12",
 ]
 
 [project.scripts]

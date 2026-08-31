@@ -13,7 +13,7 @@ import { Controls } from '../src/actions';
 // any of this file's exports are called. See src/background/task.ts.
 import '../src/background/task';
 import { installCacheInvalidation } from '../src/gallery/cache';
-import { installSearchRecents } from '../src/search';
+import { installSearchRecents, useSearchWarmth } from '../src/search';
 import { ArchiveProvider, useArchive } from '../src/state/archive';
 import { BackupProvider } from '../src/state/backup';
 import { color } from '../src/theme';
@@ -96,6 +96,14 @@ export default function RootLayout() {
 function Gate() {
   const { credential } = useArchive();
   const paired = credential !== null;
+
+  // The app being open is the fact photo-ml cannot observe and needs: it is
+  // what decides whether the models a search runs on are in VRAM or whether the
+  // card is free for the overnight captioning pass. Asked here rather than on
+  // the search screen, because the whole point is that the checkpoints finish
+  // loading before somebody types — and asked only when paired, because an
+  // unpaired phone has no credential to ask with and nothing behind the ask.
+  useSearchWarmth(paired);
 
   return (
     <>

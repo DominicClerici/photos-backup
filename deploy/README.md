@@ -238,8 +238,8 @@ Four models, and the budget is tight enough to be worth writing down:
 
 | | |
 |---|---|
-| encoder, resident | 2.3GB |
-| query parser, resident | 1.2GB |
+| encoder, leased | 2.3GB |
+| query parser, leased | 1.2GB |
 | captioner, on demand | 9.1–10.1GB |
 | text recogniser | none — it runs on the CPU |
 | desktop session | ~1.4GB |
@@ -249,6 +249,30 @@ is on demand and why unloading calls `torch.cuda.empty_cache()` rather than just
 dropping a reference — dropping it returns the blocks to torch's allocator,
 which keeps them reserved against the driver, and `nvidia-smi` goes on showing
 10GB held.
+
+It is also why the first two are *leased* rather than resident. They used to be
+loaded when photo-ml started and never given back, so an idle archive showed
+about 5GB held in `nvidia-smi` with nothing running — and the peak above was
+15GB rather than 11.5. Now nothing is loaded until something asks:
+
+- **A gallery being opened** takes the `search` lease. The browser and the app
+  both ask on a page load and on coming back to the foreground, and photod
+  renews it on ordinary gallery traffic, so it lapses `ML_SEARCH_IDLE` after the
+  last request. Refused while an ingestion pass has the card, and refused when
+  `PHOTO_ML_SEARCH_BUDGET_GB` or more is held by something outside this archive.
+- **The vision pool** takes the `ingest` lease before it claims, and hands it
+  back the moment its queue drains. Refused while a gallery is open, and refused
+  when `PHOTO_ML_INGEST_BUDGET_GB` or more is held elsewhere; a refusal is asked
+  again in `ML_INGEST_RETRY` rather than retried.
+
+The two never overlap, which is the point. photod's own NVENC transcoding is not
+counted against either budget — see photo-ml/README.md § Leases.
+
+**Reading the state.** `curl -s localhost:8789/health | jq` now answers three
+questions rather than one: `models` is what is loaded, `leases` is who is holding
+it and why not, and `vram` is what the driver says everybody else is using. An
+empty `models` table is the correct state most of the time; `leases[].last_refusal`
+is where to look when it is not.
 
 ML_IMAGES.md §11 names the number to watch: **whether NVENC transcodes ever fail
 to allocate during a backfill.** If they do, the answer is a lower

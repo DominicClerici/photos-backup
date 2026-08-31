@@ -27,6 +27,27 @@ const visionRetryDelay = time.Minute
 // rate.
 const mlProbeInterval = 15 * time.Second
 
+// ingestLeaseTTL is how long photo-ml is asked to hold the ingest lease past
+// each renewal, and ingestRenewInterval is how often the gate renews it.
+//
+// The gap between them is deliberate and is the whole content of the setting: a
+// lease that outlives three missed renewals is one that survives a slow database
+// and a busy machine, and one that expires ninety seconds after the last is one
+// that gives the card back on its own when photod is killed mid-backfill. The
+// alternative — a lease held until something explicitly releases it — makes a
+// `kill -9` during a four-hour caption pass into a card nobody can use until
+// somebody notices and restarts photo-ml.
+const (
+	ingestLeaseTTL      = 90 * time.Second
+	ingestRenewInterval = 30 * time.Second
+	defaultIngestRetry  = 15 * time.Minute
+)
+
+// mlKinds are the three passes that need the card. In no particular order here:
+// the priority between them is jobs.ClaimInOrder's business and this is only
+// ever asked whether any of them exist.
+var mlKinds = []jobs.Kind{jobs.KindVision, jobs.KindOCR, jobs.KindDescribe}
+
 // runVision is the one job in this worker that leaves the machine's own
 // process tree: the ML renditions go out over loopback and 1152 numbers per
 // frame come back.
@@ -155,21 +176,25 @@ func (r *Runner) checkModel(once *sync.Once, role, reported, expected string) {
 	})
 }
 
-// mlAvailable reports whether photo-ml is up and warm, and is the reason the
-// vision pool does not need an error path for "the service is not installed".
+// mlAvailable is the vision pool's gate: three questions, in the order that
+// makes the cheap ones able to answer for the expensive ones.
+//
+//	is there anything to do   one index probe, and the only one asked every tick
+//	is photo-ml there         cached for mlProbeInterval, across every worker
+//	may we have the card      the lease, and the reason this is not one question
 //
 // A pool that claimed first and discovered second would work — Defer exists for
 // the job that is in flight when the service goes — but it would spend a claim,
 // a lease and a heartbeat goroutine per asset to find out something that is
-// true of the whole queue at once. Asking first, and asking at most once every
-// mlProbeInterval however many workers there are, means a machine whose GPU
-// service is down has a vision pool that is genuinely idle rather than one
-// churning through sixty thousand rows.
+// true of the whole queue at once. Asking first means a machine whose GPU
+// service is down, or whose card is being used by somebody, has a vision pool
+// that is genuinely idle rather than one churning through sixty thousand rows.
 //
-// `ready` rather than `ok`: photo-ml answers /health from its first moment, on
-// purpose, so that warming up and being gone are distinguishable. Handing work
-// to a service that is listening but still pulling weights off a mirror would
-// only produce a timeout.
+// The first question is not cached, and that is worth saying because the other
+// two are. It is one index probe, it is what decides whether the card is handed
+// back, and caching it would mean a photograph that landed a second after the
+// queue drained waited fifteen seconds to be looked at — the exact latency the
+// nudge exists to remove.
 func (r *Runner) mlAvailable(ctx context.Context) bool {
 	if r.ML == nil {
 		return false
@@ -177,6 +202,50 @@ func (r *Runner) mlAvailable(ctx context.Context) bool {
 
 	r.mlMu.Lock()
 	defer r.mlMu.Unlock()
+
+	if !r.mlWork(ctx) {
+		// Nothing queued and nothing running. The card goes back now rather
+		// than when the lease lapses, because photod is the only process that
+		// knows a queue is empty and the difference is whether the next person
+		// to open the gallery gets a search box or a page of words. See
+		// photo_ml/leases.py.
+		r.releaseIngestLocked(ctx)
+		return false
+	}
+	if !r.mlHealthyLocked(ctx) {
+		return false
+	}
+	return r.mlLeaseLocked(ctx)
+}
+
+// mlWork reports whether any of the three GPU passes has work outstanding.
+//
+// Running counts as well as pending: a worker mid-caption is exactly when the
+// lease must not be handed back, and Quiet already answers both in one query.
+func (r *Runner) mlWork(ctx context.Context) bool {
+	quiet, err := r.Queue.Quiet(ctx, mlKinds, 0)
+	if err != nil {
+		if ctx.Err() == nil {
+			r.log().Error("ask whether there is any ML work outstanding", "error", err)
+		}
+		// Assume there is. A database that will not answer is not a reason to
+		// hand back a lease that a caption pass may be halfway through, and the
+		// claim below is about to fail against the same database anyway.
+		return true
+	}
+	return !quiet
+}
+
+// mlHealthyLocked is the old gate: is the service there, and is it in a state to
+// be given work.
+//
+// `ready` rather than `ok`: photo-ml answers /health from its first moment, on
+// purpose, so that a service which is up and a service which is gone are
+// distinguishable. What `ready` means changed when the search models stopped
+// being loaded at startup — it used to be "the resident checkpoints are in
+// VRAM" and is now "at least one model here can load at all" — but what the
+// pool does about it did not.
+func (r *Runner) mlHealthyLocked(ctx context.Context) bool {
 	if time.Since(r.mlCheckedAt) < mlProbeInterval {
 		return r.mlOK
 	}
@@ -194,7 +263,7 @@ func (r *Runner) mlAvailable(ctx context.Context) bool {
 	// two lines in the journal, not two hundred and forty.
 	switch {
 	case r.mlOK && !was:
-		r.log().Info("photo-ml is answering; the vision pool is claiming work",
+		r.log().Info("photo-ml is answering; the vision pool is asking for the card",
 			"device", health.Device, "dtype", health.Dtype, "models", residentNames(health))
 	case !r.mlOK && was:
 		reason := "not ready"
@@ -205,6 +274,116 @@ func (r *Runner) mlAvailable(ctx context.Context) bool {
 			"reason", reason, "note", "backups, the gallery and every other pool are unaffected")
 	}
 	return r.mlOK
+}
+
+// mlLeaseLocked takes or renews the ingest lease, and is the new half of this
+// gate.
+//
+// The old arrangement had exactly one question about the card — is the service
+// up — because the answer to every other one was fixed: the search models were
+// loaded at startup and never given back, so an ingestion pass ran whenever
+// there was work and shared a 16GB card with 3GB it could not displace. This is
+// what replaced that. photo-ml decides; both facts it decides on are things
+// this side cannot see (what the driver says is free, what else is loaded) and
+// both facts it needs are things only this side can see (that there is a queue,
+// and that it is still draining).
+//
+// A refusal is ordinary and is not an error. Somebody has the gallery open, or
+// something outside this archive is holding most of the card. The queue is the
+// state and the work is still in it, so the answer is to ask again in fifteen
+// minutes — which is roughly how long the two things it is waiting on take to
+// change, and is not a backoff: it does not grow, because nothing here is
+// failing.
+func (r *Runner) mlLeaseLocked(ctx context.Context) bool {
+	now := time.Now()
+	if r.holdingIngest {
+		if now.Sub(r.ingestRenewedAt) < ingestRenewInterval {
+			return true
+		}
+		grant, err := r.ML.Lease(ctx, mlclient.LeaseIngest, ingestLeaseTTL)
+		if err == nil && grant.Held {
+			r.ingestRenewedAt = now
+			return true
+		}
+		// A renewal that was refused means the term lapsed and something else
+		// took the card while this worker was between jobs. Nothing is wrong
+		// and nothing is lost — the job that is running finishes, and the next
+		// pass of this gate goes round the front and asks properly.
+		r.holdingIngest = false
+		if err != nil && ctx.Err() == nil {
+			r.log().Warn("could not renew the ingest lease", "error", err)
+		}
+		return false
+	}
+
+	if !r.ingestRefusedAt.IsZero() && now.Sub(r.ingestRefusedAt) < r.ingestRetry() {
+		return false
+	}
+
+	grant, err := r.ML.Lease(ctx, mlclient.LeaseIngest, ingestLeaseTTL)
+	switch {
+	case err != nil && !errors.Is(err, mlclient.ErrUnavailable):
+		// A 4xx: this photo-ml does not arbitrate leases at all. An older
+		// build, or one whose lease group this photod does not know about.
+		// Treated as consent, because the alternative is a backfill that never
+		// runs again over a version skew — and the service's own residency
+		// rules, which are what this replaced, are still in place.
+		r.holdingIngest = true
+		r.ingestRenewedAt = now
+		r.noLeases.Do(func() {
+			r.log().Info("photo-ml does not arbitrate leases; the vision pool is claiming work without one",
+				"reason", err.Error())
+		})
+		return true
+	case err != nil:
+		// Unreachable. The health probe above will say so on its next pass;
+		// there is nothing useful to add here.
+		return false
+	case !grant.Held:
+		r.ingestRefusedAt = now
+		if grant.Reason != r.ingestRefusal {
+			r.ingestRefusal = grant.Reason
+			r.log().Info("photo-ml will not give the vision pool the card; the queued work is waiting",
+				"reason", grant.Reason, "retry_in", r.ingestRetry())
+		}
+		return false
+	}
+
+	r.holdingIngest = true
+	r.ingestRenewedAt = now
+	r.ingestRefusedAt = time.Time{}
+	r.ingestRefusal = ""
+	r.log().Info("photo-ml gave the vision pool the card", "reason", grant.Reason)
+	return true
+}
+
+// releaseIngest hands the card back. Safe to call when nothing is held.
+func (r *Runner) releaseIngest(ctx context.Context) {
+	r.mlMu.Lock()
+	defer r.mlMu.Unlock()
+	r.releaseIngestLocked(ctx)
+}
+
+func (r *Runner) releaseIngestLocked(ctx context.Context) {
+	if !r.holdingIngest || r.ML == nil {
+		return
+	}
+	r.holdingIngest = false
+	if _, err := r.ML.ReleaseLease(ctx, mlclient.LeaseIngest); err != nil {
+		// Not worth more than a debug line. The term is ninety seconds and it
+		// is about to run out on its own, which is precisely what the term is
+		// for; this call only makes the card available sooner.
+		r.log().Debug("could not hand the ingest lease back", "error", err)
+		return
+	}
+	r.log().Info("the ML queue is empty; the card is back for the gallery")
+}
+
+func (r *Runner) ingestRetry() time.Duration {
+	if r.IngestRetry <= 0 {
+		return defaultIngestRetry
+	}
+	return r.IngestRetry
 }
 
 func residentNames(h mlclient.Health) string {

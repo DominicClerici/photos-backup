@@ -8,15 +8,23 @@ registration — and nothing in a handler knows or cares which it got.
 Three of the four models have very different costs, and the residency table is
 where that is expressed rather than in any of the code below:
 
-  encoder    1.8GB, resident. A query becomes a vector on every search.
-  parser     1.2GB, resident. A query waits on it; a 20-second load is not a
-             search box.
+  encoder    1.8GB, leased. A query becomes a vector on every search, so it is
+             pinned while somebody has the gallery open and unloaded five
+             minutes after they stop. See leases.py.
+  parser     1.2GB, leased, on the same lease and for the same reason: a query
+             waits on it, and a 20-second load is not a search box.
   captioner  ~9GB, on demand. The expensive pass in the system, and the reason
              `empty_cache()` in residency.py matters — NVENC wants that memory
              back when the backfill goes quiet.
   recogniser ~0.5GB, on demand, and on the CPU. It does not touch the card at
              all, which is why the OCR pass can be running while the captioner
              is not loaded and vice versa.
+
+The first two used to be resident: loaded at startup, never given back. That is
+the change leases.py records — an idle archive held three gigabytes and a CUDA
+context all day for a search box nobody had open, and photod is the only process
+that can tell the difference between nobody looking and nobody looking yet. So
+it says so, with POST /lease, and this service holds nothing until it does.
 
 Images arrive as base64 in JSON rather than as multipart. It costs a third more
 bytes over a loopback socket that is not the bottleneck, and it buys a service
@@ -43,8 +51,10 @@ from . import captioner as cap
 from . import encoder as enc
 from . import ocr as textrec
 from . import parser as qp
+from .leases import INGEST, SEARCH, Arbiter, Group
 from .residency import Residency, Role
 from .settings import Settings, from_env
+from .vram import Card
 
 log = logging.getLogger("photo_ml")
 
@@ -113,6 +123,18 @@ class ParseRequest(BaseModel):
     # whatever comes back against the same list again, so a model that ignores
     # this costs nothing. See searchquery.Merge.
     people: list[str] = Field(default_factory=list)
+
+
+class LeaseRequest(BaseModel):
+    """Which lease, and for how long. See leases.py."""
+
+    group: str = Field(description='"search" or "ingest"')
+    # Optional, and the service's own default is used when it is absent. The
+    # term belongs to the holder — photod knows how long it intends to go
+    # without asking again — but it is capped here, because a caller that asks
+    # for a day has either made a mistake or is about to be killed, and either
+    # way the card should not be unusable until tomorrow because of it.
+    ttl_seconds: float | None = Field(default=None)
 
 
 class EmbedResponse(BaseModel):
@@ -194,23 +216,63 @@ def build(settings: Settings) -> FastAPI:
     register(
         PARSE,
         name=qp.MODEL_NAME,
-        # Resident, like the encoder, and for the same reason: somebody is
-        # waiting on it. 1.2GB is what makes that affordable beside a 9GB
-        # captioner on a 16GB card.
-        role=Role.RESIDENT,
+        # Leased, like the encoder, and on the same lease: both are what a
+        # search request touches, so pinning one without the other would leave
+        # half of a search box instant and half of it twenty seconds cold.
+        role=Role.LEASED,
         load=lambda: qp.QueryParser(device, dtype, settings.cache_dir),
     )
     register(
         VISION,
         name=enc.MODEL_NAME,
-        # Resident, and the only one that will be. Interactive search embeds a
-        # phrase per query, and a query that waits twenty seconds for a
-        # checkpoint is not a search box. It is also the cheap one: 1.8GB
-        # against the 6GB the captioner in step 6 will want, which is what makes
-        # keeping it affordable at all.
-        role=Role.RESIDENT,
+        # Leased. Interactive search embeds a phrase per query and a query that
+        # waits twenty seconds for a checkpoint is not a search box — but only
+        # while there is a search box open, which is the fact this process
+        # cannot see and photod can. 1.8GB is cheap enough to hold through a
+        # browsing session and far too expensive to hold through a weekend.
+        role=Role.LEASED,
         load=lambda: enc.VisionEncoder(device, dtype, settings.cache_dir),
     )
+
+    # The card, and the two leases decided against it.
+    #
+    # Built after the table because `search` names the keys it pins and those
+    # keys have to exist to be pinned — an instance started with
+    # PHOTO_ML_MODELS=caption registers neither, and leases.Arbiter tolerates
+    # that: a lease over nothing is granted, warms nothing, and the routes go on
+    # answering 404 the way they already did.
+    card = Card(ignore=settings.vram_ignore)
+    arbiter = Arbiter(
+        residency,
+        card,
+        {
+            SEARCH: Group(
+                name=SEARCH,
+                pins=tuple(key for key in (VISION, PARSE) if key in settings.models),
+                budget=settings.search_budget_bytes,
+                default_ttl=settings.search_lease_seconds,
+                # Twice the default. The cap is against a caller that has made a
+                # mistake, not against a caller that wants a longer session than
+                # this file guessed at, and ten minutes of a browsing session is
+                # not a mistake.
+                max_ttl=settings.search_lease_seconds * 2,
+            ),
+            INGEST: Group(
+                name=INGEST,
+                # Nothing. What this lease holds is permission: the captioner
+                # and the recogniser are still loaded by the routes that need
+                # them and still reaped when they go idle, and pinning them here
+                # would keep ten gigabytes on the card through every gap in a
+                # queue that photod is about to refill anyway.
+                pins=(),
+                budget=settings.ingest_budget_bytes,
+                default_ttl=settings.ingest_lease_seconds,
+                max_ttl=settings.ingest_lease_seconds * 4,
+            ),
+        },
+    )
+    residency.pin_check(arbiter.pins)
+    residency.on_sweep(arbiter.sweep)
 
     # The captioner is the one model where a batch is worth waiting for: it is
     # memory-bandwidth bound, so eight images cost barely more than one, and
@@ -238,6 +300,8 @@ def build(settings: Settings) -> FastAPI:
 
     app = FastAPI(title="photo-ml", version="0.1.0")
     app.state.residency = residency
+    app.state.arbiter = arbiter
+    app.state.card = card
     app.state.settings = settings
     app.state.device = device
     app.state.dtype = dtype
@@ -254,14 +318,19 @@ def build(settings: Settings) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
-        """Up, and which models are resident.
+        """Up, what is loaded, who is holding it, and what else is on the card.
 
-        Always 200, including while the encoder is still loading and including
+        Always 200, including while a checkpoint is still loading and including
         when it failed to load. The distinction photod needs is not "is this
-        endpoint answering" — it is "can this service embed something right
-        now", and that is `ready`. A 503 here would make a service that is
+        endpoint answering" — it is "is there any point handing this service
+        work", and that is `ready`. A 503 here would make a service that is
         warming up look like a service that is gone, and the vision pool would
         back off from work it is about to be able to do.
+
+        `leases` and `vram` are what make an empty residency table readable. An
+        archive holding no models is the correct state most of the time now, and
+        without these two the page would be unable to say whether that is
+        because nobody is looking or because a game is holding nine gigabytes.
         """
         return {
             "ok": True,
@@ -269,7 +338,46 @@ def build(settings: Settings) -> FastAPI:
             "device": str(device),
             "dtype": str(dtype).removeprefix("torch."),
             "models": residency.report(),
+            "leases": arbiter.report(),
+            "vram": card.report(),
         }
+
+    @app.post("/lease")
+    def lease(req: LeaseRequest) -> dict:
+        """Take or renew a lease on the card — leases.py, over the socket.
+
+        The one route here that is about the service rather than about a
+        photograph, and it exists because the two facts that decide what should
+        be loaded live in two different processes. photod knows whether somebody
+        has the gallery open and whether there is a queue; this side knows what
+        the driver says is free and what is already on the card. Neither can
+        answer alone.
+
+        Always 200, including for a refusal. A refusal is an answer — "an
+        ingestion pass has the card", "six gigabytes are held outside this
+        archive" — and photod acts on it rather than retrying it, so making it
+        an error status would put a normal, expected, correct outcome down the
+        same path as a service that has fallen over.
+        """
+        try:
+            grant = arbiter.acquire(req.group, req.ttl_seconds)
+        except KeyError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return grant.as_dict()
+
+    @app.delete("/lease/{group}")
+    def unlease(group: str) -> dict:
+        """Hand a lease back before its term is up.
+
+        The vision pool calls this the moment its queue goes dry, and that is
+        the difference between the card coming back on the next sweep and coming
+        back ninety seconds later. A clock cannot know a queue is empty; the
+        process draining it can.
+        """
+        try:
+            return arbiter.release(group).as_dict()
+        except KeyError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.post("/embed", response_model=EmbedResponse)
     def embed(req: EmbedRequest) -> EmbedResponse:

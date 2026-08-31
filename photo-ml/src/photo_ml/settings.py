@@ -12,6 +12,7 @@ import os
 from dataclasses import dataclass
 
 from . import ocr
+from . import vram
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,39 @@ class Settings:
     ocr_model_type: str
     ocr_device: str
 
+    # How much VRAM held outside this project is enough to refuse a lease.
+    #
+    # Two numbers because the two leases are worth different amounts. Search is
+    # three gigabytes that somebody is waiting for right now, so it is allowed
+    # onto a card that is already two-thirds spoken for; an ingestion pass is
+    # ten that nobody is waiting for and that will hold the card for hours, so
+    # it wants most of the card free before it starts. See leases.py.
+    #
+    # "Outside this project" means outside all of it: photod encodes video with
+    # h264_nvenc, and a backfill that stood aside for that would be standing
+    # aside for itself. See vram.py for how the accounting is done and how it
+    # degrades on a host whose driver cannot be asked.
+    search_budget_bytes: int
+    ingest_budget_bytes: int
+
+    # How long a lease lasts when its holder stops renewing it.
+    #
+    # The search default is the one that matters: it is how long the encoder and
+    # the parser stay on the card after the last gallery request, and five
+    # minutes is comfortably longer than somebody reading one page and
+    # comfortably shorter than the card being held all evening for a tab that
+    # was closed.
+    #
+    # The ingest default is much shorter because it is renewed on every pass of
+    # photod's vision gate, which is at most fifteen seconds apart. What it is
+    # sized for is photod being killed mid-backfill: the card comes back a
+    # minute and a half later rather than at the next restart.
+    search_lease_seconds: float
+    ingest_lease_seconds: float
+
+    # Process names whose VRAM is counted as this archive's own.
+    vram_ignore: tuple[str, ...]
+
     # Where transformers caches weights. Set explicitly so the systemd unit can
     # give the service one writable directory and no home directory at all.
     cache_dir: str | None
@@ -126,6 +160,11 @@ def from_env() -> Settings:
         ocr_model_type=os.environ.get("PHOTO_ML_OCR_MODEL_TYPE", "").strip().lower()
         or ocr.DEFAULT_MODEL_TYPE,
         ocr_device=os.environ.get("PHOTO_ML_OCR_DEVICE", "").strip().lower() or "",
+        search_budget_bytes=_gib(os.environ.get("PHOTO_ML_SEARCH_BUDGET_GB"), 8.0),
+        ingest_budget_bytes=_gib(os.environ.get("PHOTO_ML_INGEST_BUDGET_GB"), 4.0),
+        search_lease_seconds=_positive_float(os.environ.get("PHOTO_ML_SEARCH_LEASE_SECONDS"), 300.0),
+        ingest_lease_seconds=_positive_float(os.environ.get("PHOTO_ML_INGEST_LEASE_SECONDS"), 90.0),
+        vram_ignore=_names(os.environ.get("PHOTO_ML_VRAM_IGNORE"), vram.DEFAULT_IGNORE),
         cache_dir=os.environ.get("PHOTO_ML_CACHE_DIR") or None,
     )
 
@@ -147,6 +186,27 @@ def _models(value: str | None) -> frozenset[str]:
     named = {name.strip().lower() for name in value.split(",") if name.strip()}
     chosen = named & ALL_MODELS
     return frozenset(chosen) if chosen else ALL_MODELS
+
+
+def _gib(value: str | None, fallback: float) -> int:
+    """A budget in gigabytes, as bytes. Zero and below fall back rather than
+    meaning "never" — a budget of nothing would refuse every lease forever, and
+    an env file is not where somebody should be able to turn the whole feature
+    off by typo. PHOTO_ML_MODELS is where a model is turned off deliberately."""
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        parsed = fallback
+    if parsed <= 0:
+        parsed = fallback
+    return int(parsed * (1 << 30))
+
+
+def _names(value: str | None, fallback: tuple[str, ...]) -> tuple[str, ...]:
+    if not value:
+        return fallback
+    named = tuple(name.strip().lower() for name in value.split(",") if name.strip())
+    return named or fallback
 
 
 def _positive_int(value: str | None, fallback: int) -> int:

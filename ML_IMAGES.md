@@ -315,7 +315,9 @@ POST /describe  images[] → [{caption, tags[]}] VLM, free-form tags      built
 POST /ocr       images[] → [{text, lines[]}]   dedicated text recognition  built
 POST /parse     query    → filter JSON         small instruct model     built
 POST /triage    words[]  → [{junk, score}]     the captioner, as a judge   built
-GET  /health             → which models are resident                    built
+GET  /health             → what is loaded, who holds it, what else is on the card  built
+POST /lease     {group}  → whether the card is yours       search / ingest  built
+DELETE /lease/{group}    → hand it back                                     built
 ```
 
 *(Every route takes a list and answers per item, which the sketch had as
@@ -345,10 +347,37 @@ about 1.4 GB.
 
 | model | planned | actual | residency |
 |---|---|---|---|
-| vision encoder, SigLIP-2 so400m fp16 | 1.8 GB | **2.3 GB** | resident |
-| query parser | 4B at 4-bit, 3 GB | **Qwen3-0.6B bf16, 1.2 GB** | resident |
+| vision encoder, SigLIP-2 so400m fp16 | 1.8 GB | **2.3 GB** | leased |
+| query parser | 4B at 4-bit, 3 GB | **Qwen3-0.6B bf16, 1.2 GB** | leased |
 | captioner | 7–8B at 4-bit, 6 GB | **Qwen3-VL-4B bf16, 9.1–13.0 GB** | on demand |
 | OCR, rapidocr PP-OCRv6 medium | 0.5 GB | **127 MB, 1.2 GB peak** | on demand |
+
+*(The first two were **resident** — loaded at startup, never given back — for
+most of this file's life, and the whole of the arithmetic below assumed it. What
+that arithmetic did not price is the ordinary case: an archive nobody is looking
+at, holding 3.5 GB of weights and a CUDA context all day for a search box nobody
+has open. `nvidia-smi` on an idle machine read about 5 GB with nothing running.*
+
+*They are **leased** now, which keeps the latency argument and drops the
+"forever". A lease is photod saying somebody is looking — a page load, an app
+coming to the foreground, and then ordinary gallery traffic — and it lapses five
+minutes after the last request. photo-ml cannot see a browser and never will;
+photod cannot see the card. Neither can answer alone, so photod asks and
+photo-ml decides. See photo-ml/src/photo_ml/leases.py.*
+
+*A second lease, `ingest`, is the vision pool's, and the two are mutually
+exclusive. That is what the row below is really about: 15 GB of 16.3 at the peak
+of a captioning pass left 0.71 GB, which is the margin NVENC needs and nothing
+more. Now the captioner runs on a card with no search models on it, and a search
+typed mid-backfill is answered by Postgres alone — a real cost, and the right
+one, because a text-ranked search returns photographs and a search that waits
+twenty seconds for a checkpoint does not.*
+
+*Both leases are also checked against what the driver says everybody else is
+holding: 8 GB refuses search, 4 GB refuses an ingestion pass. "Everybody else"
+excludes photod, whose NVENC transcoding is this project. A host whose driver
+cannot be asked raises no objection to either — photo-ml is optional forever, and
+that includes being optional about knowing anything.)*
 
 *(Two of those moved and both for the same reason: the card is Blackwell, and
 the AWQ/GPTQ kernels are the part of that ecosystem most likely to be missing an

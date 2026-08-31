@@ -650,6 +650,47 @@ export interface SearchPage {
  * row edits. Materialising the parse into parameters is the only way to say
  * "and not the date it found"; see lib/search.
  */
+/**
+ * What the archive can do with a typed sentence right now.
+ *
+ * `available` is whether it expects to be able to rank by what a photograph
+ * looks like at all; `ready` is whether it can this second. They are two fields
+ * because the models are loaded on demand rather than kept in VRAM forever, so
+ * there is a real twenty-second window after a page load in which the archive
+ * has said yes and is still fetching checkpoints. A search in that window ranks
+ * by words and says so in `degraded`.
+ */
+export interface SearchWarmth {
+  available: boolean;
+  ready: boolean;
+  /** photod's sentence about why, when there is one worth showing. */
+  note?: string;
+}
+
+/**
+ * Tells the archive a gallery has just been opened, so that the models a search
+ * needs start loading now rather than when somebody types.
+ *
+ * The one call in this file that exists for its side effect on another machine's
+ * VRAM. photo-ml holds no state and has never seen a browser: it cannot tell an
+ * archive nobody has opened in a week from one being scrolled right now, so the
+ * encoder and the query parser used to be loaded at startup and never given
+ * back — about 3GB held all day for a search box nobody had open. This is the
+ * missing fact, sent.
+ *
+ * Fire it on a page load, on a sign-in, and when the app comes back to the
+ * foreground. Ordinary gallery traffic keeps it alive after that, so nothing has
+ * to poll: photod renews the lease on the requests it is already serving, and
+ * the models are unloaded a few minutes after the last one.
+ *
+ * Failure is not worth reporting to anybody. A search still works without this
+ * — it ranks by captions, tags, recognised text, filenames and place names, and
+ * the response says that it did.
+ */
+export function warmSearch(): Promise<SearchWarmth> {
+  return send<SearchWarmth>("/v1/search/warm", {});
+}
+
 export function fetchSearch(
   params: URLSearchParams,
   limit: number,

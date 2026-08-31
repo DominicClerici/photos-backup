@@ -63,6 +63,40 @@ Environment=TRITON_CACHE_DIR=/var/lib/photo-ml/triton
 #Environment=PHOTO_ML_OCR_MODEL_TYPE=medium
 #Environment=PHOTO_ML_OCR_DEVICE=cpu
 
+# How much VRAM held by processes outside this archive is enough to refuse a
+# lease — the search models on a page load, or an ingestion pass on the queue.
+#
+# Two numbers because the two are worth different amounts. Search is 3.5GB that
+# somebody is waiting for right now, so it is allowed onto a card that is already
+# two-thirds spoken for; a captioning pass is ten gigabytes that nobody is
+# waiting for and that will hold the card for hours, so it wants most of the card
+# free before it starts.
+#
+# "Outside this archive" means outside all of it. photod encodes video with
+# h264_nvenc, and a backfill that stood aside for that would be standing aside
+# for itself — so photod and its ffmpeg children are counted as ours, by process
+# name, because photod forks one per clip and this service cannot be told in
+# advance about a child that will exist in four seconds.
+#
+# A host whose driver cannot be asked raises no objection to either. That is the
+# same rule the rest of this service follows: degrade towards working. /health
+# reports `vram.measurable: false` when that is what happened.
+#Environment=PHOTO_ML_SEARCH_BUDGET_GB=8
+#Environment=PHOTO_ML_INGEST_BUDGET_GB=4
+#Environment=PHOTO_ML_VRAM_IGNORE=photod,photobackup,ffmpeg,ffprobe
+
+# How long each lease outlives its last renewal.
+#
+# Terms rather than timers, and what they are sized for is the holder dying. The
+# search lease is renewed by photod on ordinary gallery traffic, so five minutes
+# is how long the card stays committed after the last person stopped looking —
+# and it is also what photod's ML_SEARCH_IDLE asks for, so changing it here alone
+# changes only the ceiling. The ingest lease is renewed every thirty seconds by
+# the vision pool's gate, so ninety seconds is how long a `kill -9` during a
+# four-hour caption pass leaves the card unusable.
+#Environment=PHOTO_ML_SEARCH_LEASE_SECONDS=300
+#Environment=PHOTO_ML_INGEST_LEASE_SECONDS=90
+
 # Unloading a model has to survive a stop as well: a service killed mid-forward
 # pass leaves VRAM held until the process actually exits, and NVENC is waiting
 # for it.

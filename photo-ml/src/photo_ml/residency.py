@@ -1,21 +1,32 @@
 """Which models are in VRAM, and when they stop being.
 
 The card is 16.3GB and the desktop session is already holding about 1.4 of it.
-The vision encoder is small enough to keep loaded forever; the captioner and the
-text recogniser that arrive in ML_IMAGES.md step 6 are not, and neither is
-anything else that wants the card — the archive machine transcodes with
-h264_nvenc, and NVENC is a separate silicon block that will not fight the models
-for SMs but very much does want VRAM.
+Everything else that wants it — the captioner, the text recogniser, and NVENC,
+which is a separate silicon block that will not fight the models for SMs but
+very much does want VRAM — has to fit in what is left.
 
 So a model declares a role rather than being loaded wherever somebody first
 needs it:
 
-  RESIDENT   loaded once, at startup, and never given back. The vision encoder,
-             because interactive search embeds a query on every keystroke-ish
-             and a 20-second load in front of that is not a search box.
+  LEASED     loaded when somebody takes a lease on it and unloaded when that
+             lease lapses. The vision encoder and the query parser, because
+             interactive search embeds a query on every keystroke-ish and a
+             20-second load in front of that is not a search box — but only
+             while somebody actually has the gallery open. See leases.py.
   ON_DEMAND  loaded when something asks, unloaded once nothing has asked for
              idle_seconds. The heavy ones. A backfill gets the whole card and
              hands it back a few minutes after the queue goes dry.
+
+LEASED used to be RESIDENT: loaded at startup and never given back. That was
+right about the latency and wrong about everything else, because it meant a
+machine with nobody looking at it held three gigabytes of weights and a CUDA
+context all day for a search box nobody had open. The role kept the latency and
+gave up the "forever": a lease is photod saying somebody is looking, which is a
+fact this process cannot observe and does not have to guess at.
+
+A LEASED model is still reaped on idle when nothing pins it, which is what makes
+a stray request that arrives outside any lease — an admin curl, a search that
+raced a lapse — cost twenty seconds rather than three gigabytes until restart.
 
 Two details that are the entire reason this is a module rather than a dict.
 
@@ -53,7 +64,7 @@ log = logging.getLogger("photo_ml.residency")
 
 
 class Role(enum.Enum):
-    RESIDENT = "resident"
+    LEASED = "leased"
     ON_DEMAND = "on_demand"
 
 
@@ -90,6 +101,24 @@ class Residency:
         self._mu = threading.Lock()
         self._stop = threading.Event()
         self._reaper: threading.Thread | None = None
+        # Whether a lease is currently holding this key on the card. Installed
+        # by leases.Arbiter rather than known here, because "somebody has the
+        # gallery open" is not a fact about weights and this module is only
+        # about weights. Absent — in a test, or in an instance nothing has
+        # leased from — nothing is pinned and the reaper's clock is the only
+        # rule, which is exactly how ON_DEMAND has always behaved.
+        self._pinned: Callable[[str], bool] | None = None
+        # Run at the end of every sweep, so the lease deadlines are checked on
+        # the same thread and the same interval the idle timers are. One reaper
+        # rather than two: they are the same job asked by two different clocks.
+        self._on_sweep: list[Callable[[], None]] = []
+
+    def pin_check(self, pinned: Callable[[str], bool]) -> None:
+        """Tell the reaper how to ask whether a key is spoken for."""
+        self._pinned = pinned
+
+    def on_sweep(self, hook: Callable[[], None]) -> None:
+        self._on_sweep.append(hook)
 
     def register(
         self,
@@ -103,32 +132,24 @@ class Residency:
             self._entries[key] = Entry(name=name, role=role, load=load, evicts=evicts)
 
     def start(self) -> None:
-        """Warm the resident models and begin reaping the on-demand ones.
+        """Begin reaping.
 
-        Warming happens on a background thread so the socket is listening
-        immediately. A service that answers nothing for twenty seconds while a
-        checkpoint loads is indistinguishable from a service that is down, and
-        the one thing photod needs to be able to tell about this process is
-        exactly that — so /health answers from the first moment and says
-        `ready: false` until the encoder is up.
+        Nothing is loaded here, and that is the change this file exists to
+        record. Startup used to warm the two search models on a background
+        thread so that the socket was listening immediately while 3GB of
+        checkpoints arrived; now nothing loads until somebody asks, either by
+        taking a lease or by sending a request. The service is up in about a
+        second and holds no VRAM at all until there is a reason to.
+
+        What that costs is the first search after a lapse, and leases.py is
+        where that cost is managed: photod takes the lease on a page load, so
+        the weights are arriving while the first screen of thumbnails is.
         """
-        threading.Thread(target=self._warm, name="warm", daemon=True).start()
         self._reaper = threading.Thread(target=self._reap_loop, name="reap", daemon=True)
         self._reaper.start()
 
     def stop(self) -> None:
         self._stop.set()
-
-    def _warm(self) -> None:
-        for key, entry in list(self._entries.items()):
-            if entry.role is Role.RESIDENT:
-                try:
-                    self._ensure(entry)
-                except Exception:
-                    # Already recorded on the entry and surfaced by /health.
-                    # Raising here would kill a daemon thread and change
-                    # nothing else.
-                    log.exception("could not load the resident model %s", key)
 
     @contextmanager
     def use(self, key: str) -> Iterator[Any]:
@@ -232,32 +253,57 @@ class Residency:
         In use means left alone, for the reason the reaper leaves it alone:
         unloading weights another thread is mid-forward-pass on is a segfault
         rather than an error. Returns whether anything was actually unloaded.
+
+        The lock is taken without blocking, and a model whose lock is held is
+        left alone for the same reason a model in use is. Callers of this are on
+        latency budgets that a checkpoint load does not fit inside — the vision
+        pool's gate gives photo-ml five seconds to answer, and a lease that had
+        to wait twenty for a warm thread to finish would time it out. Nothing is
+        lost by declining: the reaper's next sweep asks the same question, and
+        the model that was mid-load is one somebody has just asked for anyway.
         """
         entry = self._entries.get(key)
-        if entry is None or entry.role is Role.RESIDENT:
+        if entry is None:
             return False
-        with entry.lock:
+        if not entry.lock.acquire(blocking=False):
+            return False
+        try:
             if entry.model is None or entry.in_use > 0:
                 return False
             held = entry.model
             entry.model = None
             entry.loaded_at = None
+        finally:
+            entry.lock.release()
         _drop(held)
         log.info("unloaded %s; nothing is queued that needs it", entry.name)
         return True
 
     def _reap_loop(self) -> None:
         while not self._stop.wait(self._sweep):
-            for entry in list(self._entries.values()):
-                self._reap(entry)
+            # The leases first, so that a term which has just run out releases
+            # what it pins before the pass below asks whether anything is idle.
+            # The other order costs one whole sweep interval on every lapse.
+            for hook in list(self._on_sweep):
+                try:
+                    hook()
+                except Exception:
+                    log.exception("a residency sweep hook failed")
+            for key, entry in list(self._entries.items()):
+                self._reap(key, entry)
 
-    def _reap(self, entry: Entry) -> None:
-        if entry.role is Role.RESIDENT:
-            return
+    def _reap(self, key: str, entry: Entry) -> None:
         with entry.lock:
             if entry.model is None or entry.in_use > 0:
                 return
             if entry.last_used is None or time.monotonic() - entry.last_used < self._idle:
+                return
+            # A leased model is not idle in the sense this clock means. Somebody
+            # has the gallery open and has not typed for six minutes, which is
+            # the exact case the lease exists to keep weights loaded through —
+            # the alternative is a search box that is instant, then twenty
+            # seconds, then instant again, for no reason the person can see.
+            if self._pinned is not None and self._pinned(key):
                 return
             held = entry.model
             entry.model = None
@@ -284,18 +330,37 @@ class Residency:
             )
         return out
 
-    def ready(self) -> bool:
-        """True once every resident model is actually resident.
+    def loaded(self, key: str) -> bool:
+        """Whether this model's weights are on the card right now."""
+        entry = self._entries.get(key)
+        return entry is not None and entry.model is not None
 
-        The one question photod's vision pool asks before it claims a job. A
-        service that is listening but still pulling 1.8GB of weights off a
-        mirror is not a service the pool should be handing work to.
+    def ready(self) -> bool:
+        """True when this service can be handed work.
+
+        It used to mean "every resident model is actually resident", which was
+        the right question while two checkpoints were pulled off a mirror at
+        startup and the pool had to be kept off a service that was listening but
+        empty. Nothing is loaded at startup any more, so that question has no
+        content: the service is ready the moment it is up, and a first request
+        that waits twenty seconds for weights is what mlclient.DefaultTimeout
+        has always been sized for.
+
+        What is left worth asking is whether anything here can load at all. A
+        checkpoint that will not download stays broken, and a vision pool that
+        spent an overnight backfill discovering that one asset at a time would
+        park the library as permanently failed. So this goes false when *every*
+        registered model has a recorded failure, and /health names each one.
+
+        Every rather than any, deliberately. A recogniser that will not download
+        must not stop embeddings: the three passes are independent, they fail
+        independently, and a per-job failure already reaches the right place —
+        mlclient turns photo-ml's 503 into a deferral and the queue keeps the
+        other two kinds moving. This gate is for the case where nothing is going
+        to work, which is the only case where claiming work is pointless.
         """
-        return all(
-            entry.model is not None
-            for entry in self._entries.values()
-            if entry.role is Role.RESIDENT
-        )
+        entries = list(self._entries.values())
+        return not entries or any(entry.error is None for entry in entries)
 
 
 def _drop(held: Any) -> None:

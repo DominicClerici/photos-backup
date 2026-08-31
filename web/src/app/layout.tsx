@@ -5,6 +5,7 @@ import { Geist } from "next/font/google";
 import { SelectionProvider } from "@/hooks/useSelection";
 import { ViewProvider } from "@/hooks/useView";
 import { CommandPalette } from "@/components/CommandPalette";
+import { SearchWarm } from "@/components/SearchWarm";
 import { TabBar } from "@/components/TabBar";
 import { Toaster } from "@/components/ui/toast";
 import { VaultGate } from "@/components/VaultGate";
@@ -50,6 +51,11 @@ export default function RootLayout({
           and one more: ⌘K has to work on a page that is still loading and on one
           that has nothing to do with searching, so the listener has to outlive
           every page. It is also what the search button opens — see TabBar. */}
+      {/* SearchWarm is here for the plainest version of the same reason: it has
+          to fire on the first load of any route, not only on /search, because
+          the whole point is that the models a search needs finish loading while
+          somebody is looking at their photographs rather than after they have
+          asked a question. It draws nothing. */}
       {/* And the vault's password prompt is here because it is asked for from
           everywhere: a right-click in the library, a menu on an album tile, a
           page that has just found out it is locked. One dialog opened from a
@@ -62,6 +68,7 @@ export default function RootLayout({
               {children}
               <TabBar />
               <CommandPalette />
+              <SearchWarm />
               <VaultGate />
             </ViewProvider>
           </SelectionProvider>

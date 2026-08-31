@@ -171,7 +171,12 @@ func run(log *slog.Logger) error {
 		ml = mlclient.New(cfg.MLURL)
 		log.Info("photo-ml configured; photographs will be searchable by what they show",
 			"url", cfg.MLURL, "encoder", db.VisionModel, "captioner", db.CaptionModel,
-			"recogniser", db.OCRModel, "vision_workers", cfg.VisionConcurrency)
+			"recogniser", db.OCRModel, "vision_workers", cfg.VisionConcurrency,
+			// The two numbers that decide when the card is held. Logged at
+			// startup because the answer to "why is nothing being captioned"
+			// and the answer to "why is search slow the first time" are both
+			// here, and both are otherwise invisible.
+			"search_idle", cfg.MLSearchIdle, "ingest_retry", cfg.MLIngestRetry)
 	} else {
 		log.Info("no ML_URL; photographs keep their dates, places and filenames and will not be searchable by what they show",
 			"hint", "photo-ml/README.md, then set ML_URL=http://127.0.0.1:8789")
@@ -193,6 +198,11 @@ func run(log *slog.Logger) error {
 		Ceremonies:   webauth.NewCeremonies(webauth.CeremonyTTL),
 		Vault:        vaults,
 		ML:           ml,
+		// How long photo-ml holds the search models past the last gallery
+		// request. This side of the archive is the one that can see a browser,
+		// which is why the setting is here and not on the worker. See
+		// api/mlwarm.go.
+		MLSearchIdle: cfg.MLSearchIdle,
 		// What the status page needs to tell a degraded server from a busy one.
 		WorkerEnabled: !cfg.WorkerDisabled,
 		Tools:         mediaTools(cfg),
@@ -279,6 +289,7 @@ func run(log *slog.Logger) error {
 		workers.PrepWorkers = cfg.PrepConcurrency
 		workers.VisionWorkers = cfg.VisionConcurrency
 		workers.DescribeQuiet = time.Duration(cfg.DescribeQuietSeconds) * time.Second
+		workers.IngestRetry = cfg.MLIngestRetry
 
 		workers.Start(ctx)
 		defer workers.Wait()

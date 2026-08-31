@@ -59,6 +59,14 @@ const HealthTimeout = 5 * time.Second
 // up costs a refinement rather than the search.
 const ParseTimeout = 8 * time.Second
 
+// LeaseTimeout bounds the lease calls, and is short for the reason
+// HealthTimeout is: nothing on the other side of this call blocks on a model.
+// photo-ml grants a lease and loads the checkpoints on its own thread, so a
+// slow answer here is a service that is unwell rather than one that is busy —
+// and the caller is either a person's page load or a worker's gate, neither of
+// which should wait two minutes to find out the card is spoken for.
+const LeaseTimeout = 5 * time.Second
+
 // errorBodyLimit bounds how much of a failure response is read into an error
 // message. Enough for FastAPI's JSON detail, not enough for a stack trace to
 // end up in the jobs table.
@@ -89,6 +97,13 @@ type Health struct {
 	Device string        `json:"device"`
 	Dtype  string        `json:"dtype"`
 	Models []ModelStatus `json:"models"`
+	// Leases and VRAM are what make an empty Models table readable. Holding no
+	// weights at all is the correct state most of the time now — see
+	// photo_ml/leases.py — and without these two the status page could not say
+	// whether that is because nobody is looking or because something else has
+	// the card.
+	Leases []LeaseStatus `json:"leases"`
+	VRAM   VRAMStatus    `json:"vram"`
 }
 
 // ModelStatus is one row of §6's residency table, as the service currently sees
@@ -100,6 +115,111 @@ type ModelStatus struct {
 	Resident bool   `json:"resident"`
 	InUse    int    `json:"in_use"`
 	Error    string `json:"error"`
+}
+
+// The two leases photo-ml arbitrates. Constants rather than strings at the call
+// sites because a typo in one would be a lease that is never taken and never
+// refused — the acquire would 400, mlclient would report it as an ordinary
+// error, and the symptom would be a search box that is permanently slow for a
+// reason nothing says out loud.
+const (
+	// LeaseSearch pins the encoder and the query parser while somebody has the
+	// gallery open. Taken on a page load, renewed by ordinary gallery traffic,
+	// and lapsing a few minutes after the last request.
+	LeaseSearch = "search"
+	// LeaseIngest is the right to run the expensive passes. Held by the vision
+	// pool while it has work and released the moment its queue goes dry.
+	LeaseIngest = "ingest"
+)
+
+// Grant is photo-ml's answer to one lease request: whether the card is ours,
+// and if not, why not.
+//
+// A refusal is a 200. It is an answer rather than a failure — "an ingestion
+// pass has the card", "six gigabytes are held outside this archive" — and the
+// caller acts on it rather than retrying it, so it must not arrive down the
+// same path as a service that has fallen over. ErrUnavailable still means what
+// it means everywhere else in this package.
+type Grant struct {
+	Group string `json:"group"`
+	// Held is whether the lease is ours right now.
+	Held bool `json:"held"`
+	// Ready is whether what the lease pins is actually on the card. False for a
+	// grant that was taken a moment ago and is still pulling 3GB of
+	// checkpoints, which is a state the search path has to be able to see: a
+	// query issued in that window ranks by text rather than waiting.
+	Ready bool `json:"ready"`
+	// Reason is why, in a sentence, and it is written for a person reading the
+	// status page rather than for a switch statement.
+	Reason string `json:"reason"`
+	// ExpiresIn is how long is left on the term, in seconds. Nil when the lease
+	// is not held.
+	ExpiresIn *float64 `json:"expires_in"`
+	// ForeignBytes is what the driver says is held on the card by processes
+	// outside this archive — photod's own NVENC transcoding is not counted.
+	// Nil on a host whose driver cannot be asked, where no budget objects to
+	// anything.
+	ForeignBytes *int64 `json:"foreign_bytes"`
+	BudgetBytes  int64  `json:"budget_bytes"`
+}
+
+// LeaseStatus is one row of the lease table on /health.
+type LeaseStatus struct {
+	Group       string   `json:"group"`
+	Held        bool     `json:"held"`
+	Ready       bool     `json:"ready"`
+	Pins        []string `json:"pins"`
+	BudgetBytes int64    `json:"budget_bytes"`
+	ExpiresIn   *float64 `json:"expires_in"`
+	HeldFor     *float64 `json:"held_for_seconds"`
+	LastRefusal string   `json:"last_refusal"`
+}
+
+// VRAMStatus is what the driver said the last time photo-ml asked it.
+type VRAMStatus struct {
+	// Measurable is false on a host with no NVIDIA driver, or one whose driver
+	// will not answer. Both budgets then consent to everything, which is how
+	// this whole arrangement behaved before it could measure anything.
+	Measurable   bool     `json:"measurable"`
+	ForeignBytes *int64   `json:"foreign_bytes"`
+	Unavailable  string   `json:"unavailable"`
+	Ignoring     []string `json:"ignoring"`
+}
+
+// Lease takes or renews one of photo-ml's two leases.
+//
+// Taking and renewing are the same call on purpose. photod pushes the search
+// deadline forward on ordinary gallery traffic and the ingest deadline forward
+// on every pass of the vision pool's gate, and neither of those knows or should
+// have to know whether it is the first one.
+//
+// ttl is how long the grant should outlive this call — how long photod is
+// willing to go without asking again. photo-ml caps it; see leases._term.
+func (c *Client) Lease(ctx context.Context, group string, ttl time.Duration) (Grant, error) {
+	var out Grant
+	body := map[string]any{"group": group, "ttl_seconds": ttl.Seconds()}
+	ctx, cancel := context.WithTimeout(ctx, LeaseTimeout)
+	defer cancel()
+	if err := c.post(ctx, "/lease", body, &out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// ReleaseLease hands a lease back before its term is up.
+//
+// The vision pool calls it the moment its queue goes dry, and that is the whole
+// difference between the gallery getting the card back on the next sweep and
+// getting it back ninety seconds later. A clock on the other side of the socket
+// cannot know a queue is empty; the process draining it can.
+func (c *Client) ReleaseLease(ctx context.Context, group string) (Grant, error) {
+	var out Grant
+	ctx, cancel := context.WithTimeout(ctx, LeaseTimeout)
+	defer cancel()
+	if err := c.send(ctx, http.MethodDelete, "/lease/"+group, nil, &out); err != nil {
+		return out, err
+	}
+	return out, nil
 }
 
 // Embeddings is a batch of unit vectors and the model that produced them.
@@ -347,15 +467,30 @@ func encode(images [][]byte) []string {
 // post is embed's transport, generalised: the same 5xx-versus-4xx rule, which
 // is the whole of what this package exists to get right.
 func (c *Client) post(ctx context.Context, path string, body, out any) error {
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("encode %s request: %w", path, err)
+	return c.send(ctx, http.MethodPost, path, body, out)
+}
+
+// send is post with the verb pulled out, for the one route that has a DELETE.
+// A nil body sends none, which is what a DELETE with its subject in the path
+// wants — FastAPI is content to receive one either way, but a Content-Type on a
+// request with no content is the kind of small lie that costs somebody an hour
+// with tcpdump one day.
+func (c *Client) send(ctx context.Context, method, path string, body, out any) error {
+	var reader io.Reader
+	if body != nil {
+		payload, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("encode %s request: %w", path, err)
+		}
+		reader = bytes.NewReader(payload)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+path, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, reader)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := c.client().Do(req)
 	if err != nil {

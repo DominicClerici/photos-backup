@@ -19,9 +19,10 @@ downstream, and the alternative — a 4B model resident on a card that has to fi
 a captioner beside it — buys accuracy in a place where accuracy is not what is
 load-bearing.
 
-Resident rather than on demand, unlike the captioner. A query waits on this, and
-a search box that pauses twenty seconds to load a checkpoint is not a search
-box.
+Leased rather than on demand, unlike the captioner. A query waits on this, and a
+search box that pauses twenty seconds to load a checkpoint is not a search box —
+but only while there is a search box open, which is why it is a lease rather
+than the permanent residency it used to be. See leases.py.
 """
 
 from __future__ import annotations
@@ -44,10 +45,12 @@ log = logging.getLogger("photo_ml.parser")
 # mexico" comes back with both — and what does not survive costs nothing, which
 # is exactly the arrangement §11 asks for.
 #
-# It stays small because it stays *resident*, and the card has to fit a 9.6GB
-# captioner beside it during a backfill. PHOTO_ML_PARSER_MODEL swaps it: Qwen3-
-# 1.7B is meaningfully better at this and costs 3.4GB, which fits fine on a
-# machine that is not captioning and does not fit on one that is.
+# It stays small because it is *pinned for the whole of a browsing session*, and
+# because the lease that pins it is the thing standing between a backfill and the
+# card. PHOTO_ML_PARSER_MODEL swaps it: Qwen3-1.7B is meaningfully better at this
+# and costs 3.4GB, which is affordable now in a way it was not when this was
+# resident — the two never share the card, so what it competes with is the
+# encoder and a desktop session rather than a 9.6GB captioner.
 HF_ID = os.environ.get("PHOTO_ML_PARSER_MODEL", "Qwen/Qwen3-0.6B")
 MODEL_NAME = HF_ID.split("/")[-1].lower()
 

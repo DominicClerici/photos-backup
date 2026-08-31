@@ -447,15 +447,76 @@ time.
 The card is 16.3GB and the desktop session already holds about 1.4 of it. A
 model declares a role rather than being loaded wherever somebody first needs it:
 
-- **resident** — loaded at startup, never given back. The vision encoder, at
-  2.3GB, and the query parser at 1.2GB, because interactive search embeds a
-  phrase and parses a sentence per query, and a query that waits twenty seconds
-  for a checkpoint is not a search box.
+- **leased** — loaded when somebody takes a lease on it and unloaded when that
+  lease lapses. The vision encoder, at 2.3GB, and the query parser at 1.2GB,
+  because interactive search embeds a phrase and parses a sentence per query,
+  and a query that waits twenty seconds for a checkpoint is not a search box —
+  but only while there is a search box open.
 - **on demand** — loaded when asked, unloaded once nothing has asked for
   `PHOTO_ML_IDLE_SECONDS`. The 9.6GB captioner and the text recogniser.
 
-The mechanism is `residency.py`, and two details in it are the reason it is a
-module rather than a dict.
+**Nothing is loaded at startup.** The service is up in about a second and holds
+no VRAM at all until there is a reason to. That is a change: the first two used
+to be *resident* — loaded on the way up and never given back — which was right
+about the latency and wrong about everything else, because an archive nobody was
+looking at held 3.5GB of weights and a CUDA context all day for a search box
+nobody had open.
+
+## Leases
+
+`leases.py`, and the reason it is a separate module from `residency.py`:
+residency answers *what is loaded*, and this answers the question in front of
+it — whether anything should be, and for whose benefit. That question needs two
+facts that live in two processes. photod knows whether somebody has the gallery
+open and whether there is a queue; this side knows what the driver says is free
+and what is already on the card. Neither can answer alone, so photod asks and
+this side decides.
+
+Two leases, and they are **mutually exclusive**:
+
+| | pins | refused when | term |
+|---|---|---|---|
+| `search` | encoder + parser, ~3.5GB | `ingest` is held, or ≥ `PHOTO_ML_SEARCH_BUDGET_GB` is held outside this archive | `PHOTO_ML_SEARCH_LEASE_SECONDS`, renewed by gallery traffic |
+| `ingest` | nothing — it holds *permission* | `search` is held, or ≥ `PHOTO_ML_INGEST_BUDGET_GB` is held outside this archive | `PHOTO_ML_INGEST_LEASE_SECONDS`, renewed by the vision pool's gate |
+
+```
+POST   /lease            {"group": "search", "ttl_seconds": 300}
+DELETE /lease/ingest
+```
+
+A refusal is a **200**, not an error. "An ingestion pass has the card" and "9.2GB
+is held outside this archive" are answers photod acts on rather than retries: a
+search ranks by words and says so in its `degraded` field, and the vision pool
+asks again in `ML_INGEST_RETRY`.
+
+Mutual exclusion rather than a priority, and it is a choice worth stating. The
+captioner peaks at 12.98GB with the search models in place, which left 0.71GB of
+a 15.51GB card — the margin NVENC needs, and nothing more. Adding a browser to
+that is where the 503s came from. So a backfill runs on an idle machine and
+yields the whole card to the first person who opens the gallery; a search typed
+mid-backfill is answered by Postgres alone. That last part is a real cost and it
+is the right one — a text-ranked search returns photographs, and a search that
+hangs for twenty seconds waiting on a checkpoint does not.
+
+### What counts as somebody else's VRAM
+
+`vram.py` asks NVML, per process, and sums what is *not* this project's.
+**photod counts as ours**: it transcodes with `h264_nvenc`, and a backfill that
+postponed itself because the archive was busy encoding video would be this
+project declining to run because this project is running. The names are
+`PHOTO_ML_VRAM_IGNORE`, matched against `/proc/<pid>/comm`, because photod forks
+an ffmpeg per clip and this service cannot be told about a child that will exist
+in four seconds.
+
+A card that cannot be measured — no driver, a driver mid-upgrade, an
+`nvidia-ml-py` that will not import — **raises no objection**. Both budgets then
+consent to everything, which is exactly how this behaved before it could measure
+anything. `/health` says `vram.measurable: false` when that is what happened.
+
+### The rest of the mechanism
+
+`residency.py`, and two details in it are the reason it is a module rather than
+a dict.
 
 `use()` refcounts, because the reaper runs on its own thread and unloading a
 model another thread is mid-forward-pass on is a segfault rather than an error.

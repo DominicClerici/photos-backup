@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/dominicclerici/photos-backup/server/internal/db"
 	"github.com/dominicclerici/photos-backup/server/internal/derivstore"
@@ -41,12 +42,55 @@ type fakeML struct {
 	// worth of words.
 	captions []string
 	text     []string
+
+	// noLeaseRoute makes /lease answer 404, which is what an older photo-ml
+	// does. A 4xx rather than a 5xx, and the difference is the whole point: it
+	// is a permanent property of how the service was started, so the pool
+	// treats it as consent rather than waiting for it to get better.
+	noLeaseRoute bool
+	// grants is whether /lease says yes, and refusal is the sentence it gives
+	// when it does not. A refusal is a 200 with held=false, which is why these
+	// are two fields rather than a status code: it is an answer the pool acts
+	// on rather than a failure it retries.
+	grants  bool
+	refusal string
+	// acquired and released record the lease traffic, which is what the tests
+	// below assert about — that four workers are one lease, that an empty queue
+	// hands the card back, and that a refusal is not asked again immediately.
+	acquired []string
+	released []string
 }
 
 func newFakeML(t *testing.T) *fakeML {
 	t.Helper()
-	f := &fakeML{ready: true}
+	f := &fakeML{ready: true, grants: true}
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /lease", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Group string `json:"group"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		if f.noLeaseRoute {
+			http.Error(w, `{"detail":"Not Found"}`, http.StatusNotFound)
+			return
+		}
+		f.acquired = append(f.acquired, req.Group)
+		reason := "taken"
+		if !f.grants {
+			reason = f.refusal
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"group": req.Group, "held": f.grants, "ready": f.grants,
+			"reason": reason, "budget_bytes": 4 << 30,
+		})
+	})
+	mux.HandleFunc("DELETE /lease/{group}", func(w http.ResponseWriter, r *http.Request) {
+		group := r.PathValue("group")
+		f.released = append(f.released, group)
+		json.NewEncoder(w).Encode(map[string]any{
+			"group": group, "held": false, "ready": false, "reason": "released",
+		})
+	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
 			"ok": true, "ready": f.ready, "device": "cpu", "dtype": "float32",
@@ -311,6 +355,15 @@ func TestNoRenditionsIsNotAFailure(t *testing.T) {
 	}
 }
 
+// queueVision puts one embedding job in the queue, which is the thing the gate
+// asks about first. Enough to make "there is work" true; nothing claims it.
+func (h *harness) queueVision(t *testing.T, assetID string) {
+	t.Helper()
+	if err := jobs.Enqueue(context.Background(), h.store.Pool(), jobs.KindVision, assetID); err != nil {
+		t.Fatalf("queue a vision job: %v", err)
+	}
+}
+
 // The gate, which is why the pool does not need an error path for "not
 // installed": it asks before it claims. `ready` rather than `ok`, because
 // photo-ml answers /health from its first moment on purpose and handing work to
@@ -319,9 +372,11 @@ func TestTheVisionPoolWaitsForAWarmService(t *testing.T) {
 	ml := newFakeML(t)
 	h := newHarness(t).withML(ml.URL)
 	ctx := context.Background()
+	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
+	h.queueVision(t, asset.ID)
 
 	if !h.mlAvailable(ctx) {
-		t.Fatal("a warm service should be available")
+		t.Fatal("a warm service with work queued should be available")
 	}
 
 	ml.ready = false
@@ -334,6 +389,114 @@ func TestTheVisionPoolWaitsForAWarmService(t *testing.T) {
 	h.mlCheckedAt = h.mlCheckedAt.Add(-mlProbeInterval)
 	if h.mlAvailable(ctx) {
 		t.Error("a closed socket is not available")
+	}
+}
+
+// An idle archive must not hold a card. This is the first of the gate's three
+// questions and the only one asked on every tick: everything else here is
+// cached, and caching this would mean a photograph that landed a second after
+// the queue drained waited fifteen seconds to be looked at.
+func TestAnEmptyQueueNeverAsksForTheCard(t *testing.T) {
+	ml := newFakeML(t)
+	h := newHarness(t).withML(ml.URL)
+
+	if h.mlAvailable(context.Background()) {
+		t.Error("there is nothing to do; the pool has no business holding the card")
+	}
+	if len(ml.acquired) != 0 {
+		t.Errorf("asked for %v with an empty queue, want no lease call at all", ml.acquired)
+	}
+}
+
+// And the other side of it: the card goes back the moment the queue drains,
+// rather than when the term lapses. photod is the only process that knows a
+// queue is empty, and the difference is whether the next person to open the
+// gallery gets a search box or a page of words.
+func TestDrainingTheQueueHandsTheCardBack(t *testing.T) {
+	ml := newFakeML(t)
+	h := newHarness(t).withML(ml.URL)
+	ctx := context.Background()
+	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
+	h.queueVision(t, asset.ID)
+
+	if !h.mlAvailable(ctx) {
+		t.Fatal("work is queued and the service is warm")
+	}
+	h.claimAndRun(t, jobs.KindVision)
+
+	if h.mlAvailable(ctx) {
+		t.Error("the queue is empty; the gate should be shut")
+	}
+	if len(ml.released) != 1 || ml.released[0] != mlclient.LeaseIngest {
+		t.Errorf("released %v, want one release of the ingest lease", ml.released)
+	}
+}
+
+// A refusal is ordinary: somebody has the gallery open, or something outside
+// this archive is holding most of the card. It is not a failure and it is not
+// asked again in five seconds — the queue is the state and the work is still in
+// it. See config.MLIngestRetry.
+func TestARefusedLeaseIsNotAskedAgainImmediately(t *testing.T) {
+	ml := newFakeML(t)
+	ml.grants = false
+	ml.refusal = "the search lease holds the card"
+	h := newHarness(t).withML(ml.URL)
+	h.IngestRetry = time.Hour
+	ctx := context.Background()
+	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
+	h.queueVision(t, asset.ID)
+
+	if h.mlAvailable(ctx) {
+		t.Fatal("photo-ml refused the card; the pool must not claim")
+	}
+	for range 5 {
+		h.mlCheckedAt = h.mlCheckedAt.Add(-mlProbeInterval)
+		h.mlAvailable(ctx)
+	}
+	if len(ml.acquired) != 1 {
+		t.Errorf("asked %d times inside the retry window, want once", len(ml.acquired))
+	}
+
+	// And it does come back, once the pace says so.
+	ml.grants = true
+	h.ingestRefusedAt = h.ingestRefusedAt.Add(-2 * time.Hour)
+	if !h.mlAvailable(ctx) {
+		t.Error("the card was free again and the work is still queued")
+	}
+}
+
+// Four workers are one lease and one health probe. Both are facts about the
+// archive rather than about a worker, which is why they live on the Runner and
+// not in the loop.
+func TestTheLeaseIsSharedAcrossWorkers(t *testing.T) {
+	ml := newFakeML(t)
+	h := newHarness(t).withML(ml.URL)
+	ctx := context.Background()
+	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
+	h.queueVision(t, asset.ID)
+
+	for range 8 {
+		if !h.mlAvailable(ctx) {
+			t.Fatal("the service is warm and the work is queued")
+		}
+	}
+	if len(ml.acquired) != 1 {
+		t.Errorf("took the lease %d times, want once and then renewals on a timer", len(ml.acquired))
+	}
+}
+
+// A photo-ml that has never heard of a lease must not mean a backfill that
+// never runs again. Its own residency rules are still in place — they are what
+// this replaced — so what is lost is the arbitration, not the models.
+func TestAPhotoMLWithNoLeaseRouteStillGetsWork(t *testing.T) {
+	ml := newFakeML(t)
+	ml.noLeaseRoute = true
+	h := newHarness(t).withML(ml.URL)
+	asset := h.ingest(t, "iphone-portrait.heic", db.MediaImage)
+	h.queueVision(t, asset.ID)
+
+	if !h.mlAvailable(context.Background()) {
+		t.Error("a version skew must not stop the archive describing photographs")
 	}
 }
 

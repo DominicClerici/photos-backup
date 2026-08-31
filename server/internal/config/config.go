@@ -163,6 +163,34 @@ type Config struct {
 	// whole library into queued work. See jobs.ReconcileVision.
 	MLURL string
 
+	// MLSearchIdle is how long photo-ml keeps the search models on the card
+	// after the last gallery request.
+	//
+	// The number this whole arrangement turns on. Those two models used to be
+	// resident — loaded when photo-ml started and never given back — so an
+	// archive nobody was looking at held about 3GB of weights and a CUDA
+	// context all day for a search box nobody had open. photod is the only
+	// process that can see a browser, so photod is what says otherwise: it
+	// takes a lease on a page load and pushes it forward on ordinary gallery
+	// traffic, and this is how far forward.
+	//
+	// Five minutes because it is comfortably longer than reading one page and
+	// comfortably shorter than holding the card all evening for a tab that was
+	// closed. It is a term rather than a timer: photo-ml lets go on its own if
+	// photod stops asking, so a restart here costs the next search a cold load
+	// and nothing else.
+	MLSearchIdle time.Duration
+	// MLIngestRetry is how long the vision pool waits before asking again after
+	// photo-ml refuses it the card.
+	//
+	// Refusals are ordinary and expected — somebody has the gallery open, or a
+	// game is holding nine gigabytes — so this is a pace rather than a backoff,
+	// and it does not grow. Fifteen minutes because the two things it is
+	// waiting on move on that scale: a browsing session ends, or something else
+	// on the card finishes. Nothing is lost by waiting, because the queue is
+	// the state and the work is still in it.
+	MLIngestRetry time.Duration
+
 	// VideoEncoder is the ffmpeg encoder for playback renditions. libx264 works
 	// everywhere; the archive machine's NVIDIA card runs h264_nvenc, which
 	// video.videoArgs knows how to configure. Anything named *nvenc takes the
@@ -233,7 +261,9 @@ func FromEnv() Config {
 		LivePreviewConcurrency: positive(os.Getenv("LIVE_PREVIEW_CONCURRENCY"), 2),
 		LivePreviewCacheBytes:  int64(positive(os.Getenv("LIVE_PREVIEW_CACHE_MB"), 64)) << 20,
 
-		MLURL: strings.TrimSpace(os.Getenv("ML_URL")),
+		MLURL:         strings.TrimSpace(os.Getenv("ML_URL")),
+		MLSearchIdle:  duration(os.Getenv("ML_SEARCH_IDLE"), 5*time.Minute),
+		MLIngestRetry: duration(os.Getenv("ML_INGEST_RETRY"), 15*time.Minute),
 
 		VideoEncoder: or(os.Getenv("VIDEO_ENCODER"), "libx264"),
 
