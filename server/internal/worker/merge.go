@@ -80,8 +80,13 @@ func (r *Runner) runMerge(ctx context.Context, assetID string) error {
 		// is kept under the group rather than deleted with the rest of the
 		// staging, and the review page offers it beside a button that archives
 		// it anyway. The job still fails — nothing is in the library yet.
+		//
+		// And fails for good on the first try: the join is a deterministic
+		// function of the same files, so a retry would rebuild the same file
+		// and reject it again. The button that archives it anyway requeues
+		// the job, which is the only thing that should run it a second time.
 		r.keepRejected(group, staged)
-		return err
+		return jobs.Permanent(err)
 	}
 	if err != nil {
 		return err

@@ -174,6 +174,62 @@ func TestFailReschedulesUntilAttemptsRunOut(t *testing.T) {
 	}
 }
 
+func TestPermanentFailureParksOnTheFirstAttempt(t *testing.T) {
+	q, store := testQueue(t)
+	ctx := context.Background()
+	newAsset(t, store)
+
+	q.BaseBackoff = time.Nanosecond
+	q.MaxBackoff = time.Nanosecond
+	q.MaxAttempts = 5
+
+	verdict := errors.New("join: 2 parts totalling 13.292s came out as 12.850s; refusing to archive that")
+
+	job, err := q.Claim(ctx, []jobs.Kind{jobs.KindMetadata}, "worker-1")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	permanent, err := q.Fail(ctx, job, fmt.Errorf("wrapped: %w", jobs.Permanent(verdict)))
+	if err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+	if !permanent {
+		t.Fatal("a permanent failure was rescheduled")
+	}
+
+	if _, err := q.Claim(ctx, []jobs.Kind{jobs.KindMetadata}, "worker-1"); !errors.Is(err, jobs.ErrNoJob) {
+		t.Fatalf("a permanently failed job was claimed again: %v", err)
+	}
+
+	failed, err := q.Failed(ctx, 10)
+	if err != nil {
+		t.Fatalf("list failed: %v", err)
+	}
+	if len(failed) != 1 {
+		t.Fatalf("failed jobs = %d, want 1", len(failed))
+	}
+	if want := "wrapped: " + verdict.Error(); failed[0].Error != want {
+		t.Errorf("stored error = %q, want %q", failed[0].Error, want)
+	}
+}
+
+func TestPermanentKeepsTheCauseReachable(t *testing.T) {
+	type verdict struct{ error }
+	cause := verdict{errors.New("refused")}
+	err := jobs.Permanent(cause)
+
+	var got verdict
+	if !errors.As(err, &got) {
+		t.Error("errors.As cannot see through Permanent")
+	}
+	if err.Error() != cause.Error() {
+		t.Errorf("message = %q, want the cause's own", err.Error())
+	}
+	if jobs.Permanent(nil) != nil {
+		t.Error("Permanent(nil) is not nil")
+	}
+}
+
 func TestFailedJobIsNotClaimableBeforeItsBackoffElapses(t *testing.T) {
 	q, store := testQueue(t)
 	ctx := context.Background()

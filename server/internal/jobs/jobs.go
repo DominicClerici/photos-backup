@@ -249,6 +249,29 @@ func NewQueue(pool *pgxpool.Pool) *Queue {
 // the common case on an idle server, not a failure.
 var ErrNoJob = errors.New("jobs: nothing to claim")
 
+// ErrPermanent marks a failure that another attempt cannot change: the job ran
+// against the same bytes and reached a verdict, rather than tripping over
+// something that might be different in a minute. Fail parks such a job on the
+// spot instead of spending the rest of its attempts arriving at the same
+// answer. Wrap a cause with Permanent rather than returning this directly.
+var ErrPermanent = errors.New("jobs: permanent failure")
+
+// Permanent wraps err so that Fail parks the job without retrying it. The
+// message is err's own, unchanged, because last_error is read verbatim by the
+// pages that surface a failed job.
+func Permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return permanentError{err}
+}
+
+type permanentError struct{ err error }
+
+func (e permanentError) Error() string        { return e.err.Error() }
+func (e permanentError) Unwrap() error        { return e.err }
+func (e permanentError) Is(target error) bool { return target == ErrPermanent }
+
 // Claim takes the oldest runnable job of any of the given kinds and marks it
 // running. Concurrent callers never receive the same job: SKIP LOCKED makes a
 // claimer step over rows another transaction is already taking, rather than
@@ -635,7 +658,7 @@ func (q *Queue) Complete(ctx context.Context, id int64) error {
 // It reports whether the failure was permanent, so the caller can update the
 // asset's derived state to match.
 func (q *Queue) Fail(ctx context.Context, j Job, cause error) (permanent bool, err error) {
-	permanent = j.Attempts >= q.maxAttempts()
+	permanent = j.Attempts >= q.maxAttempts() || errors.Is(cause, ErrPermanent)
 	delay := q.backoff(j.Attempts)
 
 	const fail = `
